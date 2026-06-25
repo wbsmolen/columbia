@@ -1,0 +1,58 @@
+# Vendored: Cloudflare `privacy-gateway-server-go`
+
+This directory is a vendored copy of Cloudflare's open-source OHTTP (RFC 9458) gateway reference implementation. It's checked into this repository directly, not as a git submodule, so the build is self-contained and the exact gateway source can be audited alongside the rest of the system.
+
+## Upstream
+
+| | |
+|---|---|
+| Project | `privacy-gateway-server-go` |
+| Upstream repo | https://github.com/cloudflare/privacy-gateway-server-go |
+| Vendored commit | `360d4136d5a7d3801b5b20216477b9dd548f48c2` |
+| Commit date | 2026-02-19 |
+| Commit subject | `Merge pull request #73 from ThePlexus/update-readme` |
+| License | BSD 3-Clause (`LICENSE`, preserved unmodified) |
+| Copyright | © 2022 Cloudflare Inc. |
+
+The upstream `LICENSE` file (BSD 3-Clause) is preserved unmodified in this directory, as that license requires for redistribution in source form. This attribution and license notice is required when redistributing the vendored code.
+
+## What this gateway does
+
+It implements the OHTTP Gateway Resource from [RFC 9458 (OHTTP)](https://www.rfc-editor.org/rfc/rfc9458). It accepts HPKE-encapsulated [Binary HTTP](https://www.rfc-editor.org/rfc/rfc9292) requests (`message/ohttp-req`), HPKE-decapsulates them, fetches the inner target resource, and returns the HPKE-encapsulated response (`message/ohttp-res`). It sees request content but never the client's IP, because the relay terminates the client connection. See the top-level [`README.md`](../README.md) and [`ARCHITECTURE.md`](../ARCHITECTURE.md) for how it fits the operator-blind path.
+
+The vendored gateway also exposes `/gateway-metadata` and `/gateway-echo`, which reflect back what the gateway received. They are useful as a relay-stripping self-test: drive `/gateway-metadata` through the full relay path and confirm it returns no client-identifying headers. Because they reflect inbound data, disable them or don't expose them in production.
+
+The crypto is HPKE (RFC 9180). The gateway publishes two key configs: a primary config using KEM `X25519+Kyber768-draft00` (KEM id `0x30`), a draft, non-RFC, post-quantum hybrid of X25519 and Kyber768 (experimental), and a legacy config using `DHKEM(X25519, HKDF-SHA256)` (KEM id `0x20`), the classical RFC 9180 suite. Both pair the KEM with `HKDF-SHA256` and `AES-128-GCM`. A classical-only client must select the legacy config (KEM `0x20`); the primary config is a draft post-quantum suite that not every client supports.
+
+## Local modifications
+
+One deviation from upstream: the GCP App Engine example manifests (`gateway.yaml`, `gateway-protohttp.yaml`, `app.yaml`) were removed (see below). Nothing else is changed; the Go source and the vendored dependency tree are byte-identical to the upstream commit above. All deployment-specific behavior is supplied entirely at runtime through environment variables (documented in the upstream `README.md`), not by patching the source:
+
+- `SEED_SECRET_KEY`, the 32-byte HPKE seed, injected at deploy time from the host's secret store and never committed. The gateway runs with `LOG_SECRETS=false`, so the seed is never printed.
+- `ALLOWED_TARGET_ORIGINS`, restricts the gateway to an allowlist of origins it may fetch (everything else is refused).
+
+## Removed: the GCP App Engine manifests
+
+Upstream ships GCP App Engine manifests (`gateway.yaml`, `gateway-protohttp.yaml`, `app.yaml`). The two `*.yaml` env-variable files carried publicly-known 16-byte placeholder seeds in a committed `SEED_SECRET_KEY:` field. A gateway booted with one of those derives a publicly known keypair and offers zero confidentiality, and committing any seed-shaped value to an open tree is the wrong default. They are not used by the supported deploy path (Docker), so they have been removed from this vendored copy.
+
+Provide a fresh 32-byte seed at runtime through the environment, never in a file (see [`../SELFHOSTING.md`](../SELFHOSTING.md)). Never commit a seed.
+
+## Why vendored instead of a submodule
+
+- Self-contained, auditable builds. `docker build` against this directory needs no network and no submodule init; the exact gateway bytes are right here.
+- Reproducibility. It pins the gateway to one reviewed commit, so upstream can't shift under us.
+- Transparency goal. The long-term aim (see [`../ROADMAP.md`](../ROADMAP.md)) is reproducible builds plus a public transparency log of attested measurements, which needs the precise source present and pinned.
+
+## Updating the vendored copy
+
+To re-vendor a newer upstream commit:
+
+```sh
+# from a scratch dir
+git clone https://github.com/cloudflare/privacy-gateway-server-go
+cd privacy-gateway-server-go && git checkout <new-commit>
+rm -rf .git
+# copy contents over ohttp-gateway/, then update the commit hash in this file
+```
+
+Review the diff carefully (this code decrypts user traffic) and update the Vendored commit row above. If the seed or key handling changes, re-derive and re-pin the gateway key fingerprint in any client that pins it.
