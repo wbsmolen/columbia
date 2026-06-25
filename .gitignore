@@ -1,0 +1,76 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Columbia — .gitignore
+#
+# CRITICAL: this repo must NEVER contain a real HPKE seed, key, token, or cred.
+# Inject the gateway's SEED_SECRET_KEY from your host's secret store at runtime —
+# nothing secret should ever be written to disk here. The patterns below are a
+# belt-and-suspenders backstop. If you find a secret tracked, scrub it and
+# rotate the value.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Secrets / keys / seeds (NEVER commit) ──
+.env
+.env.*
+*.env
+*.seed
+*.b64
+*.p8
+*.p12
+*.pfx
+api_key.json
+secrets.json
+*.secret
+
+# HPKE / TLS key material (the gateway reads SEED_SECRET_KEY from the env at
+# runtime; certs are generated locally via mkcert and must stay out of git)
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+key.pem
+cert.pem
+
+# ── Node ──
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+package-lock.json    # services are dependency-free; no lockfile expected
+
+# ── Go build artifacts (vendored gateway) ──
+build/
+bin/
+*.exe
+*.test
+*.out
+# upstream gateway build output binaries
+ohttp-gateway/privacy-gateway-server
+ohttp-gateway/app-gateway-go
+ohttp-gateway/gateway          # `make all` output
+
+# ── Container / image / archive artifacts ──
+*.tar
+*.tar.gz
+*.tgz
+
+# ── OS / editor cruft ──
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# ── Logs / temp ──
+*.log
+tmp/
+.tmp/

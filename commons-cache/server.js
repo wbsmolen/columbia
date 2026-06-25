@@ -1,0 +1,252 @@
+// Columbia — commons-cache
+//
+// The optional "public commons" tier: fetch each public, sessionless item ONCE
+// and serve it to all clients, fronted by OHTTP so the operator can't
+// profile reads. This service is the cache origin.
+//
+// Dependency-free (Node 20+: global fetch + built-in http). Structured JSON logs
+// to stdout carry RED metrics only — NO IPs, NO user data, NO request bodies —
+// matching the privacy-preserving observability design.
+//
+// Generic by design: it caches a public, sessionless upstream URL. Set the
+// upstream origin via UPSTREAM_BASE and adapt the path template below to your
+// own target. Anything tied to a user's identity should stay on-device and never
+// reach this path.
+//
+// Endpoints:
+//   GET /health     — liveness
+//   GET /v1/probe   — diagnostic: can THIS host reach the configured upstream
+//                     surfaces at all? Reports status, size, and latency.
+//   GET /v1/commons — cached public feed (TTL + stale-while-revalidate)
+//                     ?id=<feed-id>&sort=<sort>
+
+const http = require('http');
+
+const PORT = parseInt(process.env.PORT || '8080', 10); // non-root can't bind <1024
+const TTL_MS = parseInt(process.env.COMMONS_TTL_MS || '60000', 10);        // fresh window
+const SWR_MS = parseInt(process.env.COMMONS_SWR_MS || '300000', 10);       // serve-stale window
+const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || 'https://example.com').replace(/\/+$/, '');
+const UPSTREAM_UA = process.env.UPSTREAM_UA ||
+  'columbia-commons/1.0 (+https://example.com)';
+const MAX_ENTRIES = parseInt(process.env.COMMONS_MAX_ENTRIES || '5000', 10);     // cache bound (LRU)
+const MAX_BODY_BYTES = parseInt(process.env.COMMONS_MAX_BODY_BYTES || '5000000', 10); // reject oversized bodies
+
+// A sort/view is any short lowercase token. This validates input (prevents path
+// injection); it deliberately fixes no vocabulary — your upstream defines it.
+const SORT_RE = /^[a-z]+$/;
+
+// Feed media types we are willing to echo back. Anything else is normalized to
+// application/octet-stream so we never reflect an arbitrary upstream type.
+const ALLOWED_CONTENT_TYPES = new Set([
+  'application/rss+xml',
+  'application/atom+xml',
+  'application/xml',
+  'text/xml',
+  'application/json',
+]);
+
+// In-memory cache: key -> { body, contentType, fetchedAt, revalidating }
+const cache = new Map();
+
+function log(fields) {
+  // route is a TEMPLATE (bounded cardinality), never a raw path with IDs.
+  process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...fields }) + '\n');
+}
+
+// Bounded cache write with LRU eviction of the oldest insertion. Re-inserting on
+// every write keeps the Map's insertion order acting as a recency list.
+function cacheSet(key, val) {
+  cache.delete(key);
+  cache.set(key, val);
+  while (cache.size > MAX_ENTRIES) cache.delete(cache.keys().next().value);
+}
+
+// Allowlist the upstream content-type's media type to known feed formats; never
+// reflect an arbitrary upstream type back to clients.
+function safeContentType(raw) {
+  const media = String(raw || '').split(';')[0].trim().toLowerCase();
+  return ALLOWED_CONTENT_TYPES.has(media) ? media : 'application/octet-stream';
+}
+
+// Guard against the operator repointing UPSTREAM_BASE at an internal/private
+// surface, turning this cache into an SSRF relay. Validate once at startup.
+(function validateUpstreamBase() {
+  let parsed;
+  try {
+    parsed = new URL(UPSTREAM_BASE);
+  } catch {
+    log({ event: 'fatal', reason: 'upstream_base_invalid' });
+    process.exit(1);
+  }
+  const host = parsed.hostname.toLowerCase();
+  const isPrivate =
+    parsed.protocol !== 'https:' ||
+    host === 'localhost' ||
+    host.startsWith('127.') ||
+    host === '::1' ||
+    host.startsWith('10.') ||
+    host.startsWith('192.168.') ||
+    host.startsWith('169.254.') ||
+    /^172\.(1[6-9]|2[0-9]|3[01])\./.test(host);
+  if (isPrivate) {
+    log({ event: 'fatal', reason: 'upstream_base_invalid' });
+    process.exit(1);
+  }
+})();
+
+function upstreamHeaders() {
+  return {
+    'User-Agent': UPSTREAM_UA,
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+}
+
+async function fetchUpstream(url) {
+  const started = Date.now();
+  try {
+    const res = await fetch(url, {
+      headers: upstreamHeaders(),
+      redirect: 'manual',                 // never follow — a 3xx could point at an internal host (SSRF)
+      signal: AbortSignal.timeout(10000), // bound slow/hung upstreams
+    });
+    // Treat any 3xx as an upstream error: we do not follow redirects.
+    if (res.status >= 300 && res.status < 400) {
+      return { status: res.status, body: Buffer.alloc(0), contentType: 'application/octet-stream', ms: Date.now() - started, error: true };
+    }
+    const body = Buffer.from(await res.arrayBuffer());
+    // Reject oversized bodies — do not cache or serve (memory DoS guard).
+    if (res.status === 200 && body.length > MAX_BODY_BYTES) {
+      return { status: res.status, body: Buffer.alloc(0), contentType: 'application/octet-stream', ms: Date.now() - started, error: true };
+    }
+    return { status: res.status, body, contentType: res.headers.get('content-type') || 'application/json', ms: Date.now() - started };
+  } catch {
+    // Never surface the exception text — fixed, empty error result only.
+    return { status: 0, body: Buffer.alloc(0), contentType: 'application/octet-stream', ms: Date.now() - started, error: true };
+  }
+}
+
+// Build the upstream URL for an (id, sort) pair. Adapt this template to your own
+// target origin/path; it is the single integration point for the cache.
+function upstreamUrl(id, sort) {
+  return `${UPSTREAM_BASE}/${encodeURIComponent(id)}/${encodeURIComponent(sort)}.rss`;
+}
+
+// Cache with stale-while-revalidate semantics.
+async function getCachedFeed(id, sort) {
+  const key = `${id}/${sort}`;
+  const url = upstreamUrl(id, sort);
+  const now = Date.now();
+  const entry = cache.get(key);
+
+  if (entry) {
+    const age = now - entry.fetchedAt;
+    if (age < TTL_MS) return { ...entry, cacheState: 'HIT' };
+    if (age < TTL_MS + SWR_MS) {
+      // Serve stale immediately; refresh in the background (single-flight).
+      if (!entry.revalidating) {
+        entry.revalidating = true;
+        fetchUpstream(url)
+          .then((up) => {
+            if (up.status === 200 && !up.error) {
+              cacheSet(key, { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), revalidating: false });
+            }
+          })
+          .catch(() => {})
+          .finally(() => { entry.revalidating = false; }); // always reset — never get stuck revalidating
+      }
+      return { ...entry, cacheState: 'STALE' };
+    }
+  }
+
+  // Cold or rotten — fetch synchronously.
+  const up = await fetchUpstream(url);
+  if (up.status === 200 && !up.error) {
+    const fresh = { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), revalidating: false };
+    cacheSet(key, fresh);
+    return { ...fresh, cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms };
+  }
+  // Upstream failed — fixed error result, no upstream body/status leaked downstream.
+  return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true };
+}
+
+async function handleProbe() {
+  // Does this host reach the upstream's public surfaces? Try a few; report status only.
+  const targets = [
+    ['commons', upstreamUrl('example', 'latest')],
+  ];
+  const results = {};
+  for (const [name, url] of targets) {
+    const up = await fetchUpstream(url);
+    results[name] = { status: up.status, bytes: up.body.length, ms: up.ms };
+  }
+  return results;
+}
+
+const server = http.createServer(async (req, res) => {
+  const started = Date.now();
+  const u = new URL(req.url, `http://localhost`);
+  const route = u.pathname;
+  let status = 404, cacheState = '-';
+
+  try {
+    if (route === '/health') {
+      status = 200;
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', service: 'commons-cache', ts: new Date().toISOString(), uptimeS: Math.round(process.uptime()), cacheKeys: cache.size }));
+    } else if (route === '/v1/probe') {
+      const results = await handleProbe();
+      status = 200;
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ note: 'upstream-surface reachability from this host: status, size, and latency', results }, null, 2));
+    } else if (route === '/v1/commons') {
+      const id = (u.searchParams.get('id') || '').replace(/[^A-Za-z0-9_]/g, '');
+      const sort = (u.searchParams.get('sort') || 'latest').toLowerCase();
+      if (!id || !SORT_RE.test(sort)) {
+        status = 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'require ?id=<feed-id>&sort=<sort>' }));
+      } else {
+        const out = await getCachedFeed(id, sort);
+        cacheState = out.cacheState;
+        if (out.upstreamError) {
+          // Fixed 502 — never leak upstream status, body, or error text.
+          status = 502;
+          res.writeHead(status, {
+            'Content-Type': 'application/json',
+            'X-Cache': cacheState,
+            'X-Content-Type-Options': 'nosniff',
+            'Cache-Control': 'no-store',
+          });
+          res.end(JSON.stringify({ error: 'upstream unavailable' }));
+        } else {
+          status = 200;
+          const ageS = out.fetchedAt ? Math.max(0, Math.floor((Date.now() - out.fetchedAt) / 1000)) : 0;
+          // CDN-ready: a downstream CDN can edge-cache public feeds, collapsing
+          // the public-read tier to origin-shield traffic. Only cache successes.
+          res.writeHead(status, {
+            'Content-Type': safeContentType(out.contentType),
+            'X-Cache': cacheState,
+            'X-Content-Type-Options': 'nosniff',
+            'Cache-Control': `public, max-age=${Math.floor(TTL_MS / 1000)}, stale-while-revalidate=${Math.floor(SWR_MS / 1000)}`,
+            'Age': String(ageS),
+          });
+          res.end(out.body);
+        }
+      }
+    } else {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort='] }));
+    }
+  } catch {
+    // Fixed 500 — never place exception text into the response body.
+    status = 500;
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'internal' }));
+  }
+
+  // RED metric — route TEMPLATE only, no IPs, no query values, no bodies.
+  log({ route, method: req.method, status, cache: cacheState, durationMs: Date.now() - started });
+});
+
+server.listen(PORT, () => log({ event: 'listen', port: PORT, ttlMs: TTL_MS, swrMs: SWR_MS }));
