@@ -138,9 +138,32 @@ so they self-expire when the epoch rolls.
 | `APPLE_TEAM_ID` | unset | your Apple Team ID. Required to enforce App Attest |
 | `APPLE_BUNDLE_ID` | unset | Lander's bundle id. Required to enforce App Attest |
 | `APPLE_APP_ATTEST_AAGUID` | `appattest` | `appattest` for production, `appattestdevelop` for dev/TestFlight builds |
+| `APP_ATTEST_CLOCK_SKEW_MS` | `300000` | tolerance (ms) when checking the x5c certs' validity windows, for issuer/Apple clock drift |
+| `REQUIRE_CLIENT_DATA_BINDING` | `1` (on) | require the App Attest `clientDataHash` to commit to the exact `blinded[]` batch + epoch (see below). Set to `0` only during client bring-up, before the iOS client computes the matching hash |
 
 The signing key is injected exactly like the gateway's `SEED_SECRET_KEY`: from your
 host's secret store at runtime, never written to disk in this repo.
+
+### Request-payload binding (`clientDataHash` ↔ `blinded[]`)
+
+App Attest proves "a genuine device signed this 32-byte `clientDataHash`." On its
+own that authenticates the device but not the request: a captured valid
+`{keyId, assertion, clientDataHash}` could be replayed against a *different*
+`blinded[]` batch (still bounded by the per-device quota, but not request-integrity
+checked). With `REQUIRE_CLIENT_DATA_BINDING=1` (the default), the issuer requires
+
+```
+clientDataHash == SHA-256( utf8(epoch) || 0x00 || blinded[0] || 0x00 || blinded[1] || 0x00 ... )
+```
+
+where each `blinded[i]` is the raw (base64-decoded) blinded message, so the
+attestation/assertion is bound to the exact tokens being requested in this epoch
+(the current or previous epoch is accepted, to tolerate an epoch-boundary crossing).
+**The iOS client must compute its App Attest challenge as this same hash.** Until
+that client change ships, run with `REQUIRE_CLIENT_DATA_BINDING=0` (App Attest then
+bounds abuse per-device but does not bind the payload) and flip it on once the
+client matches. This is the one piece of the App Attest gate whose other half lives
+in the Lander app.
 
 ## What is production ready vs what still needs work
 
@@ -162,27 +185,54 @@ these pieces.
   issuer rejects every request rather than issuing under a key nobody controls or
   to a device nobody verified.
 
+**Implemented:**
+
+- **Apple App Attest validation** (`appattest.js`). The full server-side check is
+  now implemented, per Apple's "Validating Apps That Connect to Your Server through
+  App Attest":
+  - *Attestation* (one-time device registration): CBOR-decode the attestation
+    object, verify the `x5c` certificate chain anchors to Apple's App Attest Root
+    CA (real X.509 path + signature + validity checks via node's
+    `crypto.X509Certificate`), verify the nonce in the leaf cert's
+    `1.2.840.113635.100.8.2` extension equals `SHA256(authData || clientDataHash)`,
+    verify `rpIdHash == SHA256(appID)`, verify the AAGUID matches the configured
+    environment (`appattest` prod / `appattestdevelop` dev), verify `signCount == 0`,
+    bind the keyId to `SHA256` of the credential's uncompressed EC point, and
+    extract the device public key for storage.
+  - *Assertion* (per issuance): verify the ECDSA-P256-SHA256 signature over
+    `SHA256(authData || clientDataHash)` with the stored device key, re-check
+    `rpIdHash`, and enforce a strictly increasing sign counter.
+
+  It still **fails closed**: with `APPLE_APP_ATTEST_ROOT_CA_PEM_B64`,
+  `APPLE_TEAM_ID`, or `APPLE_BUNDLE_ID` unset, the validator rejects every request,
+  and any failed check rejects the request. There is no silent-allow path.
+
+  The validation logic is exercised by `appattest.test.js` against a synthetic
+  trust chain (a self-minted CA + leaf, built in pure JS in `appattest-fixtures.js`)
+  that satisfies every Apple check, plus negative tests that each tampered field is
+  rejected. The one remaining gap is a **real-device fixture**: a captured
+  attestation/assertion from a physical iPhone running Lander, validated against
+  Apple's real Root CA, to confirm byte-compatibility with Apple's actual encoder.
+  See the repo's roadmap and the PR notes for exactly how to capture one.
+
 **Stubbed, and clearly marked as such:**
 
-- **Apple App Attest validation** (`appattest.js`). The full structure is there,
-  with every Apple-defined check as its own labeled function: cert chain to Apple's
-  App Attest Root CA, nonce binding, key-id binding, rpId/appID hash, aaguid, and
-  the assertion's monotonic sign counter. Each one that cannot be completed without
-  operator input (Apple's root cert, your team and bundle id) or without CBOR/X.509
-  parsing is a `STUB` that returns `false` with a precise `TODO`. The module
-  fails closed until `APPLE_APP_ATTEST_ROOT_CA_PEM_B64`, `APPLE_TEAM_ID`, and
-  `APPLE_BUNDLE_ID` are supplied AND the parsing is filled in. There is no
-  silent-allow path. Wiring this up is the main remaining task before production.
-
-- **Persistent quota and redemption state.** Both the issuer's per-device per-epoch
-  quota and the relay's spend-once set are in-memory and single-process. That is
-  fine for a first cut and for a single replica, but it has two gaps for a real
-  multi-replica deployment: a device could get its full quota from each replica,
-  and a restart forgets prior spends. The code marks exactly where a shared atomic
-  store goes (Redis `INCR`/`EXPIRE` for the quota keyed by a salted device hash,
-  Redis `SET NX` with an epoch TTL for the redemption nullifiers). The nullifier is
-  derived from the token signature only and carries no identity, so the store never
-  holds anything user-linking.
+- **Persistent quota, redemption, and attested-key state.** The issuer's per-device
+  per-epoch quota, the relay's spend-once set, and the App Attest attested-key store
+  (device public key + last sign counter per keyId) are all in-memory and
+  single-process. That is fine for a first cut and for a single replica, but it has
+  gaps for a real multi-replica deployment: a device could get its full quota from
+  each replica, a restart forgets prior spends, and a device registered on one
+  replica is unknown to another (its assertions are rejected as `unknown_device_key`
+  until it re-attests; the Lander client handles this by re-attesting on rejection).
+  The code marks exactly where a shared atomic store goes (Redis `INCR`/`EXPIRE` for
+  the quota keyed by a salted device hash, Redis `SET NX` with an epoch TTL for the
+  redemption nullifiers, and a Redis hash per keyId for the attested key with a
+  compare-and-set on the sign counter so concurrent assertions cannot both pass with
+  the same counter). The nullifier is derived from the token signature only and
+  carries no identity; the attested key is device-PUBLIC material, and the store is
+  keyed by a salted hash of the keyId, so the store never holds anything
+  user-linking.
 
 - **Attester / Issuer split.** Right now one service plays both Privacy Pass roles.
   RFC 9576 allows splitting the Attester (which sees the device) from the Issuer
@@ -234,9 +284,50 @@ npm install
 node --test
 ```
 
-The suite proves the blind-sign roundtrip, relay acceptance of a valid token,
+Run them under the deploy runtime (`node:20.18.1-alpine`), not a newer local node,
+since a node-version mismatch has crashed this service in production before:
+
+```sh
+# from the repo root (the Privacy Pass test imports the sibling relay)
+docker run --rm -v "$PWD":/repo -w /repo/token-issuer node:20.18.1-alpine \
+  sh -c 'npm ci && npm test'
+```
+
+`test.js` proves the blind-sign roundtrip, relay acceptance of a valid token,
 double-spend rejection, tampered/forged-token rejection, an unlinkability sanity
-check, and the quota accounting.
+check, the quota accounting, and a real-entrypoint boot.
+
+`appattest.test.js` proves the App Attest validator: a well-formed (synthetic)
+attestation is accepted and returns the device key, an assertion from that key
+verifies and advances the sign counter, and each tampered field is rejected on its
+own (wrong rpIdHash, wrong challenge/nonce, broken chain, untrusted root, wrong
+aaguid, non-zero first counter, forged keyId, bad assertion signature,
+non-increasing counter, unknown device key), plus fail-closed behaviour on missing
+inputs. The synthetic trust chain is built in pure JS in `appattest-fixtures.js`
+(a test helper; it is not imported by `server.js` and is not copied into the image).
+
+### Capturing a real-device fixture (required follow-up)
+
+The synthetic fixtures substitute one thing only - the trust anchor (our test root
+in place of Apple's Root CA, injected exactly as an operator injects the real root).
+Every cryptographic and structural check is the production one. Still, before
+trusting this in production you should validate one **real** attestation from a
+physical iPhone running Lander, against Apple's real Root CA, to confirm
+byte-compatibility with Apple's actual CBOR/X.509 encoder. Two ways:
+
+1. **Debug capture endpoint (temporary).** Add a short-lived `POST /attest-debug`
+   to a NON-production instance that takes `{ keyId, attestation, clientDataHash }`,
+   runs `validateAppAttest` with the real `APPLE_*` env set, and returns the result
+   (and, in debug only, the failing check). Drive it from the Lander client's App
+   Attest code path once, capture the request body, then **remove the endpoint**.
+2. **Captured fixture (preferred, permanent regression).** Have the Lander client
+   log one real `attestation` + `clientDataHash` + `keyId` for a known challenge,
+   paste them into a new test alongside the **real** Apple Root CA PEM (base64), and
+   assert `validateAppAttest` returns `ok: true`. Because a real attestation is not
+   user-linking once the challenge is discarded, this fixture is safe to commit.
+
+Until that fixture exists, treat App Attest as "implemented and unit-proven against
+a synthetic chain, pending one real-device confirmation."
 
 ## Dependencies
 

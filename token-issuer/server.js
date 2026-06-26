@@ -61,6 +61,12 @@ const MAX_TOKENS_PER_REQUEST = parseInt(process.env.MAX_TOKENS_PER_REQUEST || '6
 // Body size cap (the assertion + N blinded messages). Bounds memory per request.
 const MAX_BODY = parseInt(process.env.MAX_BODY_BYTES || '262144', 10);
 
+// Bind the App Attest clientDataHash to the blinded[] payload (see handleIssue
+// step a2). ON by default: App Attest then proves the device authorized THESE
+// tokens, not just that a genuine device is present. Set to 0 only during client
+// bring-up, before the iOS client computes clientDataHash over the batch.
+const REQUIRE_CLIENT_DATA_BINDING = process.env.REQUIRE_CLIENT_DATA_BINDING !== '0';
+
 // The issuer signing key (PKCS#8, base64-encoded) is injected at runtime via env,
 // exactly like the gateway's SEED_SECRET_KEY. It is NEVER committed. If unset, the
 // issuer fails closed at startup. To rotate per epoch in production you supply the
@@ -89,6 +95,23 @@ function log(fields) {
 // only the epoch's key id, so spend time leaks nothing finer than the epoch.
 function currentEpoch() {
   return Math.floor(Date.now() / 1000 / EPOCH_SECONDS);
+}
+
+// The canonical value the device's App Attest challenge must hash to, so the
+// attestation/assertion is bound to THIS blinded batch in THIS epoch (see the
+// REQUIRE_CLIENT_DATA_BINDING gate in handleIssue). The client computes the same
+// SHA-256 over the same bytes when it requests its App Attest assertion:
+//   SHA-256( utf8(epoch) || 0x00 || blinded[0] || 0x00 || blinded[1] || 0x00 ... )
+// where each blinded[i] is the raw (base64-decoded) blinded message. The 0x00
+// separators and the leading epoch make the preimage unambiguous.
+function expectedClientDataHash(epochId, blinded) {
+  const h = crypto.createHash('sha256');
+  h.update(String(epochId), 'utf8');
+  for (const b of blinded) {
+    h.update(Buffer.from([0x00]));
+    h.update(Buffer.from(b, 'base64'));
+  }
+  return h.digest();
 }
 
 // --- Epoch key management ---------------------------------------------------
@@ -224,6 +247,66 @@ function reserveQuota(epochId, deviceId, n) {
   return true;
 }
 
+// --- Attested-key store (App Attest device registration) --------------------
+//
+// App Attest is two-phase: a one-time ATTESTATION registers a hardware key, and
+// every later request carries an ASSERTION signed by that key. To check an
+// assertion we must remember the device's public key and its last sign counter,
+// keyed by the App Attest keyId.
+//
+// ATTESTED-KEY STORE (production): this Map is in-process and resets on restart,
+// which has the same two multi-replica gaps the quota store has: a device
+// registered on replica A is unknown to replica B, and a restart forgets every
+// registration (forcing devices to re-attest, which the Lander client handles by
+// falling back to a fresh attestation when an assertion is rejected as unknown).
+// For a real multi-replica deployment, move this to the SAME shared store as the
+// quota/redemption state (e.g. Redis: a hash per keyId holding the SPKI PEM + last
+// counter, with the counter updated via a compare-and-set so two concurrent
+// assertions cannot both pass with the same counter). The stored public key is
+// device-PUBLIC material, not a secret, but the keyId is a device identifier, so
+// key the store by a SALTED hash of the keyId exactly like the quota table rather
+// than the raw keyId. The counter update MUST be atomic to preserve the
+// strictly-increasing guarantee under concurrency.
+//
+// NOTE on identity: the keyId is the one device identifier this service handles.
+// It is used transiently to look up the attested key and is NEVER logged (see the
+// RED-only logging note at the top of this file).
+
+const attestedKeys = new Map(); // keyId -> { publicKeyPem, signCount }
+
+const ATTEST_STORE = {
+  getAttestedKey(keyId) {
+    return attestedKeys.get(keyId) || null;
+  },
+  setAttestedKey(keyId, publicKeyPem, signCount) {
+    // Re-attestation of an EXISTING keyId must not roll the assertion counter
+    // backwards: a fresh attestation reports signCount 0, but if this device has
+    // already advanced its counter via assertions, resetting to 0 would re-open the
+    // assertion-replay window for that key. Producing a fresh attestation needs
+    // genuine hardware re-attesting its own key (a valid chain-to-Apple + a
+    // challenge-bound nonce), so this is not a forgery vector, but we still keep the
+    // higher counter as defense-in-depth. The public key is identical across
+    // attestations of the same hardware key, so refreshing the PEM is harmless.
+    const existing = attestedKeys.get(keyId);
+    const keptCount = Math.max(signCount || 0, existing ? (existing.signCount || 0) : 0);
+    attestedKeys.set(keyId, { publicKeyPem, signCount: keptCount });
+    // Bound the map so a flood of one-time attestations cannot grow it forever.
+    // This is a coarse cap; the production shared store would use a TTL instead.
+    if (attestedKeys.size > 500000) {
+      // Drop the oldest ~10% by insertion order (Map preserves it).
+      let toDrop = Math.floor(attestedKeys.size * 0.1);
+      for (const k of attestedKeys.keys()) {
+        if (toDrop-- <= 0) break;
+        attestedKeys.delete(k);
+      }
+    }
+  },
+  setSignCount(keyId, n) {
+    const rec = attestedKeys.get(keyId);
+    if (rec) rec.signCount = n;
+  },
+};
+
 // --- /issue -----------------------------------------------------------------
 //
 // Request JSON:
@@ -270,22 +353,69 @@ async function handleIssue(req, res, start, body) {
   }
 
   // (a) Validate App Attest. This proves the request comes from a genuine,
-  // unmodified Lander install on real Apple hardware. FAILS CLOSED: if the
-  // validator is a stub (Apple root cert / team+bundle id not supplied), it
-  // returns false and we reject. We never log the assertion/attestation.
-  let attestOk = false;
+  // unmodified Lander install on real Apple hardware. FAILS CLOSED: if App Attest
+  // is unconfigured (Apple root cert / team+bundle id not supplied), the validator
+  // returns { ok: false } and we reject. We never log the assertion/attestation,
+  // and we never log the coarse failure reason at a level that could fingerprint a
+  // device (it is an aggregate counter only).
+  //
+  // We pass the in-process attested-key store so an ASSERTION can be checked
+  // against the device public key recorded at ATTESTATION time, and so the sign
+  // counter advances. On a successful attestation we persist the returned public
+  // key keyed by keyId.
+  let attest;
   try {
-    attestOk = await validateAppAttest({ keyId, attestation, assertion, clientDataHash });
+    attest = await validateAppAttest({ keyId, attestation, assertion, clientDataHash, store: ATTEST_STORE });
   } catch {
-    attestOk = false;
+    attest = { ok: false, reason: 'verification_exception' };
   }
-  if (!attestOk) {
+  if (!attest || !attest.ok) {
     res.writeHead(401); res.end();
     log({ route: '/issue', status: 401, reason: 'attest_failed', durationMs: Date.now() - start });
     return;
   }
+  // Register the device's attested public key on the one-time attestation, so its
+  // later assertions can be verified. (validateAppAttest does the assertion-side
+  // counter update through the store itself.)
+  if (attest.mode === 'attestation') {
+    ATTEST_STORE.setAttestedKey(attest.keyId, attest.publicKeyPem, attest.signCount);
+  }
 
+  // (a2) REQUEST-PAYLOAD BINDING. App Attest proves "a genuine device signed THIS
+  // clientDataHash"; on its own it does NOT prove the device authorized THESE
+  // blinded messages, because clientDataHash is an opaque 32 bytes from the client.
+  // Without binding, a captured valid {keyId, assertion, clientDataHash} could be
+  // replayed against a different `blinded[]` batch (still rate-limited by the
+  // per-device quota, but not request-integrity-checked).
+  //
+  // To close that, the client MUST set its App Attest challenge so that
+  //   clientDataHash == SHA-256( utf8("<epoch>") || 0x00 || each base64(blinded) joined by 0x00 )
+  // i.e. clientDataHash commits to the exact batch being requested in this epoch.
+  // We recompute that here and require equality. This is gated behind an env flag
+  // (default ON in production once the client ships the matching hash; an operator
+  // may set REQUIRE_CLIENT_DATA_BINDING=0 during client bring-up, accepting that
+  // App Attest then only bounds abuse per-device and does not bind the payload).
   const epochId = currentEpoch();
+
+  if (REQUIRE_CLIENT_DATA_BINDING) {
+    let got;
+    try { got = Buffer.from(clientDataHash, 'base64'); } catch { got = Buffer.alloc(0); }
+    // Accept the current OR previous epoch's binding: the client computes the hash
+    // against the epoch it last saw, which can be one behind the issuer if the
+    // request crosses an epoch boundary (the issuer already publishes both epochs'
+    // keys for the same reason). Both candidate hashes are constant-time compared.
+    let bound = false;
+    if (got.length === 32) {
+      for (const e of [epochId, epochId - 1]) {
+        if (crypto.timingSafeEqual(got, expectedClientDataHash(e, blinded))) { bound = true; break; }
+      }
+    }
+    if (!bound) {
+      res.writeHead(401); res.end();
+      log({ route: '/issue', status: 401, reason: 'client_data_binding_failed', durationMs: Date.now() - start });
+      return;
+    }
+  }
 
   // (b) Enforce the per-device per-epoch issuance quota. The keyId is the device
   // identifier; it is hashed before it touches the quota table and never logged.
@@ -472,6 +602,8 @@ export {
   reserveQuota,
   keyIdFromSpki,
   derivePublicKey,
+  expectedClientDataHash,
+  ATTEST_STORE,
   EPOCH_SECONDS,
   RSA_MODULUS_BITS,
   PSS_HASH,
