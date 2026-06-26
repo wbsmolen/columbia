@@ -6,6 +6,8 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -21,6 +23,33 @@ import (
 	"github.com/chris-wood/ohttp-go"
 	"github.com/cloudflare/circl/hpke"
 )
+
+// relayGatewaySecretEnvVariable is the shared secret the relay attaches (as the
+// X-Columbia-Relay-Auth header) so the gateway can refuse traffic that didn't
+// come through our relay. LOCAL MODIFICATION (Columbia). Empty/unset = open.
+const relayGatewaySecretEnvVariable = "RELAY_GATEWAY_SECRET"
+
+// requireRelaySecret wraps a handler so requests lacking the correct
+// X-Columbia-Relay-Auth header are rejected with 401 BEFORE any HPKE
+// decapsulation runs. LOCAL MODIFICATION (Columbia). If secret is empty the
+// check is disabled (open), matching the default-open posture of the other
+// network controls; set RELAY_GATEWAY_SECRET in production to lock the
+// relay→gateway hop. Constant-time compare; the header value is never logged.
+func requireRelaySecret(secret string, next http.HandlerFunc) http.HandlerFunc {
+	expected := []byte(secret)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if len(expected) > 0 {
+			presented := []byte(r.Header.Get("X-Columbia-Relay-Auth"))
+			ha := sha256.Sum256(presented)
+			hb := sha256.Sum256(expected)
+			if subtle.ConstantTimeCompare(ha[:], hb[:]) != 1 {
+				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
 
 const (
 	// keying material (seed) should have as many bits of entropy as the bit
@@ -133,6 +162,18 @@ func getStringEnv(key string, defaultVal string) string {
 		return defaultVal
 	}
 	return val
+}
+
+// getStringEnvAllowEmpty returns the env value when the variable is SET (even to
+// the empty string, which callers use to DISABLE an endpoint), and the default
+// only when the variable is UNSET. LOCAL MODIFICATION (Columbia): lets
+// ECHO_ENDPOINT="" / METADATA_ENDPOINT="" unregister the reflective endpoints,
+// which getStringEnv cannot express because it treats "" as "use default".
+func getStringEnvAllowEmpty(key, defaultVal string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return defaultVal
 }
 
 func main() {
@@ -331,8 +372,10 @@ func main() {
 	gatewayEndpoint := getStringEnv(gatewayEndpointEnvVariable, defaultGatewayEndpoint)
 	configEndpoint := getStringEnv(configEndpointEnvVariable, defaultConfigEndpoint)
 	legacyConfigEndpoint := getStringEnv(legacyConfigEndpointEnvVariable, defaultLegacyConfigEndpoint)
-	echoEndpoint := getStringEnv(echoEndpointEnvVariable, defaultEchoEndpoint)
-	metadataEndpoint := getStringEnv(metadataEndpointEnvVariable, defaultMetadataEndpoint)
+	// Use AllowEmpty so an explicitly-empty env DISABLES the reflective endpoint
+	// (getStringEnv would otherwise restore the default on "").
+	echoEndpoint := getStringEnvAllowEmpty(echoEndpointEnvVariable, defaultEchoEndpoint)
+	metadataEndpoint := getStringEnvAllowEmpty(metadataEndpointEnvVariable, defaultMetadataEndpoint)
 	healthEndpoint := getStringEnv(healthEndpointEnvVariable, defaultHealthEndpoint)
 
 	// Install configuration endpoints
@@ -363,12 +406,26 @@ func main() {
 		target:        target,
 	}
 
-	http.HandleFunc(gatewayEndpoint, server.target.gatewayHandler)
-	http.HandleFunc(echoEndpoint, server.target.gatewayHandler)
-	http.HandleFunc(metadataEndpoint, server.target.gatewayHandler)
-	http.HandleFunc(healthEndpoint, server.healthCheckHandler)
-	http.HandleFunc(legacyConfigEndpoint, target.legacyConfigHandler)
-	http.HandleFunc(configEndpoint, target.configHandler)
+	// LOCAL MODIFICATION (Columbia): require the relay→gateway shared secret on
+	// the main gateway endpoint, BEFORE any HPKE work, and only register an
+	// endpoint when its pattern is non-empty. Setting ECHO_ENDPOINT="" /
+	// METADATA_ENDPOINT="" disables the reflective self-test handlers in
+	// production (they echo inbound headers via httputil.DumpRequest). See
+	// VENDORED.md "Local modifications".
+	relayGatewaySecret := os.Getenv(relayGatewaySecretEnvVariable)
+	registerFunc := func(pattern string, h http.HandlerFunc) {
+		if pattern == "" {
+			return // disabled by config: do not register (HandleFunc panics on "")
+		}
+		http.HandleFunc(pattern, h)
+	}
+
+	registerFunc(gatewayEndpoint, requireRelaySecret(relayGatewaySecret, server.target.gatewayHandler))
+	registerFunc(echoEndpoint, server.target.gatewayHandler)
+	registerFunc(metadataEndpoint, server.target.gatewayHandler)
+	registerFunc(healthEndpoint, server.healthCheckHandler)
+	registerFunc(legacyConfigEndpoint, target.legacyConfigHandler)
+	registerFunc(configEndpoint, target.configHandler)
 	http.HandleFunc("/", server.indexHandler)
 
 	var b bytes.Buffer

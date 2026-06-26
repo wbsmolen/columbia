@@ -26,10 +26,18 @@ The crypto is HPKE (RFC 9180). The gateway publishes two key configs: a primary 
 
 ## Local modifications
 
-One deviation from upstream: the GCP App Engine example manifests (`gateway.yaml`, `gateway-protohttp.yaml`, `app.yaml`) were removed (see below). Nothing else is changed; the Go source and the vendored dependency tree are byte-identical to the upstream commit above. All deployment-specific behavior is supplied entirely at runtime through environment variables (documented in the upstream `README.md`), not by patching the source:
+Two deviations from upstream: (1) the GCP App Engine example manifests (`gateway.yaml`, `gateway-protohttp.yaml`, `app.yaml`) were removed (see below); (2) two small env-gated access controls were added to `main.go` (see "Added: relay auth + endpoint guard" below). The vendored dependency tree is byte-identical to the upstream commit above, and the Go source is byte-identical apart from those two additions in `main.go`. Other deployment-specific behavior is supplied entirely at runtime through environment variables (documented in the upstream `README.md`), not by patching the source:
 
 - `SEED_SECRET_KEY`, the 32-byte HPKE seed, injected at deploy time from the host's secret store and never committed. The gateway runs with `LOG_SECRETS=false`, so the seed is never printed.
 - `ALLOWED_TARGET_ORIGINS`, restricts the gateway to an allowlist of origins it may fetch (everything else is refused).
+- `RELAY_GATEWAY_SECRET`, the shared secret the relay attaches as `X-Columbia-Relay-Auth`; the gateway rejects `/gateway` requests without it (see below). Empty/unset = open.
+
+## Added: relay auth + endpoint guard (`main.go`)
+
+Two surgical, env-gated additions to `main.go`; nothing else in the Go source changes:
+
+- **Relay→gateway auth.** A `requireRelaySecret` middleware wraps the main gateway endpoint and rejects any request whose `X-Columbia-Relay-Auth` header doesn't match `RELAY_GATEWAY_SECRET` (constant-time compare), **before** HPKE decapsulation. Empty/unset = check disabled (open), preserving upstream behavior. Set the SAME value on the relay (`RELAY_GATEWAY_SECRET`) and the gateway; set it on the relay first, then the gateway, so there's no window where the gateway 401s all relay traffic.
+- **Endpoint registration guard.** Registration now skips any endpoint whose pattern is the empty string (Go's `http.HandleFunc` panics on `""`). In production set `ECHO_ENDPOINT=""` and `METADATA_ENDPOINT=""` to disable the reflective `/gateway-echo` and `/gateway-metadata` self-test handlers, which echo inbound request headers via `httputil.DumpRequest`. The in-code defaults are unchanged (`/gateway-echo`, `/gateway-metadata`), so the self-test path stays available in dev/staging.
 
 ## Removed: the GCP App Engine manifests
 
