@@ -301,3 +301,60 @@ test('(g) boots under the entrypoint and serves a public key from a PKCS#1 signi
     child.kill('SIGKILL');
   }
 });
+
+// --- (h) App Attest clientDataHash <-> blinded[] binding --------------------
+//
+// The issuer binds the App Attest clientDataHash to the exact blinded batch and
+// epoch (REQUIRE_CLIENT_DATA_BINDING). This proves the device authorized THESE
+// tokens, not just that a genuine device is present. Assert the binding hash is
+// deterministic, order-sensitive, payload-sensitive, and epoch-sensitive, so a
+// captured assertion cannot be replayed against a different batch.
+test('(h) expectedClientDataHash binds the blinded batch + epoch', () => {
+  const { expectedClientDataHash } = issuer;
+  const epoch = 12345;
+  const a = Buffer.from('aaaa', 'utf8').toString('base64');
+  const b = Buffer.from('bbbb', 'utf8').toString('base64');
+
+  const h1 = expectedClientDataHash(epoch, [a, b]);
+  assert.strictEqual(h1.length, 32, 'binding hash is SHA-256');
+
+  // Deterministic for the same inputs.
+  assert.ok(h1.equals(expectedClientDataHash(epoch, [a, b])), 'same inputs -> same hash');
+
+  // Order-sensitive: swapping the batch order changes the binding.
+  assert.ok(!h1.equals(expectedClientDataHash(epoch, [b, a])), 'order changes the hash');
+
+  // Payload-sensitive: a different blinded message changes the binding (this is
+  // what stops replay against a different batch).
+  const c = Buffer.from('cccc', 'utf8').toString('base64');
+  assert.ok(!h1.equals(expectedClientDataHash(epoch, [a, c])), 'different payload -> different hash');
+
+  // Epoch-sensitive: the same batch in a different epoch binds differently.
+  assert.ok(!h1.equals(expectedClientDataHash(epoch + 1, [a, b])), 'different epoch -> different hash');
+
+  // The 0x00 separators make the preimage unambiguous: [ab] and [a,b] differ.
+  const ab = Buffer.from('aaaabbbb', 'utf8').toString('base64');
+  assert.ok(!expectedClientDataHash(epoch, [ab]).equals(expectedClientDataHash(epoch, [a, b])),
+    'concatenated single message must not collide with two messages');
+});
+
+// --- (i) re-attestation must not roll the assertion counter backwards --------
+//
+// A fresh attestation reports signCount 0. If a device re-attests an existing
+// keyId, the store must KEEP the higher counter so the assertion-replay window is
+// not re-opened (security review F2).
+test('(i) ATTEST_STORE preserves the higher sign counter on re-attestation', () => {
+  const { ATTEST_STORE } = issuer;
+  const keyId = 'test-keyid-' + crypto.randomBytes(8).toString('hex');
+  const pem = '-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----\n';
+
+  // Register, then advance the counter via assertions.
+  ATTEST_STORE.setAttestedKey(keyId, pem, 0);
+  ATTEST_STORE.setSignCount(keyId, 42);
+  assert.strictEqual(ATTEST_STORE.getAttestedKey(keyId).signCount, 42);
+
+  // Re-attestation reports 0; the store must keep 42, not roll back.
+  ATTEST_STORE.setAttestedKey(keyId, pem, 0);
+  assert.strictEqual(ATTEST_STORE.getAttestedKey(keyId).signCount, 42,
+    're-attestation must not reset the counter to 0');
+});
