@@ -68,6 +68,15 @@ const REDEMPTION_MAX_KEYS = parseInt(process.env.REDEMPTION_MAX_KEYS || '5000000
 const RELAY_GATEWAY_SECRET = process.env.RELAY_GATEWAY_SECRET || '';
 const RELAY_GATEWAY_HEADER = 'x-columbia-relay-auth';
 
+// --- Front Door origin lock -------------------------------------------------
+// When set, the relay accepts a request only if it arrived through our Azure
+// Front Door, which injects the X-Azure-FDID header carrying our profile's
+// Front Door ID. This pins the public origin to Front Door so the Container App
+// FQDN can't be hit directly. Empty/unset => disabled (preserves current
+// behavior exactly), so the check is inert until an operator sets REQUIRE_FDID
+// at deploy time once Front Door is provisioned. The FDID value is NEVER logged.
+const REQUIRE_FDID = process.env.REQUIRE_FDID || '';
+
 // --- Public key-config passthrough ------------------------------------------
 // When the gateway runs internal-only, clients can no longer fetch its public
 // GET /ohttp-configs (the key config they pin). The relay — the sole public hop
@@ -313,6 +322,29 @@ function timingSafeEqualStr(presented, expected) {
   return crypto.timingSafeEqual(ha, hb);
 }
 
+// Front Door origin lock check. Returns true if the request is allowed to
+// proceed: either REQUIRE_FDID is unset (lock disabled) or the request carries a
+// matching X-Azure-FDID. A request may carry MULTIPLE x-azure-fdid values (Node
+// comma-joins a repeated header), so we split and accept if ANY token matches
+// REQUIRE_FDID via the constant-time compare. The header value is NEVER logged.
+function frontDoorAllowed(req) {
+  if (!REQUIRE_FDID) return true; // lock disabled => behavior unchanged
+  const raw = req.headers['x-azure-fdid'];
+  if (typeof raw !== 'string' || raw.length === 0) return false;
+  for (const tok of raw.split(',')) {
+    if (timingSafeEqualStr(tok.trim(), REQUIRE_FDID)) return true;
+  }
+  return false;
+}
+
+// The set of paths exempt from the Front Door origin lock. Only GET /health is
+// exempt on the relay: the platform health probe hits it in-environment with no
+// Front Door in that hop. Every other relay route (/relay, /ohttp-configs)
+// requires the FDID when REQUIRE_FDID is set.
+function fdidExempt(req, path) {
+  return req.method === 'GET' && path === '/health';
+}
+
 // Short-lived cache of the gateway's public key config. { body, contentType, fetchedAt }.
 let configCache = null;
 
@@ -376,6 +408,21 @@ function serveConfig(res, start) {
 
 const server = http.createServer((req, res) => {
   const start = Date.now();
+
+  // Front Door origin lock. When REQUIRE_FDID is set, every non-exempt request
+  // must arrive through Azure Front Door (which injects X-Azure-FDID). This runs
+  // BEFORE any route does work so a direct-to-origin hit is rejected up front.
+  // GET /health is exempt so the platform probe still passes. The FDID value is
+  // never logged; we log only the route + status. When REQUIRE_FDID is unset this
+  // whole block is a no-op and behavior is exactly as before.
+  if (REQUIRE_FDID) {
+    const path = String(req.url || '').split('?')[0];
+    if (!fdidExempt(req, path) && !frontDoorAllowed(req)) {
+      res.writeHead(403); res.end();
+      log({ route: path, status: 403, durationMs: Date.now() - start });
+      return;
+    }
+  }
 
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });

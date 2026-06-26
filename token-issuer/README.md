@@ -140,6 +140,7 @@ so they self-expire when the epoch rolls.
 | `APPLE_APP_ATTEST_AAGUID` | `appattest` | `appattest` for production, `appattestdevelop` for dev/TestFlight builds |
 | `APP_ATTEST_CLOCK_SKEW_MS` | `300000` | tolerance (ms) when checking the x5c certs' validity windows, for issuer/Apple clock drift |
 | `REQUIRE_CLIENT_DATA_BINDING` | `1` (on) | require the App Attest `clientDataHash` to commit to the exact `blinded[]` batch + epoch (see below). Set to `0` only during client bring-up, before the iOS client computes the matching hash |
+| `REQUIRE_FDID` | unset | when set, reject any request whose `X-Azure-FDID` header does not match, so the issuer only accepts traffic that arrived through your front door (CDN/WAF). `/health` and `/issuer-keys` are exempt. Empty/unset disables the check |
 
 The signing key is injected exactly like the gateway's `SEED_SECRET_KEY`: from your
 host's secret store at runtime, never written to disk in this repo.

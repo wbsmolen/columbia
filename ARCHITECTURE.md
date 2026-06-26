@@ -30,6 +30,8 @@ flowchart LR
 | Gateway | decapsulates the request, fetches an allowlisted target, re-encapsulates | request content, never the client IP |
 | Commons cache (optional) | fetches each public item once, serves many | public content only, no user identity |
 
+The token issuer sits off this request path. It gates who may use the relay by issuing anonymous tokens the relay verifies, never touching the request itself; see [Anonymous client tokens](#anonymous-client-tokens).
+
 The transport is [OHTTP (RFC 9458)](https://www.rfc-editor.org/rfc/rfc9458). The client HPKE-seals each request against the gateway's public key (`message/ohttp-req`), the relay forwards the sealed bytes on without revealing the client, the gateway decrypts to the inner [Binary HTTP (RFC 9292)](https://www.rfc-editor.org/rfc/rfc9292) (`message/bhttp`) request, fetches the target, and returns the HPKE-sealed response (`message/ohttp-res`). The crypto is HPKE ([RFC 9180](https://www.rfc-editor.org/rfc/rfc9180)). The gateway publishes two key configs: a primary config using KEM `X25519+Kyber768-draft00` (KEM id `0x30`), a draft, non-RFC, post-quantum hybrid of X25519 and Kyber768 (treat it as experimental), and a legacy config using `DHKEM(X25519, HKDF-SHA256)` (KEM id `0x20`), the classical RFC 9180 suite. Both pair the KEM with `HKDF-SHA256` and `AES-128-GCM`. The gateway is Cloudflare's `privacy-gateway-server-go` (vendored, BSD-3). A classical-only RFC 9458 client interoperates by selecting the legacy config (KEM `0x20`); the primary config is a draft post-quantum suite that not every client supports.
 
 ### Abuse controls
@@ -38,13 +40,30 @@ The relay is the public surface, so it carries the abuse controls. The design co
 
 - A per-IP fixed-window rate limit plus a global in-flight concurrency cap, both env-tunable. The per-IP key is the address the trusted ingress terminates: behind a managed ingress the TCP peer is the ingress, so the relay reads the rightmost `X-Forwarded-For` entry. That IP is the same one the relay already terminates and is allowed to see; using it as a transient counter key reveals nothing the relay did not already hold, and it is never written to a log or forwarded to the gateway. Over-limit requests get a 429. A bounded key table keeps a spoofed-source flood from growing memory.
 - A strict request shape: only `POST /relay` with `Content-Type: message/ohttp-req` is served (wrong type returns 415, any other path or method returns 404), so there is no general proxy surface to probe.
-- A pluggable client-auth hook with three modes: off (network controls only), an interim shared-secret header checked in constant time, and a future token mode for App Attest plus blind-signed Privacy Pass tokens once a separate issuer exists. The shared-secret mode is an extractable speed-bump, not real client authentication; the credential is never logged.
+- A pluggable client-auth hook with three modes: `off` (network controls only), `secret` (a shared-secret header checked in constant time), and `token` (an anonymous issuer-signed token verified offline). The shared-secret mode is an extractable speed-bump, not real client authentication. The token mode is the real client gate, backed by the token issuer below. The credential is never logged in any mode.
 
-A relay→gateway shared secret runs alongside these. The relay attaches a constant `X-Columbia-Relay-Auth` header to its outbound request, and the gateway rejects `/gateway` traffic that lacks a matching value (constant-time, before any HPKE work). Being constant across all requests, it identifies the relay, never a client, so it leaks nothing about who is on the other end.
+A relay-to-gateway shared secret runs alongside these. The relay attaches a constant `X-Columbia-Relay-Auth` header to its outbound request, and the gateway rejects `/gateway` traffic that lacks a matching value (constant-time, before any HPKE work). Being constant across all requests, it identifies the relay, never a client, so it leaks nothing about who is on the other end.
 
 ### Single public surface
 
-The hardened deployment makes the relay the only publicly reachable component and runs the gateway and the commons cache on internal ingress, reachable only from inside the environment. With the gateway internal, clients can no longer fetch its `GET /ohttp-configs` to pin the public key config, so the relay proxies that one read-only endpoint: it returns the gateway's key-config bytes verbatim, cached briefly. The key config is public material clients are meant to pin, so this passthrough adds no surface that could leak identity. This posture sits on top of the two-operator non-collusion split, not in place of it: each operator still runs its own component, and the gateway is simply no longer exposed to the open internet. [SELFHOSTING.md](./SELFHOSTING.md#single-public-surface-internal-gateway-and-commons) covers the deployment details.
+The relay is the only publicly reachable component. The gateway and the commons cache run on internal ingress, reachable only from inside the environment, and the token issuer is its own public service alongside the relay. With the gateway internal, clients cannot fetch its `GET /ohttp-configs` to pin the public key config, so the relay proxies that one read-only endpoint: it returns the gateway's key-config bytes verbatim, cached briefly. The key config is public material clients are meant to pin, so this passthrough adds no surface that could leak identity. This posture sits on top of the two-operator non-collusion split, not in place of it: each operator still runs its own component, and the gateway stays off the open internet. [SELFHOSTING.md](./SELFHOSTING.md#single-public-surface-internal-gateway-and-commons) covers the deployment details.
+
+### Edge front door
+
+A CDN or WAF can sit in front of the public relay and issuer to absorb DDoS and rate-limit per IP at the edge before traffic reaches the origins. When the relay and issuer are configured to require it, they reject any request that did not arrive through that front door, verified through a front-door identifier the front door injects into a header. This pins each public origin to the front door so its host cannot be hit directly. The check is inert unless an operator enables it, and the identifier is never logged. Health probes are exempt so the platform can still reach the origins in-environment, and the issuer's `GET /issuer-keys` is exempt because the relay fetches it directly. A managed front door is one way to run this; any CDN or WAF that injects a verifiable origin-lock header works. See [SELFHOSTING.md](./SELFHOSTING.md#edge-front-door-cdn--waf).
+
+## Anonymous client tokens
+
+`token` mode answers a question the network controls cannot: let only a genuine, rate-limited client use the relay, without that gate becoming a way to identify the client. The token issuer is a separate service that plays the Attester and Issuer roles of the Privacy Pass architecture ([RFC 9576](https://www.rfc-editor.org/rfc/rfc9576)).
+
+- The device proves it is genuine Apple hardware running an unmodified install with App Attest. The issuer is the one component allowed to see the device identity at issuance time.
+- The device blinds its token inputs locally and sends only the blinded messages. The issuer blind-signs each with the current epoch RSA private key ([RFC 9474](https://www.rfc-editor.org/rfc/rfc9474), `RSABSSA-SHA384-PSS`, the Apple Private Access Token construction from [RFC 9578](https://www.rfc-editor.org/rfc/rfc9578)) and returns blind signatures. It never unblinds, so it never sees a finished token.
+- A per-device per-epoch quota bounds issuance, so even a genuine device is rate limited.
+- The device finalizes each token locally, then spends one per relay request in the outer OHTTP header. The relay verifies the signature offline against the issuer's published epoch public key and enforces spend-once. It fetches that public key once and caches it, so there is no per-request call to the issuer and the issuer never learns which token was spent.
+
+The blind signature severs the device identity the issuer saw at issuance from the token the relay sees at spend time. The unblinding factor never leaves the device, so even if one operator ran both the issuer and the relay, it could not match a token back to the device that requested it from a single request. Keep them under separate non-colluding operators anyway: with enough traffic shaping, an operator that holds both views could begin to correlate issuance and spend timing across many requests. The keypair rotates per epoch (one week by default), so everyone issued in the same epoch is one anonymity set, and the quota counter and spend-once set both self-expire when the epoch rolls.
+
+The exact wire format, the App Attest binding, and the epoch model are in [`token-issuer/PROTOCOL.md`](./token-issuer/PROTOCOL.md).
 
 ## Trust and threat model
 
@@ -56,9 +75,10 @@ The design keeps identity and content with two separate parties, so neither one 
 | Relay | yes | no | only ever holds `message/ohttp-req` ciphertext, can't decrypt |
 | Gateway | no | yes | the relay sends a fresh request with no client IP or headers; the gateway holds the HPKE seed |
 | Commons cache | no | public content only | sits behind the gateway, serves identical public content to everyone |
+| Token issuer | sees the device id at issuance | no | only blinded token requests; never the finished token, never the content it is spent on |
 | Upstream | sees the gateway's IP | yes | never sees your IP, sees one shared fetcher |
 
-No single party ever holds identity and content at the same time. The relay has identity without content, the gateway has content without identity.
+No single party ever holds identity and content at the same time. The relay has identity without content, the gateway has content without identity, and the issuer sees a device identity but only blinded material it cannot tie to any spent token.
 
 ### Non-collusion
 

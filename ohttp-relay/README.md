@@ -29,7 +29,7 @@ sequenceDiagram
     participant commons as Commons Cache
 
     Note over client: HPKE-seal request
-    client->>relay: POST / · Content-Type message/ohttp-req · opaque ciphertext
+    client->>relay: POST /relay · Content-Type message/ohttp-req · opaque ciphertext
     Note over relay: strip ALL client headers + IP<br/>then fresh POST /gateway
     relay->>gateway: POST /gateway · Content-Type message/ohttp-req
     Note over gateway: HPKE-decapsulate<br/>to inner message/bhttp
@@ -54,7 +54,8 @@ sequenceDiagram
 | Route | Method | Purpose |
 |---|---|---|
 | `/health` | `GET` | liveness, returns `ok` |
-| `/` | `POST` | accepts a `message/ohttp-req` body, forwards it to the gateway's `/gateway`, returns the `message/ohttp-res` body verbatim |
+| `/relay` | `POST` | accepts a `message/ohttp-req` body, forwards it to the gateway's `/gateway`, returns the `message/ohttp-res` body verbatim |
+| `/ohttp-configs` | `GET` | proxies the gateway's public key config so clients can pin the key while the gateway stays internal |
 
 ## What it deliberately does not forward
 
