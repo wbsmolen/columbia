@@ -338,6 +338,28 @@ test('(h) expectedClientDataHash binds the blinded batch + epoch', () => {
     'concatenated single message must not collide with two messages');
 });
 
+// --- (h2) CROSS-CHECK VECTOR: the binding hash bytes are pinned ---------------
+//
+// This is the shared vector that pins the clientDataHash byte layout to a known
+// value for a fixed (epoch, blinded[]) input. The Swift client mirrors this exact
+// expected hex in BlindRSATokenTests. If either side ever changes the construction
+// (the leading epoch string, the 0x00 separators, the order, or the raw-bytes
+// hashing) one of the two tests turns red, so the two implementations cannot drift
+// apart silently even though the full end-to-end path needs a physical device.
+//
+// Vector: epoch = 2871, blinded = [ 0x11 x256, 0x22 x256 ] (two 256-byte messages).
+test('(h2) expectedClientDataHash matches the pinned cross-check vector (mirrored in Swift)', () => {
+  const { expectedClientDataHash } = issuer;
+  const epoch = 2871;
+  const b0 = Buffer.alloc(256, 0x11).toString('base64');
+  const b1 = Buffer.alloc(256, 0x22).toString('base64');
+
+  const got = expectedClientDataHash(epoch, [b0, b1]).toString('hex');
+  const PINNED = 'b3ebf7a2a03f8b0d372681555499a9d46d3017722a493cf841d80dad23e174ed';
+  assert.strictEqual(got, PINNED,
+    'binding hash for the fixed vector must equal the value the Swift test also pins');
+});
+
 // --- (i) re-attestation must not roll the assertion counter backwards --------
 //
 // A fresh attestation reports signCount 0. If a device re-attests an existing

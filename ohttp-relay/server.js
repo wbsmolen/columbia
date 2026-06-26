@@ -41,7 +41,12 @@ const RATE_MAX_KEYS  = parseInt(process.env.RATE_MAX_KEYS  || '100000', 10);// b
 // The verify function is pluggable so 'token' slots in without restructuring.
 const CLIENT_AUTH_MODE = (process.env.CLIENT_AUTH_MODE || 'off').toLowerCase();
 const CLIENT_SECRET    = process.env.CLIENT_SECRET || '';
-const CLIENT_AUTH_HEADER = (process.env.CLIENT_AUTH_HEADER || 'authorization').toLowerCase();
+// Header the client presents its credential in. Default 'x-lander-token' so the
+// token mode reads exactly what the app sends (one header carrying the whole
+// PrivateToken envelope) with no extra config. The 'secret' mode reuses the same
+// header. An operator may override to 'authorization' if they prefer to carry the
+// token there; the client would then send the same value under that header.
+const CLIENT_AUTH_HEADER = (process.env.CLIENT_AUTH_HEADER || 'x-lander-token').toLowerCase();
 
 // --- Token mode (Privacy Pass / Private Access Token) -----------------------
 // In 'token' mode the client presents an anonymous, unlinkable blind-RSA token in
@@ -136,9 +141,10 @@ function rateLimited(ipBucket) {
 }
 
 // Constant-time credential check. 'secret': require the header to equal
-// CLIENT_SECRET (timing-safe). 'token': stub that fails closed until Privacy
-// Pass / PAT verification is wired in — swap verifyAccessToken's body only. The
-// credential is NEVER logged.
+// CLIENT_SECRET (timing-safe). 'token': verify the Privacy Pass / PAT token in the
+// header via verifyAccessToken (offline RSA-PSS verify against the issuer epoch
+// public key + spend-once). Both modes read CLIENT_AUTH_HEADER. The credential is
+// NEVER logged. See ../token-issuer/PROTOCOL.md for the token wire format.
 function clientAuthorized(req) {
   if (CLIENT_AUTH_MODE === 'off') return true;
   if (CLIENT_AUTH_MODE === 'secret') {
@@ -236,10 +242,14 @@ function tryRedeem(nullifier) {
   return true;
 }
 
-// Token mode verification. The client presents, in the auth header, a compact
-// token: base64url( JSON{ keyId, tokenInput, signature } ), where signature is the
-// finalized blind-RSA (RSA-PSS/SHA-384) signature over tokenInput, issued blindly
-// so the issuer never saw this exact (tokenInput, signature) pair.
+// Token mode verification. The client presents, in the CLIENT_AUTH_HEADER (default
+// 'x-lander-token'), a compact token:
+//   PrivateToken <base64url( JSON{ keyId, tokenInput, signature } )>
+// where the outer envelope is base64url and tokenInput + signature inside the JSON
+// are standard base64. signature is the finalized blind-RSA (RSA-PSS/SHA-384,
+// 48-byte salt) signature over tokenInput, issued blindly so the issuer never saw
+// this exact (tokenInput, signature) pair. A 'PrivateToken ' or 'Bearer ' prefix is
+// optional. See ../token-issuer/PROTOCOL.md for the full contract.
 //
 // We (1) parse it, (2) look up the issuer epoch public key by keyId, (3) verify the
 // RSA-PSS signature over tokenInput offline, (4) enforce spend-once via a nullifier
