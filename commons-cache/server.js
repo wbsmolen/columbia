@@ -26,6 +26,10 @@ const PORT = parseInt(process.env.PORT || '8080', 10); // non-root can't bind <1
 const TTL_MS = parseInt(process.env.COMMONS_TTL_MS || '60000', 10);        // fresh window
 const SWR_MS = parseInt(process.env.COMMONS_SWR_MS || '300000', 10);       // serve-stale window
 const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || 'https://example.com').replace(/\/+$/, '');
+// Path appended to UPSTREAM_BASE, with {id} and {sort} substituted (each
+// sanitized and percent-encoded). Default is the generic form; an operator can
+// set e.g. /r/{id}/{sort}/.rss to target a specific upstream without a code edit.
+const UPSTREAM_PATH_TEMPLATE = process.env.UPSTREAM_PATH_TEMPLATE || '/{id}/{sort}.rss';
 const UPSTREAM_UA = process.env.UPSTREAM_UA ||
   'columbia-commons/1.0 (+https://example.com)';
 const MAX_ENTRIES = parseInt(process.env.COMMONS_MAX_ENTRIES || '5000', 10);     // cache bound (LRU)
@@ -126,10 +130,15 @@ async function fetchUpstream(url) {
   }
 }
 
-// Build the upstream URL for an (id, sort) pair. Adapt this template to your own
-// target origin/path; it is the single integration point for the cache.
+// Build the upstream URL for an (id, sort) pair. The path is driven by
+// UPSTREAM_PATH_TEMPLATE so the upstream layout is config, not code. id/sort are
+// already sanitized by the caller; we percent-encode each before substituting so
+// the template controls structure only and can never be used for path injection.
 function upstreamUrl(id, sort) {
-  return `${UPSTREAM_BASE}/${encodeURIComponent(id)}/${encodeURIComponent(sort)}.rss`;
+  const path = UPSTREAM_PATH_TEMPLATE
+    .replace(/\{id\}/g, encodeURIComponent(id))
+    .replace(/\{sort\}/g, encodeURIComponent(sort));
+  return `${UPSTREAM_BASE}${path.startsWith('/') ? '' : '/'}${path}`;
 }
 
 // Cache with stale-while-revalidate semantics.
