@@ -62,6 +62,11 @@ docker run -d --name gateway --network columbia -p 8080:8080 \
 | `ALLOWED_TARGET_ORIGINS` | yes | comma-separated allowlist of fetchable origins; everything else is 403 |
 | `LOG_SECRETS` | recommended `false` | keeps the seed from ever being printed |
 | `PORT` | `8080` | listen port (runs as non-root; below 1024 needs privilege) |
+| `RELAY_GATEWAY_SECRET` | (none) | when set, the gateway rejects `/gateway` requests that lack a matching `X-Columbia-Relay-Auth`; set the SAME value as the relay |
+| `ECHO_ENDPOINT` | `/gateway-echo` | set to `""` in production to unregister the reflective echo self-test endpoint |
+| `METADATA_ENDPOINT` | `/gateway-metadata` | set to `""` in production to unregister the reflective metadata self-test endpoint |
+
+The `RELAY_GATEWAY_SECRET`, `ECHO_ENDPOINT`, and `METADATA_ENDPOINT` controls are described in detail in [`ohttp-gateway/VENDORED.md`](./ohttp-gateway/VENDORED.md). See [Abuse controls](#abuse-controls) below for how to set the shared secret without a window where the gateway 401s all relay traffic.
 
 The gateway exposes the upstream reference endpoints, including:
 
@@ -91,10 +96,20 @@ docker run -d --name relay --network columbia -p 8081:8080 \
 
 | Env var | Required | Purpose |
 |---|---|---|
-| `GATEWAY_URL` | yes | full gateway endpoint, e.g. `https://<gateway-host>/gateway` |
+| `GATEWAY_URL` | yes | full gateway endpoint, e.g. `https://<gateway-host>/gateway` (must be `https`) |
 | `PORT` | `8080` | listen port |
+| `RATE_LIMIT_RPM` | `120` | per-IP requests per minute; `0` disables per-IP limiting |
+| `RATE_WINDOW_MS` | `60000` | length of the fixed rate-limit window |
+| `MAX_INFLIGHT` | `256` | global cap on concurrent relays; further requests get a 429 |
+| `RATE_MAX_KEYS` | `100000` | hard cap on tracked IP keys, so a spoofed-source flood can't grow the table unbounded |
+| `CLIENT_AUTH_MODE` | `off` | client auth: `off`, `secret` (shared-secret header), or `token` (future) |
+| `CLIENT_SECRET` | (none) | shared secret required when `CLIENT_AUTH_MODE=secret` |
+| `CLIENT_AUTH_HEADER` | `authorization` | header the client presents its credential in |
+| `RELAY_GATEWAY_SECRET` | (none) | shared secret sent to the gateway as `X-Columbia-Relay-Auth`; set the SAME value on the gateway |
+| `GATEWAY_CONFIGS_URL` | gateway host + `/ohttp-configs` | where the relay fetches the key config to pass through |
+| `CONFIG_TTL_MS` | `120000` | how long the relay caches the passed-through key config |
 
-> The relay forwards only the ciphertext body plus `Content-Type: message/ohttp-req`. Dropping every client header is the security property, not an oversight.
+> The relay forwards only the ciphertext body plus `Content-Type: message/ohttp-req`. Dropping every client header is the security property, not an oversight. The one extra header it adds to the outbound request is `X-Columbia-Relay-Auth` (when `RELAY_GATEWAY_SECRET` is set), which identifies the relay, never the client.
 
 ## 5. (Optional) Build and run the commons cache
 
@@ -132,6 +147,32 @@ curl http://localhost:8082/health   # commons cache
 ```
 
 To exercise the full encrypted path, use an OHTTP client. Fetch the gateway's key config (`/ohttp-configs`), HPKE-seal a `message/bhttp` request against it, and `POST` the resulting `message/ohttp-req` body to the relay. The relay returns the `message/ohttp-res` body for the client to open locally. Any RFC 9458 client library works, including the test client that ships with the upstream gateway.
+
+## Abuse controls
+
+The relay is the one public surface, so it carries the abuse controls. All of them keep state in memory only, key nothing to request content, and are never logged, so they do not weaken the operator-blind property. They are off or permissive by default; turn them on for a public deployment.
+
+- **Per-IP rate limiting and a concurrency cap.** `RATE_LIMIT_RPM` (default 120) bounds requests per minute per client IP over a `RATE_WINDOW_MS` window (default 60000); set `RATE_LIMIT_RPM=0` to disable it. `MAX_INFLIGHT` (default 256) caps concurrent relays across the whole process. Anything over either limit gets a 429. `RATE_MAX_KEYS` (default 100000) bounds the limiter's memory so a spoofed-source flood can't grow the table. Behind a managed ingress the per-IP key is read from the rightmost `X-Forwarded-For` entry, because the TCP peer is the ingress, not the client. That IP is used only as a transient counter key; it is never logged or forwarded to the gateway.
+- **Strict request shape.** The relay answers only `POST /relay` with `Content-Type: message/ohttp-req`. A wrong content type returns 415; any other path or method returns 404. There is no general proxy surface to probe.
+- **Client auth (`CLIENT_AUTH_MODE`).** `off` (default) relies on network controls only. `secret` requires a shared secret in the `CLIENT_AUTH_HEADER` (default `authorization`), checked in constant time against `CLIENT_SECRET`. Be honest about what this is: a shared secret shipped in a client is extractable, so `secret` mode is a speed-bump against casual abuse, not real client authentication. The mode is built as a pluggable hook so the intended design, App Attest plus blind-signed Privacy Pass tokens (`token` mode), slots in once the separate token issuer lands. `token` fails closed until then.
+
+## Single public surface (internal gateway and commons)
+
+The hardened posture is to make the relay the ONLY publicly reachable component and run the gateway and the commons cache on internal ingress, reachable only from inside the environment. This shrinks the attack surface to the one hop that has to be public, and it composes with the two-operator split below rather than replacing it: each operator still runs its own component, the gateway is just no longer exposed to the open internet.
+
+Two pieces make this work:
+
+- **Relay→gateway shared secret.** Set `RELAY_GATEWAY_SECRET` to the same value on the relay and the gateway. The relay attaches it as `X-Columbia-Relay-Auth` on every outbound request, and the gateway rejects `/gateway` traffic that lacks it (constant-time, before any HPKE work). Set it on the relay FIRST, then the gateway, so there is no window where the gateway 401s relay traffic. The value is constant across all requests, so it identifies the relay, never a client.
+- **Key-config passthrough.** With the gateway internal, clients can no longer reach its `GET /ohttp-configs` to fetch and pin the public key config. The relay proxies it: `GET /ohttp-configs` on the relay returns the gateway's key-config bytes verbatim, cached for `CONFIG_TTL_MS` (default 120000). The key config is public material clients are meant to pin, so passing it through leaks nothing. By default the relay fetches it from the gateway's own host; override with `GATEWAY_CONFIGS_URL` if it lives elsewhere.
+
+In production, also unregister the reflective self-test endpoints on the gateway by setting `ECHO_ENDPOINT=""` and `METADATA_ENDPOINT=""` (see [`ohttp-gateway/VENDORED.md`](./ohttp-gateway/VENDORED.md)).
+
+> Internal-ingress gotcha. On some managed container hosts, "internal" means an in-environment-only address, and flipping a component to internal CHANGES its reachable hostname (for example it gains an `.internal.` segment). The public external FQDN does NOT keep working from inside the environment. When you internalize the gateway and commons, you MUST repoint:
+>
+> - the relay's `GATEWAY_URL` (and `GATEWAY_CONFIGS_URL`, if you set it) to the gateway's new internal hostname, and
+> - the gateway's `ALLOWED_TARGET_ORIGINS` to the commons cache's new internal hostname.
+>
+> Skip the repoint and the relay hits the public edge and gets a 404. Update these in lockstep with the ingress change.
 
 ## Running relay and gateway as separate operators
 
