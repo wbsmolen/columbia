@@ -1,4 +1,4 @@
-# Deploy the three middleware services to Azure Container Apps.
+# Deploy the middleware services to Azure Container Apps.
 #
 # Manual trigger only (workflow_dispatch) — there is no auto-deploy on push.
 # Images are built in ACR and tagged with the immutable commit SHA, then the
@@ -13,6 +13,13 @@
 #   RELAY_APP          Container App name for the OHTTP relay
 #   GATEWAY_APP        Container App name for the OHTTP gateway
 #   COMMONS_APP        Container App name for the commons cache
+#   ISSUER_APP         Container App name for the token issuer
+#
+# NON-COLLUSION NOTE: for the operator-blind guarantee, the token issuer (like the
+# gateway) must not be run by the same operator as the relay. This workflow can
+# build every image, but a real deployment runs the issuer in a separate trust
+# domain. The issuer's signing key and the Apple App Attest inputs are injected as
+# Container App secrets, never baked into the image. See token-issuer/README.md.
 
 name: Deploy middleware to Azure Container Apps
 
@@ -40,6 +47,9 @@ jobs:
           - name: commons-cache
             dir: commons-cache
             app_secret: COMMONS_APP
+          - name: token-issuer
+            dir: token-issuer
+            app_secret: ISSUER_APP
     steps:
       - name: Checkout
         uses: actions/checkout@v4

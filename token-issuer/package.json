@@ -1,0 +1,19 @@
+{
+  "name": "columbia-token-issuer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Columbia Privacy Pass Attester + Issuer: App Attest gated, blind-RSA (RFC 9474) token issuance for the operator-blind relay.",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@cloudflare/blindrsa-ts": "0.4.6"
+  }
+}
