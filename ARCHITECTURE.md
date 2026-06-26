@@ -32,6 +32,20 @@ flowchart LR
 
 The transport is [OHTTP (RFC 9458)](https://www.rfc-editor.org/rfc/rfc9458). The client HPKE-seals each request against the gateway's public key (`message/ohttp-req`), the relay forwards the sealed bytes on without revealing the client, the gateway decrypts to the inner [Binary HTTP (RFC 9292)](https://www.rfc-editor.org/rfc/rfc9292) (`message/bhttp`) request, fetches the target, and returns the HPKE-sealed response (`message/ohttp-res`). The crypto is HPKE ([RFC 9180](https://www.rfc-editor.org/rfc/rfc9180)). The gateway publishes two key configs: a primary config using KEM `X25519+Kyber768-draft00` (KEM id `0x30`), a draft, non-RFC, post-quantum hybrid of X25519 and Kyber768 (treat it as experimental), and a legacy config using `DHKEM(X25519, HKDF-SHA256)` (KEM id `0x20`), the classical RFC 9180 suite. Both pair the KEM with `HKDF-SHA256` and `AES-128-GCM`. The gateway is Cloudflare's `privacy-gateway-server-go` (vendored, BSD-3). A classical-only RFC 9458 client interoperates by selecting the legacy config (KEM `0x20`); the primary config is a draft post-quantum suite that not every client supports.
 
+### Abuse controls
+
+The relay is the public surface, so it carries the abuse controls. The design constraint is that none of them may weaken the operator-blind property, so all of their state is in memory, keyed to nothing that ties back to content, and never logged. It is dropped on restart.
+
+- A per-IP fixed-window rate limit plus a global in-flight concurrency cap, both env-tunable. The per-IP key is the address the trusted ingress terminates: behind a managed ingress the TCP peer is the ingress, so the relay reads the rightmost `X-Forwarded-For` entry. That IP is the same one the relay already terminates and is allowed to see; using it as a transient counter key reveals nothing the relay did not already hold, and it is never written to a log or forwarded to the gateway. Over-limit requests get a 429. A bounded key table keeps a spoofed-source flood from growing memory.
+- A strict request shape: only `POST /relay` with `Content-Type: message/ohttp-req` is served (wrong type returns 415, any other path or method returns 404), so there is no general proxy surface to probe.
+- A pluggable client-auth hook with three modes: off (network controls only), an interim shared-secret header checked in constant time, and a future token mode for App Attest plus blind-signed Privacy Pass tokens once a separate issuer exists. The shared-secret mode is an extractable speed-bump, not real client authentication; the credential is never logged.
+
+A relay→gateway shared secret runs alongside these. The relay attaches a constant `X-Columbia-Relay-Auth` header to its outbound request, and the gateway rejects `/gateway` traffic that lacks a matching value (constant-time, before any HPKE work). Being constant across all requests, it identifies the relay, never a client, so it leaks nothing about who is on the other end.
+
+### Single public surface
+
+The hardened deployment makes the relay the only publicly reachable component and runs the gateway and the commons cache on internal ingress, reachable only from inside the environment. With the gateway internal, clients can no longer fetch its `GET /ohttp-configs` to pin the public key config, so the relay proxies that one read-only endpoint: it returns the gateway's key-config bytes verbatim, cached briefly. The key config is public material clients are meant to pin, so this passthrough adds no surface that could leak identity. This posture sits on top of the two-operator non-collusion split, not in place of it: each operator still runs its own component, and the gateway is simply no longer exposed to the open internet. [SELFHOSTING.md](./SELFHOSTING.md#single-public-surface-internal-gateway-and-commons) covers the deployment details.
+
 ## Trust and threat model
 
 The design keeps identity and content with two separate parties, so neither one can reconstruct your reading history.
