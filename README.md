@@ -4,7 +4,7 @@
 
 Columbia is named after Apollo 11's Command and Service Module, the ship that stayed up in orbit while the lander went down, with no view of what happened on the surface.
 
-It's a small toolkit with almost no dependencies. You point it at HTTP content and fetch through a split-trust path built on OHTTP ([RFC 9458](https://www.rfc-editor.org/rfc/rfc9458)). There are three pieces, each a separate service you run yourself, on plain Docker, on whatever host you want.
+It's a small toolkit with almost no dependencies. You point it at HTTP content and fetch through a split-trust path built on OHTTP ([RFC 9458](https://www.rfc-editor.org/rfc/rfc9458)). Three services carry the request path (relay, gateway, commons cache), and a fourth optional service (the token issuer) gates who may use the relay without identifying them. Each is a service you run yourself, on plain Docker, on whatever host you want.
 
 The property that matters is this: no single operator ever holds your identity and your content at the same time. The relay sees your IP but only opaque ciphertext. The gateway decrypts and fetches but never sees your IP. Run those two as separate operators and neither one can connect you to what you read.
 
@@ -49,7 +49,7 @@ The full trust and threat model, the attestation chain, and the observability de
 
 - Fetching your own HTTP reads through a split-trust path, so neither hop can tie your network identity to what you asked for.
 - Caching public content without being able to see who read it. Put the commons cache in front of public, sessionless endpoints (listings, feeds, public APIs) and many reads collapse into a handful of upstream fetches.
-- A starting point for building operator-blind transports into your own apps. The pieces are small, they stick to published standards (RFC 9458, 9292, 9180), and they're short enough to read end to end.
+- A starting point for building operator-blind transports into your own apps. The pieces are small, they stick to published standards (RFC 9458, 9292, 9180 for the transport; RFC 9576, 9474, 9578 for the anonymous tokens), and they're short enough to read end to end.
 
 Columbia is a read-path privacy layer, nothing more. It carries public, sessionless reads only. Authenticated and write requests are out of scope by design, not by limitation: your client makes those directly over its own session, so they never touch shared infrastructure at all, which is the more private place for them to run anyway. It is not a VPN, and it never pools or shares credentials.
 
@@ -62,10 +62,27 @@ Columbia is a read-path privacy layer, nothing more. It carries public, sessionl
 | [`ohttp-relay/`](./ohttp-relay) | Strips your IP and all headers, forwards opaque ciphertext to the gateway | your IP plus opaque bytes, never content |
 | [`ohttp-gateway/`](./ohttp-gateway) | Decapsulates the request, fetches the allowlisted target, re-encapsulates the response | request content, never your IP |
 | [`commons-cache/`](./commons-cache) | Fetches each public item once and serves all; TTL plus stale-while-revalidate plus single-flight | public content only, no user identity |
+| [`token-issuer/`](./token-issuer) | App Attest gated, blind-signs anonymous unlinkable tokens the relay verifies offline | the device id at issuance, never the spent token or your content |
 
-- `ohttp-relay/` is a Node service with no dependencies. It forwards `message/ohttp-req` bodies to the gateway in a fresh request that carries no client headers and no `X-Forwarded-For`. As the one public surface it also carries the abuse controls (per-IP rate limiting, a concurrency cap, a strict request shape, and a pluggable client-auth hook), all keeping ephemeral state that is never logged. For the hardened topology it can run as the sole public hop, with the gateway and cache on internal ingress, and pass the gateway's public key config through to clients. See [SELFHOSTING.md](./SELFHOSTING.md). Its logs are RED metrics only.
-- `ohttp-gateway/` is a vendored copy of Cloudflare's [`privacy-gateway-server-go`](https://github.com/cloudflare/privacy-gateway-server-go) (BSD-3, the RFC 9458 reference gateway). The source is unmodified; everything it does is configured at runtime through environment variables. Provenance and the required attribution live in [`ohttp-gateway/VENDORED.md`](./ohttp-gateway/VENDORED.md).
+- `ohttp-relay/` is a Node service with no dependencies. It forwards `message/ohttp-req` bodies to the gateway in a fresh request that carries no client headers and no `X-Forwarded-For`. As the public surface it carries the abuse controls described below. Its logs are RED metrics only.
+- `ohttp-gateway/` is a vendored copy of Cloudflare's [`privacy-gateway-server-go`](https://github.com/cloudflare/privacy-gateway-server-go) (BSD-3, the RFC 9458 reference gateway). The source is unmodified apart from two small env-gated access controls; everything else it does is configured at runtime through environment variables. Provenance and the required attribution live in [`ohttp-gateway/VENDORED.md`](./ohttp-gateway/VENDORED.md).
 - `commons-cache/` is another dependency-free Node service, an optional cache origin for public, sessionless content. It serves `X-Cache: HIT|MISS|STALE` with CDN-ready `Cache-Control` and `Age` headers.
+- `token-issuer/` is its own service. It runs Apple App Attest verification and blind-signs ([RFC 9474](https://www.rfc-editor.org/rfc/rfc9474)) anonymous tokens so the relay can require a genuine, rate-limited client without a login. It is the one component that learns a device identity, and the blinding makes that knowledge useless: it never sees the finished tokens or the content they are spent on. Verifying a spent token at the relay is offline against the issuer's published epoch public key. See [`token-issuer/PROTOCOL.md`](./token-issuer/PROTOCOL.md) for the wire format and [`token-issuer/README.md`](./token-issuer).
+
+---
+
+## Public surface and abuse controls
+
+The relay is the only service that has to be public. The gateway and the commons cache run on internal ingress, reachable only from inside the environment, and the issuer is its own public service alongside the relay. Because the gateway is internal, clients cannot fetch its key config directly, so the relay proxies that one read at `GET /ohttp-configs` and returns the gateway's public key-config bytes verbatim. That is public material clients are meant to pin, so the passthrough leaks nothing.
+
+The relay carries the abuse controls, none of which weaken the operator-blind property because all of their state is in memory, keyed to nothing that ties back to content, and never logged:
+
+- Per-IP rate limiting keyed on the address the trusted ingress appended, plus a global concurrency cap.
+- A strict request shape: only `POST /relay` with `Content-Type: message/ohttp-req` is served.
+- A relay-to-gateway shared secret (`X-Columbia-Relay-Auth`) so the gateway rejects traffic that did not come through the relay.
+- A pluggable client-auth hook with modes `off`, `secret`, and `token`. In `token` mode the relay verifies an anonymous issuer-signed token offline and enforces spend-once.
+
+A CDN or WAF (for example a managed front door) can sit in front of the public relay and issuer to absorb DDoS and rate-limit at the edge. When the relay and issuer are configured to require it, they reject any request that did not arrive through that front door, so the origins cannot be reached directly. See [SELFHOSTING.md](./SELFHOSTING.md).
 
 ---
 
@@ -138,6 +155,7 @@ flowchart TD
     roadmap["ROADMAP.md: hardening / decentralization direction"]
     license["LICENSE: PolyForm Noncommercial 1.0.0"]
     gitignore[".gitignore"]
+    security["SECURITY.md: reporting + the guarantee in scope"]
     commons["commons-cache/: optional public-content cache origin (Node)"]
     commonsfiles["server.js, Dockerfile, deploy-ghcr.sh, README.md"]
     gateway["ohttp-gateway/: VENDORED Cloudflare OHTTP gateway (Go, BSD-3)"]
@@ -145,12 +163,15 @@ flowchart TD
     gatewaysrc["… (unmodified upstream source + vendored Go deps)"]
     relay["ohttp-relay/: OHTTP relay (Node)"]
     relayfiles["server.js, Dockerfile, README.md"]
+    issuer["token-issuer/: App Attest + blind-RSA token issuer (Node)"]
+    issuerfiles["server.js, appattest.js, PROTOCOL.md, Dockerfile, README.md"]
 
     root --> readme
     root --> arch
     root --> self
     root --> roadmap
     root --> license
+    root --> security
     root --> gitignore
     root --> commons
     commons --> commonsfiles
@@ -159,6 +180,8 @@ flowchart TD
     gateway --> gatewaysrc
     root --> relay
     relay --> relayfiles
+    root --> issuer
+    issuer --> issuerfiles
 ```
 
 ## Standards
@@ -168,6 +191,9 @@ flowchart TD
 | [RFC 9458](https://www.rfc-editor.org/rfc/rfc9458) | OHTTP, the relay/gateway split-trust transport |
 | [RFC 9292](https://www.rfc-editor.org/rfc/rfc9292) | Binary HTTP, the inner `message/bhttp` request/response |
 | [RFC 9180](https://www.rfc-editor.org/rfc/rfc9180) | HPKE. The gateway publishes two key configs (see note below). |
+| [RFC 9576](https://www.rfc-editor.org/rfc/rfc9576) | Privacy Pass architecture, the issuer's Attester and Issuer roles |
+| [RFC 9474](https://www.rfc-editor.org/rfc/rfc9474) | Blind RSA (`RSABSSA-SHA384-PSS`), the token blind-signature suite |
+| [RFC 9578](https://www.rfc-editor.org/rfc/rfc9578) | Privacy Pass Token Type 2, the Apple Private Access Token construction the issuer mints |
 
 The gateway publishes two HPKE key configs:
 
