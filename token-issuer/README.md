@@ -129,7 +129,7 @@ so they self-expire when the epoch rolls.
 | Env var | Default | Purpose |
 |---|---|---|
 | `PORT` | `8080` | listen port (non-root can't bind below 1024) |
-| `ISSUER_SIGNING_KEY` | required | the epoch RSA private key, PKCS#8, base64. Injected at runtime, NEVER committed. Missing => fails closed |
+| `ISSUER_SIGNING_KEY` | required | the epoch RSA private key (2048-bit). Either a PEM string or base64 of DER; PKCS#1 or PKCS#8 are both accepted. Injected at runtime, NEVER committed. Missing or unparseable => fails closed |
 | `EPOCH_SECONDS` | `604800` | epoch length in seconds (default one week) |
 | `ISSUANCE_QUOTA_PER_EPOCH` | `256` | max tokens a single device may obtain per epoch. `0` disables the quota |
 | `MAX_TOKENS_PER_REQUEST` | `64` | max blinded messages per `/issue` call |
@@ -204,8 +204,10 @@ the guarantee to hold. See the repo's `SELFHOSTING.md` for the non-collusion mod
 
 ```sh
 # Generate an ephemeral signing key for local testing (do NOT use in production;
-# in production the key is injected from your secret store):
-node -e "const {webcrypto}=require('crypto');const {RSABSSA}=require('@cloudflare/blindrsa-ts');(async()=>{const kp=await RSABSSA.SHA384.PSS.Deterministic().generateKey({modulusLength:2048,publicExponent:new Uint8Array([1,0,1])});process.stdout.write(Buffer.from(await webcrypto.subtle.exportKey('pkcs8',kp.privateKey)).toString('base64'))})()" > /tmp/issuer_key.b64
+# in production the key is injected from your secret store). A plain openssl RSA
+# key works; the issuer accepts PEM or base64-of-DER, PKCS#1 or PKCS#8:
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -outform DER \
+  | base64 | tr -d '\n' > /tmp/issuer_key.b64
 
 ISSUER_SIGNING_KEY="$(cat /tmp/issuer_key.b64)" PORT=8080 node server.js
 curl localhost:8080/health        # -> ok

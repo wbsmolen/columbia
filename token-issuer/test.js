@@ -16,20 +16,24 @@
 // and ISSUER_KEYS_URL unset, so requiring it starts no socket and makes no network
 // call; the epoch public key is injected directly via setIssuerKeysForTest.
 
-'use strict';
+// Native ES module (the issuer package is ESM; see server.js).
 
-const test = require('node:test');
-const assert = require('node:assert');
-const crypto = require('node:crypto');
-const { webcrypto } = crypto;
+import test from 'node:test';
+import assert from 'node:assert';
+import crypto, { webcrypto } from 'node:crypto';
 
-const issuer = require('./server.js');
+import * as issuer from './server.js';
 const { suite, keyIdFromSpki, derivePublicKey } = issuer;
 
 // The relay validates GATEWAY_URL at load and exits if it is missing/not https, so
-// set a valid dummy before requiring. ISSUER_KEYS_URL stays unset => no network.
+// the dummy MUST be set before the relay module is evaluated. Static ESM imports
+// are hoisted and run before any module-body code, so we cannot order a plain
+// assignment before a static import of the relay. A dynamic import() after setting
+// the env var preserves that ordering. The relay is CommonJS, so its module.exports
+// arrives as the namespace's default export. ISSUER_KEYS_URL stays unset => no
+// network call from verifyAccessToken.
 process.env.GATEWAY_URL = process.env.GATEWAY_URL || 'https://gateway.invalid/gateway';
-const relay = require('../ohttp-relay/server.js');
+const relay = (await import('../ohttp-relay/server.js')).default;
 
 // --- Shared helpers ---------------------------------------------------------
 
@@ -224,4 +228,76 @@ test('(f) per-device per-epoch issuance quota reserves and then refuses', () => 
   const fresh = 'test-device-' + crypto.randomBytes(8).toString('hex');
   assert.strictEqual(issuer.reserveQuota(epoch, fresh, huge), false,
     'an over-quota batch must be refused for a fresh device');
+});
+
+// --- (g) signing-key format tolerance + real server boot --------------------
+//
+// Regression for two bugs found by running under the DEPLOY runtime (node 20):
+//   1. The package require()'d an ESM-only dep, which crash-loops on node 20.
+//      This test boots the real server.js as a child process, so if server.js
+//      failed to load it would never answer /issuer-keys.
+//   2. The signing key from `openssl genpkey -algorithm RSA -outform DER` is a
+//      PKCS#1 RSAPrivateKey, which WebCrypto's pkcs8 import rejected, so
+//      /issuer-keys returned 503. This injects exactly that key form and asserts
+//      a real public key comes back.
+//
+// Spawning the actual entrypoint is the only way to prove the boot path; importing
+// the module in-process would skip the ISSUER_SIGNING_KEY -> epoch-key flow.
+test('(g) boots under the entrypoint and serves a public key from a PKCS#1 signing key', async () => {
+  const { spawn } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const path = await import('node:path');
+  const http = await import('node:http');
+
+  // A PKCS#1 RSA private key (node default DER export for an RSA key), base64'd.
+  // This is the encoding `openssl genpkey -algorithm RSA -outform DER` produces and
+  // the one that previously 503'd.
+  const { generateKeyPairSync } = crypto;
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const pkcs1Der = privateKey.export({ type: 'pkcs1', format: 'der' });
+  const signingKeyB64 = Buffer.from(pkcs1Der).toString('base64');
+
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const serverPath = path.join(here, 'server.js');
+  const port = 8000 + Math.floor(Math.random() * 1000);
+
+  const child = spawn(process.execPath, [serverPath], {
+    env: { ...process.env, PORT: String(port), ISSUER_SIGNING_KEY: signingKeyB64 },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  // Helper: one GET, resolves { status, body }.
+  const get = (p) => new Promise((resolve, reject) => {
+    const req = http.get({ host: '127.0.0.1', port, path: p, timeout: 4000 }, (res) => {
+      const c = [];
+      res.on('data', (d) => c.push(d));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(c).toString('utf8') }));
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+  });
+
+  try {
+    // Wait for the server to answer /health (proves it loaded, i.e. no ERR_REQUIRE_ESM).
+    let up = false;
+    for (let i = 0; i < 40 && !up; i++) {
+      try { up = (await get('/health')).status === 200; } catch { /* not yet */ }
+      if (!up) await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.strictEqual(up, true, 'server must boot and answer /health under the entrypoint');
+
+    const keys = await get('/issuer-keys');
+    assert.strictEqual(keys.status, 200, '/issuer-keys must return 200, not 503, for a PKCS#1 key');
+    const doc = JSON.parse(keys.body);
+    assert.strictEqual(doc.suite, 'RSABSSA-SHA384-PSS-Deterministic');
+    assert.ok(Array.isArray(doc.keys) && doc.keys.length >= 1, 'at least one epoch key');
+    assert.ok(typeof doc.keys[0].publicKeySpki === 'string' && doc.keys[0].publicKeySpki.length > 0,
+      'a real public key must be published');
+    // The published SPKI must import as a usable RSA-PSS public key.
+    const spki = Buffer.from(doc.keys[0].publicKeySpki, 'base64');
+    const pub = crypto.createPublicKey({ key: spki, format: 'der', type: 'spki' });
+    assert.strictEqual(pub.asymmetricKeyType, 'rsa', 'published key must be RSA');
+  } finally {
+    child.kill('SIGKILL');
+  }
 });

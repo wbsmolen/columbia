@@ -29,9 +29,9 @@
 //   sign count, cert chain to the App Attest Root CA).
 //   Apple App Attest Root CA: https://www.apple.com/certificateauthority/
 
-'use strict';
+// Native ES module (the package is ESM; see server.js for why).
 
-const crypto = require('crypto');
+import crypto from 'node:crypto';
 
 // --- Operator-supplied inputs (env). Without these we cannot verify. ---------
 
@@ -195,7 +195,7 @@ function lookupAttestedKey(_keyId) {
   return null;
 }
 
-module.exports = {
+export {
   validateAppAttest,
   APP_ATTEST_READY,
   // Exported for tests/operators wiring real implementations in.

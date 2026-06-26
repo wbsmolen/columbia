@@ -27,17 +27,17 @@
 // a device to its tokens. The device id is used transiently for the per-epoch
 // quota check and then dropped. Counters in logs are aggregate only.
 
-'use strict';
+// Native ES module. @cloudflare/blindrsa-ts is ESM-only, so this whole package is
+// ESM ("type": "module" in package.json). require() of an ESM dep throws
+// ERR_REQUIRE_ESM on node 20 (the deploy runtime), so a CommonJS require() here
+// would crash-loop the container even though it happens to work on newer node.
 
-const http = require('http');
-const crypto = require('crypto');
-const { webcrypto } = crypto;
-const { RSABSSA } = require('@cloudflare/blindrsa-ts');
+import http from 'node:http';
+import crypto, { webcrypto } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { RSABSSA } from '@cloudflare/blindrsa-ts';
 
-const {
-  validateAppAttest,
-  APP_ATTEST_READY,
-} = require('./appattest.js');
+import { validateAppAttest, APP_ATTEST_READY } from './appattest.js';
 
 // --- Config -----------------------------------------------------------------
 
@@ -102,18 +102,51 @@ function currentEpoch() {
 
 const epochKeys = new Map(); // epochId -> { priv, pub, spkiB64, keyId }
 
-// Import the operator-supplied PKCS#8 private key for RSA-PSS signing and derive
-// its public key. Used as the base key. Throws if the env key is missing/invalid
-// so the service fails closed rather than issuing under a key nobody controls.
+// Import the operator-supplied RSA private key for RSA-PSS signing and derive its
+// public key. Throws if the env key is missing/invalid so the service fails closed
+// rather than issuing under a key nobody controls.
+//
+// Format-tolerant on purpose. An operator generates the key with whatever tool is
+// at hand, and those tools disagree on the encoding. `openssl genpkey -algorithm
+// RSA -outform DER` emits a bare PKCS#1 RSAPrivateKey; `openssl pkcs8 -topk8`
+// emits PKCS#8; a pasted PEM is text. WebCrypto's pkcs8 import is also strict about
+// the AlgorithmIdentifier OID (a generic rsaEncryption key is rejected when you ask
+// for RSA-PSS). So instead of importing straight into WebCrypto, we parse with
+// node's createPrivateKey (which auto-detects PEM vs DER and PKCS#1 vs PKCS#8),
+// then bridge into a WebCrypto RSA-PSS key via JWK, where the source OID no longer
+// matters. ISSUER_SIGNING_KEY may be a PEM string or base64 of DER.
 async function importBaseKey() {
   if (!ISSUER_SIGNING_KEY_B64) {
     throw new Error('ISSUER_SIGNING_KEY not set');
   }
-  const der = Buffer.from(ISSUER_SIGNING_KEY_B64, 'base64');
   const algo = { name: 'RSA-PSS', hash: PSS_HASH };
-  const priv = await webcrypto.subtle.importKey('pkcs8', der, algo, true, ['sign']);
-  const pub = await derivePublicKey(priv, algo);
+  const nodeKey = parsePrivateKeyEnv(ISSUER_SIGNING_KEY_B64);
+  const kt = nodeKey.asymmetricKeyType;
+  if (kt !== 'rsa' && kt !== 'rsa-pss') {
+    throw new Error('signing key is not RSA');
+  }
+  const jwk = nodeKey.export({ format: 'jwk' });
+  const priv = await webcrypto.subtle.importKey('jwk', jwk, algo, true, ['sign']);
+  const pubJwk = { kty: jwk.kty, n: jwk.n, e: jwk.e, alg: jwk.alg, ext: true };
+  const pub = await webcrypto.subtle.importKey('jwk', pubJwk, algo, true, ['verify']);
   return { priv, pub };
+}
+
+// Parse the env signing key into a node KeyObject, tolerating PEM or base64-of-DER,
+// and PKCS#8 or PKCS#1. Throws on anything unparseable, so the caller fails closed.
+function parsePrivateKeyEnv(envValue) {
+  const s = String(envValue).trim();
+  if (s.includes('-----BEGIN')) {
+    // PEM: createPrivateKey auto-detects PKCS#1 vs PKCS#8 from the header.
+    return crypto.createPrivateKey({ key: s, format: 'pem' });
+  }
+  const der = Buffer.from(s, 'base64');
+  try {
+    return crypto.createPrivateKey({ key: der, format: 'der', type: 'pkcs8' });
+  } catch {
+    // Fall back to a bare PKCS#1 RSAPrivateKey (what some openssl builds emit).
+    return crypto.createPrivateKey({ key: der, format: 'der', type: 'pkcs1' });
+  }
 }
 
 // Derive the public key from a private key by exporting its JWK and stripping the
@@ -408,10 +441,16 @@ server.requestTimeout = 20000;
 server.headersTimeout = 10000;
 server.keepAliveTimeout = 5000;
 
+// Run as the entrypoint? The ESM equivalent of `require.main === module`: compare
+// the file node was invoked with against this module's own URL. When imported by
+// the test harness this is false, so requiring/importing the module does NOT bind
+// a port.
+const isEntrypoint = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+
 // Surface, at startup, whether App Attest is fully wired or still a fail-closed
 // stub, and whether a signing key is present. This is the one place an operator
 // learns the service is running in stub mode - it is NOT silent.
-if (require.main === module) {
+if (isEntrypoint) {
   server.listen(PORT, () => {
     log({
       event: 'listen',
@@ -425,7 +464,7 @@ if (require.main === module) {
 }
 
 // Export internals for the test harness (no network needed to unit test).
-module.exports = {
+export {
   server,
   suite,
   currentEpoch,
