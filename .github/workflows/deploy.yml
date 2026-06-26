@@ -1,0 +1,66 @@
+# Deploy the three middleware services to Azure Container Apps.
+#
+# Manual trigger only (workflow_dispatch) — there is no auto-deploy on push.
+# Images are built in ACR and tagged with the immutable commit SHA, then the
+# matching Container App is updated to that image.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions).
+# Nothing environment-specific is hardcoded in this file; every name and
+# credential comes from a secret:
+#   AZURE_CREDENTIALS  azure/login service-principal JSON (az ad sp ... --sdk-auth)
+#   ACR_NAME           Azure Container Registry name (no .azurecr.io suffix)
+#   RESOURCE_GROUP     resource group holding the registry and container apps
+#   RELAY_APP          Container App name for the OHTTP relay
+#   GATEWAY_APP        Container App name for the OHTTP gateway
+#   COMMONS_APP        Container App name for the commons cache
+
+name: Deploy middleware to Azure Container Apps
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      # Build/update each service independently; a failure in one does not
+      # silently skip reporting the others.
+      fail-fast: false
+      matrix:
+        include:
+          - name: ohttp-relay
+            dir: ohttp-relay
+            app_secret: RELAY_APP
+          - name: ohttp-gateway
+            dir: ohttp-gateway
+            app_secret: GATEWAY_APP
+          - name: commons-cache
+            dir: commons-cache
+            app_secret: COMMONS_APP
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Build image in ACR (tagged with commit SHA)
+        run: |
+          az acr build \
+            -r "${{ secrets.ACR_NAME }}" \
+            -t "${{ matrix.name }}:${{ github.sha }}" \
+            "./${{ matrix.dir }}"
+
+      - name: Update Container App to the new image
+        env:
+          APP_NAME: ${{ secrets[matrix.app_secret] }}
+        run: |
+          az containerapp update \
+            -n "$APP_NAME" \
+            -g "${{ secrets.RESOURCE_GROUP }}" \
+            --image "${{ secrets.ACR_NAME }}.azurecr.io/${{ matrix.name }}:${{ github.sha }}"
