@@ -1,0 +1,6 @@
+# token-issuer is the ONE Columbia service that uses npm dependencies, so unlike
+# the dependency-free relay/commons it MUST commit its lockfile for reproducible,
+# pinned Docker builds. The root .gitignore excludes package-lock.json globally;
+# this negation re-includes it for this directory only. node_modules stays ignored.
+!package-lock.json
+node_modules/

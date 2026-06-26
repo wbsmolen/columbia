@@ -81,6 +81,23 @@ No IP, no content, no headers, no target. `route` is a fixed template.
 |---|---|---|
 | `PORT` | `8080` | listen port (non-root can't bind below 1024) |
 | `GATEWAY_URL` | required | full gateway endpoint, e.g. `https://<gateway-host>/gateway` |
+| `CLIENT_AUTH_MODE` | `off` | `off`, `secret`, or `token` (Privacy Pass / Private Access Token) |
+| `ISSUER_KEYS_URL` | unset | in `token` mode, the issuer's `GET /issuer-keys`, e.g. `https://<issuer-host>/issuer-keys` |
+| `ISSUER_KEYS_TTL_MS` | `300000` | how often the relay refreshes the cached issuer public keys |
+| `TOKEN_PSS_SALT_LEN` | `48` | RSA-PSS salt length for token verification (SHA-384 digest length) |
+| `REDEMPTION_MAX_KEYS` | `5000000` | spend-once set memory bound (single replica; a shared store is the real fix) |
+
+### Token mode (Privacy Pass)
+
+In `token` mode the relay accepts an anonymous, unlinkable blind-RSA token in the
+auth header and verifies it offline against the issuer's epoch public key
+(RSA-PSS/SHA-384, the RFC 9578 / Apple PAT suite), then enforces spend-once. There
+is no per-request call to the issuer: the relay fetches the public key once from
+`ISSUER_KEYS_URL` and caches it, so the issuer never learns which token was spent.
+That offline, public verification is what keeps the token unlinkable. The issuer
+half lives in [`../token-issuer`](../token-issuer). The spend-once set is in-memory
+and single-process for now; the code marks where a shared store goes for a
+multi-replica deployment.
 
 ## Run locally
 

@@ -37,11 +37,23 @@ const RATE_MAX_KEYS  = parseInt(process.env.RATE_MAX_KEYS  || '100000', 10);// b
 
 // --- Client auth ------------------------------------------------------------
 // CLIENT_AUTH_MODE: 'off' (default; rely on network controls), 'secret' (interim
-// shared-secret header), or 'token' (future Privacy Pass / Private Access Token).
+// shared-secret header), or 'token' (Privacy Pass / Private Access Token).
 // The verify function is pluggable so 'token' slots in without restructuring.
 const CLIENT_AUTH_MODE = (process.env.CLIENT_AUTH_MODE || 'off').toLowerCase();
 const CLIENT_SECRET    = process.env.CLIENT_SECRET || '';
 const CLIENT_AUTH_HEADER = (process.env.CLIENT_AUTH_HEADER || 'authorization').toLowerCase();
+
+// --- Token mode (Privacy Pass / Private Access Token) -----------------------
+// In 'token' mode the client presents an anonymous, unlinkable blind-RSA token in
+// the auth header. We verify it against the issuer's epoch PUBLIC key (RSA-PSS,
+// SHA-384, the RFC 9578 / Apple PAT suite) and enforce spend-once. Public key is
+// fetched ONCE from the issuer's GET /issuer-keys and cached, so there is NO
+// per-request call to the issuer: verification is fully offline and the issuer
+// never learns which token was spent (that is the unlinkability property).
+const ISSUER_KEYS_URL   = process.env.ISSUER_KEYS_URL || '';          // e.g. https://<issuer-host>/issuer-keys
+const ISSUER_KEYS_TTL_MS = parseInt(process.env.ISSUER_KEYS_TTL_MS || '300000', 10); // refresh window
+const TOKEN_PSS_SALT_LEN = parseInt(process.env.TOKEN_PSS_SALT_LEN || '48', 10);      // SHA-384 digest length
+const REDEMPTION_MAX_KEYS = parseInt(process.env.REDEMPTION_MAX_KEYS || '5000000', 10); // bound spend-set memory
 
 // --- Relay -> gateway auth --------------------------------------------------
 // Shared secret attached to the outbound request so the gateway can reject
@@ -139,9 +151,147 @@ function clientAuthorized(req) {
   return false; // unknown mode => fail closed
 }
 
-// Placeholder for token mode; isolated so the swap is a single function body.
-function verifyAccessToken(_presented) {
-  return false;
+// --- Issuer epoch public-key cache ------------------------------------------
+// Map<keyId, KeyObject>. Populated from the issuer's GET /issuer-keys (PUBLIC
+// material). Refreshed lazily once per ISSUER_KEYS_TTL_MS. A failed refresh keeps
+// the last good keys rather than dropping them, so a transient issuer outage does
+// not take token verification down, but if we have NO keys we fail closed.
+let issuerKeys = new Map();
+let issuerKeysFetchedAt = 0;
+let issuerKeysRefreshing = false;
+
+// Kick off a refresh of the issuer public keys if the cache is stale. Non-blocking:
+// verification uses whatever keys are currently cached. The fetched material is
+// PUBLIC (epoch public keys + key ids), so caching it leaks nothing.
+function maybeRefreshIssuerKeys() {
+  if (!ISSUER_KEYS_URL) return;
+  const now = Date.now();
+  if (issuerKeys.size > 0 && now - issuerKeysFetchedAt < ISSUER_KEYS_TTL_MS) return;
+  if (issuerKeysRefreshing) return;
+  issuerKeysRefreshing = true;
+
+  let u;
+  try { u = new URL(ISSUER_KEYS_URL); } catch { issuerKeysRefreshing = false; return; }
+  const opts = {
+    hostname: u.hostname,
+    port: u.port || 443,
+    path: u.pathname + u.search,
+    method: 'GET',
+    timeout: GW_TIMEOUT_MS,
+  };
+  const ireq = https.request(opts, (ires) => {
+    const cc = [];
+    let clen = 0;
+    let bad = false;
+    ires.on('data', (d) => {
+      if (bad) return;
+      clen += d.length;
+      if (clen > MAX_RESP_BYTES) { bad = true; ires.destroy(); }
+      else cc.push(d);
+    });
+    ires.on('end', () => {
+      issuerKeysRefreshing = false;
+      if (bad || (ires.statusCode || 0) !== 200) return; // keep last good keys
+      try {
+        const doc = JSON.parse(Buffer.concat(cc).toString('utf8'));
+        const next = new Map();
+        for (const k of (doc.keys || [])) {
+          if (!k || typeof k.keyId !== 'string' || typeof k.publicKeySpki !== 'string') continue;
+          const der = Buffer.from(k.publicKeySpki, 'base64');
+          const pub = crypto.createPublicKey({ key: der, format: 'der', type: 'spki' });
+          next.set(k.keyId, pub);
+        }
+        if (next.size > 0) { issuerKeys = next; issuerKeysFetchedAt = Date.now(); }
+      } catch { /* malformed doc: keep last good keys */ }
+    });
+  });
+  ireq.on('timeout', () => { ireq.destroy(new Error('issuer timeout')); });
+  ireq.on('error', () => { issuerKeysRefreshing = false; });
+  ireq.end();
+}
+
+// --- Spend-once redemption set ----------------------------------------------
+// REDEMPTION STORE (production): this Set lives in one process and resets on
+// restart, so with multiple relay replicas a token could be spent once per
+// replica, and a restart forgets all prior spends. For a real deployment, move
+// this to a shared atomic store (e.g. Redis SET with NX, keyed by the nullifier,
+// with a TTL past the token's epoch so it self-expires). The nullifier is derived
+// from the token signature only, no device id, nothing user-identifying.
+const redeemed = new Set();
+
+function nullifierFor(sigBytes) {
+  return crypto.createHash('sha256').update(sigBytes).digest('hex');
+}
+
+// Mark a token spent. Returns false if it was ALREADY spent (double-spend),
+// true if this is the first spend (and records it). Single-process atomic.
+function tryRedeem(nullifier) {
+  if (redeemed.has(nullifier)) return false;
+  redeemed.add(nullifier);
+  if (redeemed.size > REDEMPTION_MAX_KEYS) {
+    // Bound memory: drop the oldest-inserted nullifier. A shared store with epoch
+    // TTLs is the correct fix; this cap just keeps a single replica from OOMing.
+    redeemed.delete(redeemed.values().next().value);
+  }
+  return true;
+}
+
+// Token mode verification. The client presents, in the auth header, a compact
+// token: base64url( JSON{ keyId, tokenInput, signature } ), where signature is the
+// finalized blind-RSA (RSA-PSS/SHA-384) signature over tokenInput, issued blindly
+// so the issuer never saw this exact (tokenInput, signature) pair.
+//
+// We (1) parse it, (2) look up the issuer epoch public key by keyId, (3) verify the
+// RSA-PSS signature over tokenInput offline, (4) enforce spend-once via a nullifier
+// = SHA-256(signature). All four must pass. The token is NEVER logged.
+function verifyAccessToken(presented) {
+  if (typeof presented !== 'string' || presented.length === 0) return false;
+
+  // Allow an optional "PrivateToken " / "Bearer " prefix on the header value.
+  const raw = presented.replace(/^(PrivateToken|Bearer)\s+/i, '').trim();
+
+  // Refresh the issuer public keys if stale (non-blocking).
+  maybeRefreshIssuerKeys();
+  if (issuerKeys.size === 0) return false; // no keys => cannot verify => fail closed
+
+  let tok;
+  try {
+    tok = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'));
+  } catch {
+    return false;
+  }
+  const { keyId, tokenInput, signature } = tok || {};
+  if (typeof keyId !== 'string' || typeof tokenInput !== 'string' || typeof signature !== 'string') {
+    return false;
+  }
+
+  const pub = issuerKeys.get(keyId);
+  if (!pub) return false; // unknown / expired epoch key => reject
+
+  const inputBuf = Buffer.from(tokenInput, 'base64');
+  const sigBuf = Buffer.from(signature, 'base64');
+  if (inputBuf.length === 0 || sigBuf.length === 0) return false;
+
+  // (3) Verify the RSA-PSS signature offline against the issuer epoch public key.
+  let sigOk = false;
+  try {
+    sigOk = crypto.verify(
+      'sha384',
+      inputBuf,
+      { key: pub, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: TOKEN_PSS_SALT_LEN },
+      sigBuf,
+    );
+  } catch {
+    sigOk = false;
+  }
+  if (!sigOk) return false;
+
+  // (4) Spend-once. A valid signature that has already been redeemed is rejected,
+  // so a token can be spent exactly once. The nullifier is derived from the
+  // signature only and carries no identity.
+  if (!tryRedeem(nullifierFor(sigBuf))) return false;
+
+  return true;
 }
 
 // Length-independent constant-time string compare (hash both sides so length
@@ -357,4 +507,20 @@ server.requestTimeout = 20000;
 server.headersTimeout = 10000;
 server.keepAliveTimeout = 5000;
 
-server.listen(PORT, () => log({ event: 'listen', port: PORT, role: 'ohttp-relay' }));
+// Only bind the port when run directly as the entrypoint. Requiring this file
+// (the test harness does, to exercise token verification without a live socket)
+// must NOT start listening. Production behavior when run via `node server.js` is
+// unchanged.
+if (require.main === module) {
+  server.listen(PORT, () => log({ event: 'listen', port: PORT, role: 'ohttp-relay' }));
+}
+
+// Test-only surface. Lets the harness exercise the token-mode verification path
+// (signature check + spend-once) directly. Nothing here changes runtime behavior.
+module.exports = {
+  server,
+  verifyAccessToken,
+  tryRedeem,
+  nullifierFor,
+  setIssuerKeysForTest(map) { issuerKeys = map; issuerKeysFetchedAt = Date.now(); },
+};
