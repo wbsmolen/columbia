@@ -1,8 +1,13 @@
 # token-issuer
 
-The token issuer is how Columbia answers a hard question: how do you let only the
-genuine Example app use the relay, rate limit even your own users, and still never
-be able to link a user to the content they fetch?
+The token issuer is how Columbia answers a hard question: how do you let only a
+genuine, attested client use the relay, rate limit even your own users, and still
+never be able to link a user to the content they fetch?
+
+The issuer ships as a reference token-issuance gate for an iOS client using Apple
+App Attest. App Attest is inherently an Apple/iOS mechanism; on other platforms the
+attestation step is swapped for the equivalent device-integrity primitive and the
+rest of the Privacy Pass flow is unchanged.
 
 The answer is the Privacy Pass pattern (the same one Apple's Private Access Tokens
 use). This service plays the **Attester** and **Issuer** roles of the Privacy Pass
@@ -35,7 +40,7 @@ extended to "prove you're a real, rate-limited client" without a login.
                                                                 spend-once
 ```
 
-1. The device proves it is a genuine Example install via Apple App Attest.
+1. The device proves it is a genuine install of the iOS client via Apple App Attest.
 2. The device blinds one or more token inputs locally and sends the blinded
    messages (never the inputs) to `POST /issue`.
 3. The issuer validates App Attest, checks the device's per-epoch quota, and
@@ -57,8 +62,8 @@ Tokens use. "Publicly verifiable" is the property that lets the relay verify a
 spent token offline with only the public key.
 
 The blind RSA math comes from `@cloudflare/blindrsa-ts`, Cloudflare's
-implementation of RFC 9474. It is the exact construction Apple uses, which is why
-it was chosen over rolling our own.
+implementation of RFC 9474. It is the exact construction Apple uses, which is the
+reason to use it rather than a hand-rolled implementation.
 
 ## Endpoints
 
@@ -136,11 +141,11 @@ so they self-expire when the epoch rolls.
 | `MAX_BODY_BYTES` | `262144` | request body cap |
 | `APPLE_APP_ATTEST_ROOT_CA_PEM_B64` | unset | Apple's App Attest Root CA, PEM, base64. Required to ENFORCE App Attest |
 | `APPLE_TEAM_ID` | unset | your Apple Team ID. Required to enforce App Attest |
-| `APPLE_BUNDLE_ID` | unset | Example's bundle id. Required to enforce App Attest |
+| `APPLE_BUNDLE_ID` | unset | the iOS client's bundle id. Required to enforce App Attest |
 | `APPLE_APP_ATTEST_AAGUID` | `appattest` | `appattest` for production, `appattestdevelop` for dev/TestFlight builds |
 | `APP_ATTEST_CLOCK_SKEW_MS` | `300000` | tolerance (ms) when checking the x5c certs' validity windows, for issuer/Apple clock drift |
 | `REQUIRE_CLIENT_DATA_BINDING` | `1` (on) | require the App Attest `clientDataHash` to commit to the exact `blinded[]` batch + epoch (see below). Set to `0` only during client bring-up, before the iOS client computes the matching hash |
-| `REQUIRE_FDID` | unset | when set, reject any request whose `X-Azure-FDID` header does not match, so the issuer only accepts traffic that arrived through your front door (CDN/WAF). `/health` and `/issuer-keys` are exempt. Empty/unset disables the check |
+| `REQUIRE_FDID` | unset | when set, reject any request whose `X-Azure-FDID` header does not match, so the issuer only accepts traffic that arrived through your front door (a CDN or WAF, for example Azure Front Door). `/health` and `/issuer-keys` are exempt. Empty/unset disables the check |
 
 The signing key is injected exactly like the gateway's `SEED_SECRET_KEY`: from your
 host's secret store at runtime, never written to disk in this repo.
@@ -160,11 +165,11 @@ clientDataHash == SHA-256( utf8(epoch) || 0x00 || blinded[0] || 0x00 || blinded[
 where each `blinded[i]` is the raw (base64-decoded) blinded message, so the
 attestation/assertion is bound to the exact tokens being requested in this epoch
 (the current or previous epoch is accepted, to tolerate an epoch-boundary crossing).
-**The iOS client must compute its App Attest challenge as this same hash.** Until
-that client change ships, run with `REQUIRE_CLIENT_DATA_BINDING=0` (App Attest then
-bounds abuse per-device but does not bind the payload) and flip it on once the
-client matches. This is the one piece of the App Attest gate whose other half lives
-in the Example app.
+**The iOS client must compute its App Attest challenge as this same hash.** Before
+the client computes the matching hash, run with `REQUIRE_CLIENT_DATA_BINDING=0`
+(App Attest then bounds abuse per-device but does not bind the payload) and flip it
+on once the client matches. This is the one piece of the App Attest gate whose other
+half lives in the iOS client.
 
 ## What is production ready vs what still needs work
 
@@ -188,9 +193,8 @@ these pieces.
 
 **Implemented:**
 
-- **Apple App Attest validation** (`appattest.js`). The full server-side check is
-  now implemented, per Apple's "Validating Apps That Connect to Your Server through
-  App Attest":
+- **Apple App Attest validation** (`appattest.js`). The full server-side check
+  follows Apple's "Validating Apps That Connect to Your Server through App Attest":
   - *Attestation* (one-time device registration): CBOR-decode the attestation
     object, verify the `x5c` certificate chain anchors to Apple's App Attest Root
     CA (real X.509 path + signature + validity checks via node's
@@ -212,9 +216,9 @@ these pieces.
   trust chain (a self-minted CA + leaf, built in pure JS in `appattest-fixtures.js`)
   that satisfies every Apple check, plus negative tests that each tampered field is
   rejected. The one remaining gap is a **real-device fixture**: a captured
-  attestation/assertion from a physical iPhone running Example, validated against
-  Apple's real Root CA, to confirm byte-compatibility with Apple's actual encoder.
-  See the repo's roadmap and the PR notes for exactly how to capture one.
+  attestation/assertion from a physical iPhone running the iOS client, validated
+  against Apple's real Root CA, to confirm byte-compatibility with Apple's actual
+  encoder. See the capture procedure below.
 
 **Stubbed, and clearly marked as such:**
 
@@ -225,7 +229,7 @@ these pieces.
   gaps for a real multi-replica deployment: a device could get its full quota from
   each replica, a restart forgets prior spends, and a device registered on one
   replica is unknown to another (its assertions are rejected as `unknown_device_key`
-  until it re-attests; the Example client handles this by re-attesting on rejection).
+  until it re-attests; the iOS client handles this by re-attesting on rejection).
   The code marks exactly where a shared atomic store goes (Redis `INCR`/`EXPIRE` for
   the quota keyed by a salted device hash, Redis `SET NX` with an epoch TTL for the
   redemption nullifiers, and a Redis hash per keyId for the attested key with a
@@ -235,16 +239,17 @@ these pieces.
   keyed by a salted hash of the keyId, so the store never holds anything
   user-linking.
 
-- **Attester / Issuer split.** Right now one service plays both Privacy Pass roles.
-  RFC 9576 allows splitting the Attester (which sees the device) from the Issuer
-  (which blind-signs) into separate parties for an even stronger posture. That split
-  is future work and is noted in the roadmap.
+- **Attester / Issuer split.** One service plays both Privacy Pass roles. RFC 9576
+  allows splitting the Attester (which sees the device) from the Issuer (which
+  blind-signs) into separate parties for an even stronger posture. That split is a
+  roadmap item.
 
 ## Deployment intent
 
-This becomes a separate, public Azure Container App, built and deployed the same
-way as the relay, gateway, and commons cache (see the repo's deploy workflow). Like
-the gateway, **it must be run such that it never colludes with the relay.** If one
+The issuer runs as a separate, public service, built and deployed the same way as
+the relay, gateway, and commons cache (plain Docker on any host; see [`deploy/`](../deploy)
+for one example). Like the gateway, **it must be run such that it never colludes
+with the relay.** If one
 operator ran both the issuer and the relay, it could line up "device D asked for
 tokens in epoch E" (the issuer's view) against "a token from epoch E was spent on
 content C" (the relay's view) and, with enough traffic analysis, start to undo the
@@ -286,7 +291,7 @@ node --test
 ```
 
 Run them under the deploy runtime (`node:20.18.1-alpine`), not a newer local node,
-since a node-version mismatch has crashed this service in production before:
+since a node-version mismatch can change runtime behavior between local and deploy:
 
 ```sh
 # from the repo root (the Privacy Pass test imports the sibling relay)
@@ -309,19 +314,19 @@ inputs. The synthetic trust chain is built in pure JS in `appattest-fixtures.js`
 
 ### Capturing a real-device fixture (required follow-up)
 
-The synthetic fixtures substitute one thing only - the trust anchor (our test root
+The synthetic fixtures substitute one thing only, the trust anchor (the test root
 in place of Apple's Root CA, injected exactly as an operator injects the real root).
 Every cryptographic and structural check is the production one. Still, before
 trusting this in production you should validate one **real** attestation from a
-physical iPhone running Example, against Apple's real Root CA, to confirm
+physical iPhone running the iOS client, against Apple's real Root CA, to confirm
 byte-compatibility with Apple's actual CBOR/X.509 encoder. Two ways:
 
 1. **Debug capture endpoint (temporary).** Add a short-lived `POST /attest-debug`
    to a NON-production instance that takes `{ keyId, attestation, clientDataHash }`,
    runs `validateAppAttest` with the real `APPLE_*` env set, and returns the result
-   (and, in debug only, the failing check). Drive it from the Example client's App
+   (and, in debug only, the failing check). Drive it from the iOS client's App
    Attest code path once, capture the request body, then **remove the endpoint**.
-2. **Captured fixture (preferred, permanent regression).** Have the Example client
+2. **Captured fixture (preferred, permanent regression).** Have the iOS client
    log one real `attestation` + `clientDataHash` + `keyId` for a known challenge,
    paste them into a new test alongside the **real** Apple Root CA PEM (base64), and
    assert `validateAppAttest` returns `ok: true`. Because a real attestation is not

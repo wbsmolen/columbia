@@ -263,7 +263,7 @@ Now identity (relay, operator B) and content (gateway, operator A) live in separ
 
 ## Optional: one example cloud deployment
 
-Plain Docker, as above, is the supported path. If you'd rather use a managed container host, the pattern is the same: build the image, push it to a registry, and run it as a container with the same env vars. The repo includes one example script, [`commons-cache/deploy-ghcr.sh`](./commons-cache/deploy-ghcr.sh), that builds the cache image, pushes it to a container registry, and creates or updates a managed container app. It uses placeholder names you have to replace:
+Plain Docker, as above, is the supported path. If you'd rather use a managed container host, the pattern is the same: build the image, push it to a registry, and run it as a container with the same env vars. [`deploy/README.md`](./deploy/README.md) collects the deployment notes and points to one example CI automation in [`.github/workflows/deploy-azure-reference.yml`](./.github/workflows/deploy-azure-reference.yml). The repo also includes one example script, [`commons-cache/deploy-ghcr.sh`](./commons-cache/deploy-ghcr.sh), that builds the cache image, pushes it to a container registry, and creates or updates a managed container app. It uses placeholder names you have to replace:
 
 | Placeholder in the script | Replace with |
 |---|---|

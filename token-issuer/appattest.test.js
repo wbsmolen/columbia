@@ -122,7 +122,7 @@ test('(b1) wrong rpIdHash (attestation for a different appID) is REJECTED', asyn
   // simplest is to mint under base's root key directly.
   const wrong = makeAttestationFixtureUnderRoot({
     rootKey: base.rootKey, interKey: base.interKey,
-    appId: 'ABCDE12345.com.wbs.WRONG', aaguidLabel: 'appattest', challenge: crypto.randomBytes(32),
+    appId: 'ABCDE12345.com.example.WRONG', aaguidLabel: 'appattest', challenge: crypto.randomBytes(32),
   });
   const res = await validateAppAttest({ keyId: wrong.keyIdB64, attestation: wrong.attestationB64, clientDataHash: wrong.clientDataHashB64 });
   assert.strictEqual(res.ok, false);

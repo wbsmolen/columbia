@@ -1,8 +1,8 @@
 // Columbia - Apple App Attest validation (Attester role)
 //
 // This module is the gate that proves an /issue request comes from a genuine,
-// unmodified Example install on real Apple hardware, before the issuer will
-// blind-sign any tokens. It implements the server side of Apple's
+// unmodified install of the iOS client on real Apple hardware, before the issuer
+// will blind-sign any tokens. It implements the server side of Apple's
 // DCAppAttestService: the one-time ATTESTATION that registers a hardware-backed
 // key, and the per-request ASSERTION that proves possession of that key.
 //

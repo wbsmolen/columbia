@@ -5,16 +5,16 @@ Columbia's Privacy Pass token auth:
 
 - the **issuer** (`token-issuer/server.js` + `token-issuer/appattest.js`), which
   runs App Attest verification and blind-signs tokens,
-- the **app** (Example's `AppAttestTokenClient.swift`), which attests the device,
-  blinds token nonces, unblinds the issuer's blind signatures, and spends the
-  finished tokens, and
+- the **client** (an iOS reference client using Apple App Attest), which attests
+  the device, blinds token nonces, unblinds the issuer's blind signatures, and
+  spends the finished tokens, and
 - the **relay** (`ohttp-relay/server.js`), which verifies a spent token offline
   and enforces spend-once.
 
-The issuer code is the source of truth. Where the app or the relay disagreed with
-it, they were changed to match, not the other way around. This document is derived
-from the issuer's actual code, so if the code and this doc ever drift, the code
-wins and this doc is the bug.
+The issuer code is the source of truth. This document is derived from the issuer's
+actual code, so if the code and this doc ever disagree, the code wins and this doc
+is the bug. A client and a relay that interoperate with the issuer match the issuer,
+not the reverse.
 
 Everything here is built so the one party that learns the device identity (the
 issuer, via App Attest) never sees the spent token, and the party that sees the
@@ -39,7 +39,7 @@ Two consequences of "deterministic / identity preparation" that the contract
 depends on:
 
 - `prepare(nonce)` returns the nonce bytes unchanged. So the **token input** the
-  relay verifies the signature over is exactly the 32 random nonce bytes the app
+  relay verifies the signature over is exactly the 32 random nonce bytes the client
   drew. There is no extra random prefix to carry.
 - A blinded message and a finished signature are each exactly 256 bytes (2048-bit
   RSA). The issuer rejects any blinded message that is not 256 bytes.
@@ -67,15 +67,13 @@ It is derived from public material only.
 
 Around an epoch boundary the issuer publishes BOTH the current and the previous
 epoch's public key, and accepts the App Attest binding hash computed against either
-the current or the previous epoch (see `/issue`). The app keeps tokens for both
+the current or the previous epoch (see `/issue`). The client keeps tokens for both
 live epochs and drops the rest.
 
 ## Endpoints (issuer)
 
 The issuer exposes exactly three routes. There is **no** `/attest-challenge` and
-**no** separate `/attest` endpoint. Registration happens inside `/issue`. (An
-earlier app proposal had those two endpoints; they do not exist on the issuer and
-were removed from the app.)
+**no** separate `/attest` endpoint. Registration happens inside `/issue`.
 
 ### GET /health
 
@@ -83,7 +81,7 @@ Liveness only. Returns `200` with the body `ok` (text/plain). No JSON.
 
 ### GET /issuer-keys
 
-Publishes the current and previous epoch RSA public keys so the relay (and the app)
+Publishes the current and previous epoch RSA public keys so the relay (and the client)
 can verify and blind against them. Public material only.
 
 Response `200`, `application/json`:
@@ -104,7 +102,7 @@ Response `200`, `application/json`:
   presence of a second entry as optional (a fresh issuer with one epoch of history
   may publish one).
 - `publicKeySpki` is the standard `SubjectPublicKeyInfo` DER of the RSA public key,
-  **base64** (not base64url). The app tolerates base64url too, but the issuer emits
+  **base64** (not base64url). The client tolerates base64url too, but the issuer emits
   base64.
 - On a missing or unreadable signing key the issuer returns `503` (fail closed),
   not an empty key list.
@@ -137,9 +135,9 @@ Field rules, exactly as the issuer enforces them:
   `attestation`. If both are absent the issuer rejects with `no_attestation_or_assertion`.
 - `clientDataHash` (required) is the **base64 of the 32 raw bytes** of the binding
   hash defined in the next section. It is NOT a JSON object, NOT a preimage, NOT
-  base64url. It must decode to exactly 32 bytes or the issuer rejects it. This is
-  the single field the earlier app version got most wrong: it was sending the
-  preimage bytes, not the 32-byte hash.
+  base64url. It must decode to exactly 32 bytes or the issuer rejects it. The
+  common implementation mistake is sending the preimage bytes here instead of the
+  32-byte hash.
 - `blinded` (required) is an array of 1..64 base64 blinded messages, each exactly
   256 bytes after decoding. Order is preserved into the response.
 
@@ -155,7 +153,7 @@ Response `200`, `application/json`:
 
 - `epoch` is the integer epoch the tokens were signed under.
 - `keyId` is the issuer **epoch public key id** (the same id `/issuer-keys`
-  publishes), NOT the device keyId. The app banks this with each finished token so
+  publishes), NOT the device keyId. The client banks this with each finished token so
   it can tell the relay which epoch key to verify under.
 - `blindSigs[i]` is the base64 blind signature over `blinded[i]`. Same order, same
   length. The issuer never unblinds, so it never sees the finished token.
@@ -172,7 +170,7 @@ Error responses (no body, status only):
 | `503` | the issuer has no usable signing key |
 | `500` | blind-sign or unhandled error |
 
-The app treats `401`/`403` as "re-attest needed" and a fresh attestation is sent on
+The client treats `401`/`403` as "re-attest needed" and a fresh attestation is sent on
 the next call.
 
 ## The binding hash (clientDataHash), byte for byte
@@ -237,18 +235,18 @@ differently.
 
 ### Epoch tolerance
 
-The app computes the hash against the epoch it last saw from `/issuer-keys`. If the
+The client computes the hash against the epoch it last saw from `/issuer-keys`. If the
 request crosses an epoch boundary the issuer may already be one epoch ahead, so the
 issuer accepts the hash computed against **either the current or the previous
-epoch** and compares both in constant time. The app should use the current
+epoch** and compares both in constant time. The client should use the current
 epoch's integer; the previous-epoch acceptance is just slack for the boundary.
 
 ## App Attest flow and ordering
 
 App Attest is two-phase. The issuer's `validateAppAttest` enforces all of it; the
-app drives it.
+client drives it.
 
-1. **Generate key (once per install).** The app calls
+1. **Generate key (once per install).** The client calls
    `DCAppAttestService.generateKey()` to mint a hardware-backed key and gets a
    `keyId`. It persists `keyId` in the Keychain.
 
@@ -270,7 +268,7 @@ app drives it.
    same call, applies the binding check + quota + blind-signs the batch. So the
    first call registers AND issues.
 
-3. **Every later `/issue` = assertion.** The app:
+3. **Every later `/issue` = assertion.** The client:
    - builds the batch and computes the binding hash for the current epoch,
    - calls `generateAssertion(keyId, clientDataHash: bindingHash)`,
    - POSTs `/issue` with `assertion` set (and no `attestation`).
@@ -282,9 +280,9 @@ app drives it.
 
 4. **Re-attest on rejection.** If the issuer has forgotten the device (process
    restart on a single-replica deployment) it answers an assertion with
-   `unknown_device_key`. App Attest only allows ONE `attestKey` per key, so the app
+   `unknown_device_key`. App Attest only allows ONE `attestKey` per key, so the client
    cannot re-attest the same key; on a persistent rejection it must mint a fresh
-   key and attest that. The app should clear its "registered" marker and retry with
+   key and attest that. The client should clear its "registered" marker and retry with
    a fresh attestation.
 
 There is no separate challenge round trip. The binding hash IS the challenge, and
@@ -292,13 +290,13 @@ because it is derived from the batch + epoch it is fresh by construction.
 
 ## Token presentation to the relay
 
-After unblinding, the app holds, per token:
+After unblinding, the client holds, per token:
 
 - `keyId`     : the issuer epoch public key id (from the `/issue` response),
 - `tokenInput`: the 32 nonce bytes (identity preparation, so prepared == nonce),
 - `signature` : the finished 256-byte RSA-PSS signature.
 
-It presents one token per relay POST in a single header. The agreed header name is:
+It presents one token per relay POST in a single header. The header name is:
 
 ```
 x-columbia-token: PrivateToken <base64url( JSON{ keyId, tokenInput, signature } )>
@@ -309,16 +307,14 @@ x-columbia-token: PrivateToken <base64url( JSON{ keyId, tokenInput, signature } 
   `{ "keyId": "...", "tokenInput": "<base64>", "signature": "<base64>" }`.
 - Inside that JSON, `tokenInput` and `signature` are **standard base64** (the relay
   decodes them with a base64 decoder). Only the outer envelope is base64url.
-- There is exactly ONE header. The earlier app proposal split this into
-  `x-columbia-token` (signature only) plus `x-columbia-token-epoch` (keyId). That cannot
-  work, because the relay needs `tokenInput` to verify the signature, and it reads a
-  single header containing the whole JSON. `x-columbia-token-epoch` is gone; the keyId
-  travels inside the JSON.
+- There is exactly ONE header. The keyId travels inside the JSON, not in a separate
+  header, because the relay needs `tokenInput` to verify the signature and reads a
+  single header containing the whole JSON.
 
-The relay reads the header named by `CLIENT_AUTH_HEADER`, whose default is now
-`x-columbia-token` so it matches what the app sends with no extra configuration. An
-operator may point it at `authorization` instead if they prefer to carry the token
-there; the app would then send the same value under that header.
+The relay reads the header named by `CLIENT_AUTH_HEADER`, whose default is
+`x-columbia-token` so it matches what the client sends with no extra configuration.
+An operator may point it at `authorization` instead if they prefer to carry the
+token there; the client would then send the same value under that header.
 
 ## Relay verification and spend-once
 
@@ -361,9 +357,9 @@ A cross-check vector pins the binding hash bytes on both sides:
 
 - issuer: `test.js` asserts `expectedClientDataHash(epoch, blinded)` for a fixed
   `(epoch, blinded)` input equals a known hex value.
-- app: `BlindRSATokenTests` recomputes the SAME construction in Swift for the SAME
-  input and asserts the SAME hex. If either side changes the byte layout, one of the
-  two tests goes red.
+- client: an equivalent test recomputes the SAME construction for the SAME input
+  and asserts the SAME hex. If either side changes the byte layout, one of the two
+  tests goes red.
 
 What the vector does NOT cover, and which still needs a physical device plus a live
 issuer to exercise end to end:
@@ -374,4 +370,4 @@ issuer to exercise end to end:
   spend at `/relay`.
 - Re-attestation after an issuer restart.
 
-Those are device-only and are called out in the PR notes.
+Those are device-only.

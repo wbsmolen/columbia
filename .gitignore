@@ -1,9 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Columbia — .gitignore
+# Columbia .gitignore
 #
 # CRITICAL: this repo must NEVER contain a real HPKE seed, key, token, or cred.
-# Inject the gateway's SEED_SECRET_KEY from your host's secret store at runtime —
-# nothing secret should ever be written to disk here. The patterns below are a
+# Inject the gateway's SEED_SECRET_KEY from your host's secret store at runtime.
+# Nothing secret should ever be written to disk here. The patterns below are a
 # belt-and-suspenders backstop. If you find a secret tracked, scrub it and
 # rotate the value.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -37,7 +37,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
-package-lock.json    # services are dependency-free; no lockfile expected
+# Most services are dependency-free and ship no lockfile. The token-issuer is the
+# one service with npm dependencies, and it intentionally tracks its lockfile for
+# reproducible Docker builds via a directory-level negation in token-issuer/.gitignore.
+package-lock.json
 
 # ── Go build artifacts (vendored gateway) ──
 build/
