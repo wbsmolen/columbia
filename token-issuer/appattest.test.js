@@ -31,9 +31,9 @@ import {
 
 // --- One canonical fixture drives the env config for the whole file ----------
 
-const APP_ID = 'PRWUVMURYJ.com.wbs.lander';
-const TEAM_ID = 'PRWUVMURYJ';
-const BUNDLE_ID = 'com.wbs.lander';
+const APP_ID = 'ABCDE12345.com.example.app';
+const TEAM_ID = 'ABCDE12345';
+const BUNDLE_ID = 'com.example.app';
 
 // Build the baseline (valid) fixture first so we can pin its root CA via env.
 const baseChallenge = crypto.randomBytes(32);
@@ -122,7 +122,7 @@ test('(b1) wrong rpIdHash (attestation for a different appID) is REJECTED', asyn
   // simplest is to mint under base's root key directly.
   const wrong = makeAttestationFixtureUnderRoot({
     rootKey: base.rootKey, interKey: base.interKey,
-    appId: 'PRWUVMURYJ.com.wbs.WRONG', aaguidLabel: 'appattest', challenge: crypto.randomBytes(32),
+    appId: 'ABCDE12345.com.example.WRONG', aaguidLabel: 'appattest', challenge: crypto.randomBytes(32),
   });
   const res = await validateAppAttest({ keyId: wrong.keyIdB64, attestation: wrong.attestationB64, clientDataHash: wrong.clientDataHashB64 });
   assert.strictEqual(res.ok, false);

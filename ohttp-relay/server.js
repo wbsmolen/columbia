@@ -1,16 +1,16 @@
-// Columbia — OHTTP relay (RFC 9458)
+// Columbia - OHTTP relay (RFC 9458)
 //
 // The relay is the split-trust counterpart to the gateway. It sees the client's
-// IP and an OPAQUE ciphertext (message/ohttp-req) — never the plaintext, never
+// IP and an OPAQUE ciphertext (message/ohttp-req) - never the plaintext, never
 // the target. It forwards the ciphertext to the gateway, stripping every
 // identifying header, and returns the encapsulated response. The gateway sees
 // the relay's IP + plaintext but NOT the client's IP. Neither party ever holds
-// identity + content together — that's the operator-blind property.
+// identity + content together - that's the operator-blind property.
 //
 // NON-COLLUSION CAVEAT: for the security guarantee, relay and gateway MUST be
 // run by different, non-colluding operators. Running both on one host validates
 // the flow but provides no protection against the single operator. See
-// ../SELFHOSTING.md. Logs are RED-only — no IP, no content, no headers.
+// ../SELFHOSTING.md. Logs are RED-only - no IP, no content, no headers.
 
 const http = require('http');
 const https = require('https');
@@ -41,12 +41,12 @@ const RATE_MAX_KEYS  = parseInt(process.env.RATE_MAX_KEYS  || '100000', 10);// b
 // The verify function is pluggable so 'token' slots in without restructuring.
 const CLIENT_AUTH_MODE = (process.env.CLIENT_AUTH_MODE || 'off').toLowerCase();
 const CLIENT_SECRET    = process.env.CLIENT_SECRET || '';
-// Header the client presents its credential in. Default 'x-lander-token' so the
-// token mode reads exactly what the app sends (one header carrying the whole
+// Header the client presents its credential in. Default 'x-columbia-token' so the
+// token mode reads exactly what the client sends (one header carrying the whole
 // PrivateToken envelope) with no extra config. The 'secret' mode reuses the same
 // header. An operator may override to 'authorization' if they prefer to carry the
 // token there; the client would then send the same value under that header.
-const CLIENT_AUTH_HEADER = (process.env.CLIENT_AUTH_HEADER || 'x-lander-token').toLowerCase();
+const CLIENT_AUTH_HEADER = (process.env.CLIENT_AUTH_HEADER || 'x-columbia-token').toLowerCase();
 
 // --- Token mode (Privacy Pass / Private Access Token) -----------------------
 // In 'token' mode the client presents an anonymous, unlinkable blind-RSA token in
@@ -68,19 +68,19 @@ const REDEMPTION_MAX_KEYS = parseInt(process.env.REDEMPTION_MAX_KEYS || '5000000
 const RELAY_GATEWAY_SECRET = process.env.RELAY_GATEWAY_SECRET || '';
 const RELAY_GATEWAY_HEADER = 'x-columbia-relay-auth';
 
-// --- Front Door origin lock -------------------------------------------------
-// When set, the relay accepts a request only if it arrived through our Azure
-// Front Door, which injects the X-Azure-FDID header carrying our profile's
-// Front Door ID. This pins the public origin to Front Door so the Container App
-// FQDN can't be hit directly. Empty/unset => disabled (preserves current
-// behavior exactly), so the check is inert until an operator sets REQUIRE_FDID
-// at deploy time once Front Door is provisioned. The FDID value is NEVER logged.
+// --- Front door origin lock -------------------------------------------------
+// When set, the relay accepts a request only if it arrived through a front door
+// (a CDN or WAF, for example Azure Front Door), which injects the X-Azure-FDID
+// header carrying the front door's profile id. This pins the public origin to the
+// front door so the origin host can't be hit directly. Empty/unset => disabled,
+// so the check is inert until an operator sets REQUIRE_FDID at deploy time once a
+// front door is provisioned. The FDID value is NEVER logged.
 const REQUIRE_FDID = process.env.REQUIRE_FDID || '';
 
 // --- Public key-config passthrough ------------------------------------------
 // When the gateway runs internal-only, clients can no longer fetch its public
-// GET /ohttp-configs (the key config they pin). The relay — the sole public hop
-// — proxies it: a read-only GET that returns the gateway's PUBLIC key-config
+// GET /ohttp-configs (the key config they pin). The relay - the sole public hop
+// - proxies it: a read-only GET that returns the gateway's PUBLIC key-config
 // bytes verbatim. This leaks nothing: the key config is public material clients
 // are MEANT to pin. Cached briefly so we don't hit the gateway per client.
 const CONFIG_TTL_MS = parseInt(process.env.CONFIG_TTL_MS || '120000', 10);
@@ -105,9 +105,9 @@ if (gw.protocol !== 'https:') {
 }
 const GW_PORT = gw.port || 443; // honor a non-default port instead of hardcoding 443
 
-// The gateway's /ohttp-configs URL — derived from GATEWAY_URL (same host) unless
-// explicitly overridden. The relay reaches the gateway at the same FQDN whether
-// the gateway is public or internal-only (same Container Apps environment).
+// The gateway's /ohttp-configs URL, derived from GATEWAY_URL (same host) unless
+// explicitly overridden. The relay reaches the gateway at the same host whether
+// the gateway is public or internal-only (same internal network).
 const GATEWAY_CONFIGS_URL = process.env.GATEWAY_CONFIGS_URL || `${gw.protocol}//${gw.host}/ohttp-configs`;
 let cfgGw = null;
 try { cfgGw = new URL(GATEWAY_CONFIGS_URL); } catch { cfgGw = null; }
@@ -118,10 +118,10 @@ try { cfgGw = new URL(GATEWAY_CONFIGS_URL); } catch { cfgGw = null; }
 const rateBuckets = new Map();
 let inflight = 0;
 
-// Rate-limit key: the client IP as seen by the TRUSTED ingress. Behind Azure
-// Container Apps, the TCP peer (socket.remoteAddress) is the ingress proxy, not
+// Rate-limit key: the client IP as seen by the TRUSTED ingress. Behind a managed
+// container platform, the TCP peer (socket.remoteAddress) is the ingress proxy, not
 // the client, so per-IP limiting must read the rightmost X-Forwarded-For entry
-// (the address the trusted ingress appended — a client-spoofed value can only
+// (the address the trusted ingress appended - a client-spoofed value can only
 // sit to its LEFT). Used ONLY as a transient limiter key; never logged, never
 // forwarded to the gateway.
 function clientIpKey(req) {
@@ -252,7 +252,7 @@ function tryRedeem(nullifier) {
 }
 
 // Token mode verification. The client presents, in the CLIENT_AUTH_HEADER (default
-// 'x-lander-token'), a compact token:
+// 'x-columbia-token'), a compact token:
 //   PrivateToken <base64url( JSON{ keyId, tokenInput, signature } )>
 // where the outer envelope is base64url and tokenInput + signature inside the JSON
 // are standard base64. signature is the finalized blind-RSA (RSA-PSS/SHA-384,
@@ -322,7 +322,7 @@ function timingSafeEqualStr(presented, expected) {
   return crypto.timingSafeEqual(ha, hb);
 }
 
-// Front Door origin lock check. Returns true if the request is allowed to
+// Front door origin lock check. Returns true if the request is allowed to
 // proceed: either REQUIRE_FDID is unset (lock disabled) or the request carries a
 // matching X-Azure-FDID. A request may carry MULTIPLE x-azure-fdid values (Node
 // comma-joins a repeated header), so we split and accept if ANY token matches
@@ -337,9 +337,9 @@ function frontDoorAllowed(req) {
   return false;
 }
 
-// The set of paths exempt from the Front Door origin lock. Only GET /health is
+// The set of paths exempt from the front door origin lock. Only GET /health is
 // exempt on the relay: the platform health probe hits it in-environment with no
-// Front Door in that hop. Every other relay route (/relay, /ohttp-configs)
+// front door in that hop. Every other relay route (/relay, /ohttp-configs)
 // requires the FDID when REQUIRE_FDID is set.
 function fdidExempt(req, path) {
   return req.method === 'GET' && path === '/health';
@@ -409,12 +409,12 @@ function serveConfig(res, start) {
 const server = http.createServer((req, res) => {
   const start = Date.now();
 
-  // Front Door origin lock. When REQUIRE_FDID is set, every non-exempt request
-  // must arrive through Azure Front Door (which injects X-Azure-FDID). This runs
+  // Front door origin lock. When REQUIRE_FDID is set, every non-exempt request
+  // must arrive through the front door (which injects X-Azure-FDID). This runs
   // BEFORE any route does work so a direct-to-origin hit is rejected up front.
   // GET /health is exempt so the platform probe still passes. The FDID value is
   // never logged; we log only the route + status. When REQUIRE_FDID is unset this
-  // whole block is a no-op and behavior is exactly as before.
+  // whole block is a no-op.
   if (REQUIRE_FDID) {
     const path = String(req.url || '').split('?')[0];
     if (!fdidExempt(req, path) && !frontDoorAllowed(req)) {
@@ -504,7 +504,7 @@ const server = http.createServer((req, res) => {
     const body = Buffer.concat(chunks);
 
     // Forward ONLY the opaque ciphertext + its content type. Deliberately send a
-    // fresh request with NO client headers, NO X-Forwarded-For — the gateway must
+    // fresh request with NO client headers, NO X-Forwarded-For - the gateway must
     // not learn who the client is. The ONLY additional header is the relay→gateway
     // shared secret, which identifies the RELAY (not the client) so the gateway
     // can refuse traffic that didn't come through us.
@@ -539,7 +539,7 @@ const server = http.createServer((req, res) => {
       gres.on('end', () => {
         if (respAborted) return;
         const rb = Buffer.concat(rc);
-        // Pin the response content-type — never echo the gateway's header back.
+        // Pin the response content-type - never echo the gateway's header back.
         res.writeHead(gres.statusCode || 502, { 'Content-Type': 'message/ohttp-res' });
         res.end(rb);
         log({ route: '/relay', status: gres.statusCode || 502, durationMs: Date.now() - start });

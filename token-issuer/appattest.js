@@ -1,8 +1,8 @@
 // Columbia - Apple App Attest validation (Attester role)
 //
 // This module is the gate that proves an /issue request comes from a genuine,
-// unmodified Lander install on real Apple hardware, before the issuer will
-// blind-sign any tokens. It implements the server side of Apple's
+// unmodified install of the iOS client on real Apple hardware, before the issuer
+// will blind-sign any tokens. It implements the server side of Apple's
 // DCAppAttestService: the one-time ATTESTATION that registers a hardware-backed
 // key, and the per-request ASSERTION that proves possession of that key.
 //
@@ -36,7 +36,7 @@ import crypto from 'node:crypto';
 const APPLE_ROOT_CA_PEM_B64 = process.env.APPLE_APP_ATTEST_ROOT_CA_PEM_B64 || '';
 
 // The app identity the attestation must match: appID = "<TeamID>.<BundleID>".
-// e.g. PRWUVMURYJ.com.wbs.lander
+// e.g. ABCDE12345.com.example.app
 const APPLE_TEAM_ID = process.env.APPLE_TEAM_ID || '';
 const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || '';
 

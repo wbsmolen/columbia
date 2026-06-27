@@ -1,4 +1,4 @@
-# Columbia — OHTTP relay
+# Columbia - OHTTP relay
 # pin by @sha256:<digest> in CI for full reproducibility
 FROM node:20.18.1-alpine
 WORKDIR /app
