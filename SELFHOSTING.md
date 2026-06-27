@@ -107,7 +107,7 @@ docker run -d --name relay --network columbia -p 8081:8080 \
 | `RATE_MAX_KEYS` | `100000` | hard cap on tracked IP keys, so a spoofed-source flood can't grow the table unbounded |
 | `CLIENT_AUTH_MODE` | `off` | client auth: `off`, `secret` (shared-secret header), or `token` (anonymous issuer token) |
 | `CLIENT_SECRET` | (none) | shared secret required when `CLIENT_AUTH_MODE=secret` |
-| `CLIENT_AUTH_HEADER` | `x-lander-token` | header the client presents its credential in (both `secret` and `token` modes read it) |
+| `CLIENT_AUTH_HEADER` | `x-columbia-token` | header the client presents its credential in (both `secret` and `token` modes read it) |
 | `ISSUER_KEYS_URL` | (none) | in `token` mode, the issuer's `GET /issuer-keys`, e.g. `https://<issuer-host>/issuer-keys` |
 | `ISSUER_KEYS_TTL_MS` | `300000` | how often the relay refreshes the cached issuer epoch public keys |
 | `TOKEN_PSS_SALT_LEN` | `48` | RSA-PSS salt length for token verification (matches SHA-384 and the issuer suite) |
@@ -208,7 +208,7 @@ The relay is the one public surface, so it carries the abuse controls. All of th
 
 - **Per-IP rate limiting and a concurrency cap.** `RATE_LIMIT_RPM` (default 120) bounds requests per minute per client IP over a `RATE_WINDOW_MS` window (default 60000); set `RATE_LIMIT_RPM=0` to disable it. `MAX_INFLIGHT` (default 256) caps concurrent relays across the whole process. Anything over either limit gets a 429. `RATE_MAX_KEYS` (default 100000) bounds the limiter's memory so a spoofed-source flood can't grow the table. Behind a managed ingress the per-IP key is read from the rightmost `X-Forwarded-For` entry, because the TCP peer is the ingress, not the client. That IP is used only as a transient counter key; it is never logged or forwarded to the gateway.
 - **Strict request shape.** The relay answers only `POST /relay` with `Content-Type: message/ohttp-req`. A wrong content type returns 415; any other path or method returns 404. There is no general proxy surface to probe.
-- **Client auth (`CLIENT_AUTH_MODE`).** `off` (default) relies on network controls only. `secret` requires a shared secret in the `CLIENT_AUTH_HEADER` (default `x-lander-token`), checked in constant time against `CLIENT_SECRET`. Be honest about what this is: a shared secret shipped in a client is extractable, so `secret` mode is a speed-bump against casual abuse, not real client authentication. `token` mode is the real client gate: the relay reads the same header, verifies an anonymous blind-RSA token offline against the issuer's epoch public key, and enforces spend-once. Point it at the issuer with `ISSUER_KEYS_URL`; it fails closed if it has no issuer keys. See [section 6](#6-optional-build-and-run-the-token-issuer) and [`token-issuer/PROTOCOL.md`](./token-issuer/PROTOCOL.md).
+- **Client auth (`CLIENT_AUTH_MODE`).** `off` (default) relies on network controls only. `secret` requires a shared secret in the `CLIENT_AUTH_HEADER` (default `x-columbia-token`), checked in constant time against `CLIENT_SECRET`. Be honest about what this is: a shared secret shipped in a client is extractable, so `secret` mode is a speed-bump against casual abuse, not real client authentication. `token` mode is the real client gate: the relay reads the same header, verifies an anonymous blind-RSA token offline against the issuer's epoch public key, and enforces spend-once. Point it at the issuer with `ISSUER_KEYS_URL`; it fails closed if it has no issuer keys. See [section 6](#6-optional-build-and-run-the-token-issuer) and [`token-issuer/PROTOCOL.md`](./token-issuer/PROTOCOL.md).
 
 ## Single public surface (internal gateway and commons)
 
@@ -263,7 +263,7 @@ Now identity (relay, operator B) and content (gateway, operator A) live in separ
 
 ## Optional: one example cloud deployment
 
-Plain Docker, as above, is the supported path. If you'd rather use a managed container host, the pattern is the same: build the image, push it to a registry, and run it as a container with the same env vars. The repo includes one example script, [`commons-cache/deploy-ghcr.sh`](./commons-cache/deploy-ghcr.sh), that builds the cache image, pushes it to a container registry, and creates or updates a managed container app. It uses placeholder names you have to replace:
+Plain Docker, as above, is the supported path. If you'd rather use a managed container host, the pattern is the same: build the image, push it to a registry, and run it as a container with the same env vars. [`deploy/README.md`](./deploy/README.md) collects the deployment notes and points to one example CI automation in [`.github/workflows/deploy-azure-reference.yml`](./.github/workflows/deploy-azure-reference.yml). The repo also includes one example script, [`commons-cache/deploy-ghcr.sh`](./commons-cache/deploy-ghcr.sh), that builds the cache image, pushes it to a container registry, and creates or updates a managed container app. It uses placeholder names you have to replace:
 
 | Placeholder in the script | Replace with |
 |---|---|

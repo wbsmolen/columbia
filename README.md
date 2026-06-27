@@ -2,7 +2,7 @@
 
 > A self-hostable HTTP proxy toolkit for personal use, built so that whoever runs the servers can't tell who fetched what. The privacy comes from what the system is unable to see, not from a promise that nobody will look.
 
-Columbia is named after Apollo 11's Command and Service Module, the ship that stayed up in orbit while the lander went down, with no view of what happened on the surface.
+Columbia is named after Apollo 11's Command and Service Module, the ship that stayed up in orbit while the lunar module descended to the surface, with no view of what happened down there.
 
 It's a small toolkit with almost no dependencies. You point it at HTTP content and fetch through a split-trust path built on OHTTP ([RFC 9458](https://www.rfc-editor.org/rfc/rfc9458)). Three services carry the request path (relay, gateway, commons cache), and a fourth optional service (the token issuer) gates who may use the relay without identifying them. Each is a service you run yourself, on plain Docker, on whatever host you want.
 

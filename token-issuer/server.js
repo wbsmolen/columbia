@@ -19,8 +19,8 @@
 // the relay. If one operator ran both, it could line up "device D asked for tokens
 // in epoch E" (issuer view) against "a token from epoch E was spent on content C"
 // (relay view) and, with enough traffic shaping, start to link device to content.
-// Deploy the issuer as its own public Azure Container App under separate control,
-// exactly like the gateway. See ./README.md.
+// Deploy the issuer as its own public service under separate control, exactly like
+// the gateway. See ./README.md.
 //
 // LOGGING IS RED-ONLY. We never log the device id (keyId), the App Attest
 // assertion, a blinded request, a blind signature, or anything else that could tie
@@ -75,15 +75,15 @@ const REQUIRE_CLIENT_DATA_BINDING = process.env.REQUIRE_CLIENT_DATA_BINDING !== 
 // for a single replica but NOT for multi-replica (see KEY STORE note).
 const ISSUER_SIGNING_KEY_B64 = process.env.ISSUER_SIGNING_KEY || '';
 
-// --- Front Door origin lock -------------------------------------------------
-// When set, the issuer accepts a request only if it arrived through our Azure
-// Front Door, which injects the X-Azure-FDID header carrying our profile's Front
-// Door ID. This pins the public origin to Front Door so the Container App FQDN
-// can't be hit directly. Empty/unset => disabled (preserves current behavior
-// exactly), so the check is inert until an operator sets REQUIRE_FDID at deploy
-// time once Front Door is provisioned. The FDID value is NEVER logged.
+// --- Front door origin lock -------------------------------------------------
+// When set, the issuer accepts a request only if it arrived through a front door
+// (a CDN or WAF, for example Azure Front Door), which injects the X-Azure-FDID
+// header carrying the front door's profile id. This pins the public origin to the
+// front door so the origin host can't be hit directly. Empty/unset => disabled, so
+// the check is inert until an operator sets REQUIRE_FDID at deploy time once a
+// front door is provisioned. The FDID value is NEVER logged.
 // GET /health AND GET /issuer-keys are exempt: the relay fetches /issuer-keys
-// directly, in-environment, with no Front Door in that hop, and it is public key
+// directly, in-environment, with no front door in that hop, and it is public key
 // material. Every other route (/issue and any /attest* endpoints) requires it.
 const REQUIRE_FDID = process.env.REQUIRE_FDID || '';
 
@@ -269,7 +269,7 @@ function reserveQuota(epochId, deviceId, n) {
 // ATTESTED-KEY STORE (production): this Map is in-process and resets on restart,
 // which has the same two multi-replica gaps the quota store has: a device
 // registered on replica A is unknown to replica B, and a restart forgets every
-// registration (forcing devices to re-attest, which the Lander client handles by
+// registration (forcing devices to re-attest, which the iOS client handles by
 // falling back to a fresh attestation when an assertion is rejected as unknown).
 // For a real multi-replica deployment, move this to the SAME shared store as the
 // quota/redemption state (e.g. Redis: a hash per keyId holding the SPKI PEM + last
@@ -365,7 +365,7 @@ async function handleIssue(req, res, start, body) {
   }
 
   // (a) Validate App Attest. This proves the request comes from a genuine,
-  // unmodified Lander install on real Apple hardware. FAILS CLOSED: if App Attest
+  // unmodified iOS client install on real Apple hardware. FAILS CLOSED: if App Attest
   // is unconfigured (Apple root cert / team+bundle id not supplied), the validator
   // returns { ok: false } and we reject. We never log the assertion/attestation,
   // and we never log the coarse failure reason at a level that could fingerprint a
@@ -567,12 +567,12 @@ function fdidExempt(req, path) {
 const server = http.createServer((req, res) => {
   const start = Date.now();
 
-  // Front Door origin lock. When REQUIRE_FDID is set, every non-exempt request
-  // must arrive through Azure Front Door (which injects X-Azure-FDID). This runs
+  // Front door origin lock. When REQUIRE_FDID is set, every non-exempt request
+  // must arrive through the front door (which injects X-Azure-FDID). This runs
   // BEFORE any route does work so a direct-to-origin hit is rejected up front.
   // GET /health and GET /issuer-keys are exempt (see fdidExempt). The FDID value
   // is never logged; we log only the route + status. When REQUIRE_FDID is unset
-  // this whole block is a no-op and behavior is exactly as before.
+  // this whole block is a no-op.
   if (REQUIRE_FDID) {
     const path = String(req.url || '').split('?')[0];
     if (!fdidExempt(req, path) && !frontDoorAllowed(req)) {

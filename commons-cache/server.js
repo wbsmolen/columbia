@@ -1,11 +1,11 @@
-// Columbia — commons-cache
+// Columbia - commons-cache
 //
 // The optional "public commons" tier: fetch each public, sessionless item ONCE
 // and serve it to all clients, fronted by OHTTP so the operator can't
 // profile reads. This service is the cache origin.
 //
 // Dependency-free (Node 20+: global fetch + built-in http). Structured JSON logs
-// to stdout carry RED metrics only — NO IPs, NO user data, NO request bodies —
+// to stdout carry RED metrics only - NO IPs, NO user data, NO request bodies -
 // matching the privacy-preserving observability design.
 //
 // Generic by design: it caches a public, sessionless upstream URL. Set the
@@ -14,10 +14,10 @@
 // reach this path.
 //
 // Endpoints:
-//   GET /health     — liveness
-//   GET /v1/probe   — diagnostic: can THIS host reach the configured upstream
+//   GET /health     - liveness
+//   GET /v1/probe   - diagnostic: can THIS host reach the configured upstream
 //                     surfaces at all? Reports status, size, and latency.
-//   GET /v1/commons — cached public feed (TTL + stale-while-revalidate)
+//   GET /v1/commons - cached public feed (TTL + stale-while-revalidate)
 //                     ?id=<feed-id>&sort=<sort>
 
 const http = require('http');
@@ -28,7 +28,7 @@ const SWR_MS = parseInt(process.env.COMMONS_SWR_MS || '300000', 10);       // se
 const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || 'https://example.com').replace(/\/+$/, '');
 // Path appended to UPSTREAM_BASE, with {id} and {sort} substituted (each
 // sanitized and percent-encoded). Default is the generic form; an operator can
-// set e.g. /r/{id}/{sort}/.rss to target a specific upstream without a code edit.
+// set e.g. /feed/{id}/{sort}.xml to target a specific upstream without a code edit.
 const UPSTREAM_PATH_TEMPLATE = process.env.UPSTREAM_PATH_TEMPLATE || '/{id}/{sort}.rss';
 const UPSTREAM_UA = process.env.UPSTREAM_UA ||
   'columbia-commons/1.0 (+https://example.com)';
@@ -36,7 +36,7 @@ const MAX_ENTRIES = parseInt(process.env.COMMONS_MAX_ENTRIES || '5000', 10);    
 const MAX_BODY_BYTES = parseInt(process.env.COMMONS_MAX_BODY_BYTES || '5000000', 10); // reject oversized bodies
 
 // A sort/view is any short lowercase token. This validates input (prevents path
-// injection); it deliberately fixes no vocabulary — your upstream defines it.
+// injection); it deliberately fixes no vocabulary - your upstream defines it.
 const SORT_RE = /^[a-z]+$/;
 
 // Feed media types we are willing to echo back. Anything else is normalized to
@@ -111,7 +111,7 @@ async function fetchUpstream(url) {
   try {
     const res = await fetch(url, {
       headers: upstreamHeaders(),
-      redirect: 'manual',                 // never follow — a 3xx could point at an internal host (SSRF)
+      redirect: 'manual',                 // never follow - a 3xx could point at an internal host (SSRF)
       signal: AbortSignal.timeout(10000), // bound slow/hung upstreams
     });
     // Treat any 3xx as an upstream error: we do not follow redirects.
@@ -119,13 +119,13 @@ async function fetchUpstream(url) {
       return { status: res.status, body: Buffer.alloc(0), contentType: 'application/octet-stream', ms: Date.now() - started, error: true };
     }
     const body = Buffer.from(await res.arrayBuffer());
-    // Reject oversized bodies — do not cache or serve (memory DoS guard).
+    // Reject oversized bodies - do not cache or serve (memory DoS guard).
     if (res.status === 200 && body.length > MAX_BODY_BYTES) {
       return { status: res.status, body: Buffer.alloc(0), contentType: 'application/octet-stream', ms: Date.now() - started, error: true };
     }
     return { status: res.status, body, contentType: res.headers.get('content-type') || 'application/json', ms: Date.now() - started };
   } catch {
-    // Never surface the exception text — fixed, empty error result only.
+    // Never surface the exception text - fixed, empty error result only.
     return { status: 0, body: Buffer.alloc(0), contentType: 'application/octet-stream', ms: Date.now() - started, error: true };
   }
 }
@@ -162,20 +162,20 @@ async function getCachedFeed(id, sort) {
             }
           })
           .catch(() => {})
-          .finally(() => { entry.revalidating = false; }); // always reset — never get stuck revalidating
+          .finally(() => { entry.revalidating = false; }); // always reset - never get stuck revalidating
       }
       return { ...entry, cacheState: 'STALE' };
     }
   }
 
-  // Cold or rotten — fetch synchronously.
+  // Cold or rotten - fetch synchronously.
   const up = await fetchUpstream(url);
   if (up.status === 200 && !up.error) {
     const fresh = { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), revalidating: false };
     cacheSet(key, fresh);
     return { ...fresh, cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms };
   }
-  // Upstream failed — fixed error result, no upstream body/status leaked downstream.
+  // Upstream failed - fixed error result, no upstream body/status leaked downstream.
   return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true };
 }
 
@@ -219,7 +219,7 @@ const server = http.createServer(async (req, res) => {
         const out = await getCachedFeed(id, sort);
         cacheState = out.cacheState;
         if (out.upstreamError) {
-          // Fixed 502 — never leak upstream status, body, or error text.
+          // Fixed 502 - never leak upstream status, body, or error text.
           status = 502;
           res.writeHead(status, {
             'Content-Type': 'application/json',
@@ -248,13 +248,13 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort='] }));
     }
   } catch {
-    // Fixed 500 — never place exception text into the response body.
+    // Fixed 500 - never place exception text into the response body.
     status = 500;
     res.writeHead(status, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'internal' }));
   }
 
-  // RED metric — route TEMPLATE only, no IPs, no query values, no bodies.
+  // RED metric - route TEMPLATE only, no IPs, no query values, no bodies.
   log({ route, method: req.method, status, cache: cacheState, durationMs: Date.now() - started });
 });
 

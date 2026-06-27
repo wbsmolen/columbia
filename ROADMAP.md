@@ -36,7 +36,7 @@ Stop per-user key targeting, where a gateway hands one client a unique key to de
 The commons cache already emits CDN-ready headers. Put a CDN in front so public content is edge-cached globally and the cache tier only sees origin-shield traffic. It serves identical public content, so there's no per-user signal to leak.
 
 ### (g) Shared cache ⬜💲
-Right now each cache replica has its own in-memory store, so hit-rate drops as replicas fan out. A shared store (Redis, for instance) makes hit-rate replica-independent; keep single-flight across replicas with a distributed lock. Largely moot once (f) is in place.
+Each cache replica has its own in-memory store, so hit-rate drops as replicas fan out. A shared store (Redis, for instance) makes hit-rate replica-independent; keep single-flight across replicas with a distributed lock. Largely moot once (f) is in place.
 
 ### (h) Retries and resilience ⬜
 The relay and cache make single-attempt upstream calls today. Add bounded retries with backoff and jitter, per-call timeouts, and circuit-breaking, so a transient upstream hiccup doesn't surface as a user-visible failure. Keep it RED-observable.

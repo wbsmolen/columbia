@@ -26,7 +26,7 @@ This service is the cache origin at the end of the operator-blind path (`relay -
 | `COMMONS_TTL_MS` | `60000` | fresh window before a feed is treated as stale |
 | `COMMONS_SWR_MS` | `300000` | serve-stale window past TTL (background revalidate) |
 | `UPSTREAM_BASE` | `https://example.com` | upstream origin the cache fetches from (https only, validated at startup) |
-| `UPSTREAM_PATH_TEMPLATE` | `/{id}/{sort}.rss` | path appended to `UPSTREAM_BASE`, with `{id}` and `{sort}` substituted (each sanitized then percent-encoded). Set the layout for your upstream without editing code, for example `/r/{id}/{sort}/.rss`. |
+| `UPSTREAM_PATH_TEMPLATE` | `/{id}/{sort}.rss` | path appended to `UPSTREAM_BASE`, with `{id}` and `{sort}` substituted (each sanitized then percent-encoded). Set the layout for your upstream without editing code, for example `/feed/{id}/{sort}.xml`. |
 | `UPSTREAM_UA` | a generic UA string | `User-Agent` sent to the upstream origin |
 
 ## Observability

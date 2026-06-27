@@ -1,6 +1,8 @@
-# Deploy the middleware services to Azure Container Apps.
+# Optional reference deployment: build and ship the Columbia services to Azure
+# Container Apps. Columbia self-hosts on plain Docker on any host (see deploy/README.md);
+# this workflow is one example of automating that on one platform, not a requirement.
 #
-# Manual trigger only (workflow_dispatch) — there is no auto-deploy on push.
+# Manual trigger only (workflow_dispatch); there is no auto-deploy on push.
 # Images are built in ACR and tagged with the immutable commit SHA, then the
 # matching Container App is updated to that image.
 #
@@ -21,7 +23,7 @@
 # domain. The issuer's signing key and the Apple App Attest inputs are injected as
 # Container App secrets, never baked into the image. See token-issuer/README.md.
 
-name: Deploy middleware to Azure Container Apps
+name: Deploy Columbia services to Azure Container Apps (reference)
 
 on:
   workflow_dispatch:
