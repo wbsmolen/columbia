@@ -1,4 +1,5 @@
 // Columbia - token-issuer / relay token-mode tests.
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //
 // Run: node --test   (from this directory, after `npm install`)
 //

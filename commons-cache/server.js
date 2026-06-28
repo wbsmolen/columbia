@@ -1,4 +1,5 @@
 // Columbia - commons-cache
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //
 // The optional "public commons" tier: fetch each public, sessionless item ONCE
 // and serve it to all clients, fronted by OHTTP so the operator can't

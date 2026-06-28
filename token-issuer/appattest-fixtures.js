@@ -1,4 +1,5 @@
 // Columbia - synthetic App Attest fixtures for tests.
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //
 // We have NO real device attestation in CI, and node has no built-in X.509
 // builder, and the deploy image (node:20-alpine) ships no openssl CLI. So to prove

@@ -1,4 +1,5 @@
 // Columbia - OHTTP relay (RFC 9458)
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //
 // The relay is the split-trust counterpart to the gateway. It sees the client's
 // IP and an OPAQUE ciphertext (message/ohttp-req) - never the plaintext, never

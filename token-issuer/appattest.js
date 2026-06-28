@@ -1,4 +1,5 @@
 // Columbia - Apple App Attest validation (Attester role)
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //
 // This module is the gate that proves an /issue request comes from a genuine,
 // unmodified install of the iOS client on real Apple hardware, before the issuer

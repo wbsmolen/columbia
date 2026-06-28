@@ -1,4 +1,5 @@
 // Columbia - Apple App Attest validation tests.
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //
 // Run: node --test   (from this directory)
 //

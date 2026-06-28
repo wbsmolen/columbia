@@ -1,4 +1,5 @@
 // Columbia - token issuer (Privacy Pass Attester + Issuer)
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //
 // This is the Attester + Issuer roles of the Privacy Pass architecture
 // (RFC 9576). It is the ONE component in the system that is allowed to learn a
