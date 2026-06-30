@@ -35,6 +35,18 @@ const RATE_LIMIT_RPM = parseInt(process.env.RATE_LIMIT_RPM || '120', 10);   // r
 const RATE_WINDOW_MS = parseInt(process.env.RATE_WINDOW_MS || '60000', 10); // window length
 const MAX_INFLIGHT   = parseInt(process.env.MAX_INFLIGHT   || '256', 10);   // global concurrent relays
 const RATE_MAX_KEYS  = parseInt(process.env.RATE_MAX_KEYS  || '100000', 10);// bound limiter memory
+// TRUSTED_CLIENT_IP_HEADER: name of a header that a TRUSTED front proxy sets to
+// the real client IP (e.g. 'x-azure-clientip' behind Azure Front Door,
+// 'cf-connecting-ip' behind Cloudflare, 'true-client-ip' behind some CDNs).
+// REQUIRED whenever the request passes through MORE THAN ONE proxy before the
+// relay: with a multi-proxy chain (front proxy + platform ingress) the rightmost
+// X-Forwarded-For entry is the *nearest* proxy's address, not the client, so
+// every client collapses into a SINGLE rate-limit bucket and legitimate traffic
+// gets 429'd in aggregate. Set this to the front proxy's trusted single-value
+// client-IP header to key per real client. Empty (default) keeps the single-proxy
+// rightmost-XFF behaviour. Like the XFF key, it is used ONLY as a transient
+// limiter key and is never logged or forwarded to the gateway.
+const TRUSTED_CLIENT_IP_HEADER = (process.env.TRUSTED_CLIENT_IP_HEADER || '').toLowerCase();
 
 // --- Client auth ------------------------------------------------------------
 // CLIENT_AUTH_MODE: 'off' (default; rely on network controls), 'secret' (interim
@@ -126,6 +138,16 @@ let inflight = 0;
 // sit to its LEFT). Used ONLY as a transient limiter key; never logged, never
 // forwarded to the gateway.
 function clientIpKey(req) {
+  // Behind a multi-proxy chain (front proxy + platform ingress), prefer the
+  // trusted single-value client-IP header the front proxy sets. The rightmost
+  // X-Forwarded-For entry below is only correct for a SINGLE trusted proxy; with
+  // two hops it is the nearest proxy's address and would collapse every client
+  // into one bucket. See TRUSTED_CLIENT_IP_HEADER.
+  if (TRUSTED_CLIENT_IP_HEADER) {
+    const h = req.headers[TRUSTED_CLIENT_IP_HEADER];
+    const v = Array.isArray(h) ? h[0] : h;
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
   const xff = req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff.length) {
     const parts = xff.split(',');
