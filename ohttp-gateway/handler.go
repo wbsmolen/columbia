@@ -76,6 +76,7 @@ const (
 	metricsResultResponseTranslationFailed = "response_translate_failed"
 	metricsResultTargetRequestForbidden    = "request_forbidden"
 	metricsResultTargetRequestFailed       = "request_failed"
+	metricsResultRateLimited               = "rate_limited"
 	metricsResultSuccess                   = "success"
 	metricsPayloadStatusPrefix             = "gateway_payload"
 )
@@ -319,6 +320,9 @@ type FilteredHttpRequestHandler struct {
 	client         HTTPRequestHandler
 	allowedOrigins map[string]bool
 	targetRewrites map[string]TargetRewrite
+	// limiter bounds the total outbound request rate. nil (the default) disables
+	// limiting; see globalRateLimiter.
+	limiter *globalRateLimiter
 }
 
 // Handle processes HTTP requests to targets that are permitted according to a list of
@@ -339,6 +343,30 @@ func (h FilteredHttpRequestHandler) Handle(req *http.Request, metrics Metrics) (
 			req.URL.Scheme = newTarget.Scheme
 			req.URL.Host = newTarget.Host
 		}
+	}
+
+	// Global outbound rate limit (opt-in; nil limiter always allows). When the
+	// shared upstream budget is momentarily exhausted, refuse with a 429 +
+	// Retry-After instead of making the call, so clients back off rather than
+	// piling onto a budget that is already spent.
+	if !h.limiter.allow() {
+		metrics.Fire(metricsResultRateLimited)
+		retryAfter := strconv.Itoa(h.limiter.retryAfterSeconds())
+		slog.Debug("GatewayRateLimited", "host", req.Host, "retryAfter", retryAfter)
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Proto:      "HTTP/1.1",
+			ProtoMajor: 1,
+			ProtoMinor: 1,
+			Header: http.Header{
+				"Retry-After":  []string{retryAfter},
+				"Content-Type": []string{"text/plain; charset=utf-8"},
+			},
+			Body:          ioutil.NopCloser(bytes.NewReader([]byte("rate limited\n"))),
+			ContentLength: int64(len("rate limited\n")),
+			Request:       req,
+		}, nil
 	}
 
 	resp, err := h.client.Handle(req, metrics)
