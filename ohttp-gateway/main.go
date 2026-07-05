@@ -284,11 +284,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Optional global outbound rate limit. GATEWAY_MAX_QPM caps the total
+	// upstream requests-per-minute this process will make; unset or <=0 disables
+	// it (nil limiter = always allow). For a multi-replica deployment, set each
+	// replica to the shared budget divided by the replica count.
+	limiter := newGlobalRateLimiter(int(getUintEnv("GATEWAY_MAX_QPM", 0)))
+
 	// Create the default HTTP handler
 	httpHandler := FilteredHttpRequestHandler{
 		client:         HTTPClientRequestHandler{client: &http.Client{}},
 		allowedOrigins: allowedOrigins,
 		targetRewrites: targetRewrites,
+		limiter:        limiter,
 	}
 
 	// Create the default gateway and its request handler chain

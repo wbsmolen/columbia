@@ -1,6 +1,6 @@
 # Self-Hosting Columbia
 
-This guide gets the request-path components (relay, gateway, and optionally the commons cache) running on plain Docker, on any host, plus the optional token issuer that gates who may use the relay. You don't need a managed cloud. There's one optional cloud example at the end, with placeholders you swap for your own resource names.
+This guide runs the request-path components (relay, gateway, and optionally the commons cache) on plain Docker, on any host, plus the optional token issuer that gates who may use the relay. No managed cloud is required. One optional cloud example is at the end, using placeholders for your own resource names.
 
 > Read this first. The operator-blind guarantee only holds when the relay and gateway are run by different operators who don't collude. Running both on one host is fine for testing, but it gives you no protection against that single operator. The [two-operator section](#running-relay-and-gateway-as-separate-operators) below explains how to split them for the real guarantee.
 
@@ -25,7 +25,7 @@ Save it to an environment variable for the commands below:
 export SEED_SECRET_KEY="$(openssl rand -hex 32)"
 ```
 
-One seed deterministically derives BOTH published key configs (the primary `X25519+Kyber768-draft00` config and the legacy `DHKEM(X25519, HKDF-SHA256)` config). The vendored gateway has NO online key rotation: rotating `SEED_SECRET_KEY` is a hard cutover. You redeploy the gateway with the new seed, and every client that pinned the old key config fingerprint breaks until it re-pins the new one. Plan the cutover, because there is no overlap window where both old and new keys are served.
+One seed deterministically derives BOTH published key configs (the primary `X25519+Kyber768-draft00` config and the legacy `DHKEM(X25519, HKDF-SHA256)` config). The vendored gateway has NO online key rotation: rotating `SEED_SECRET_KEY` is a hard cutover. Redeploying the gateway with the new seed breaks every client that pinned the old key config fingerprint until it re-pins the new one. Plan the cutover, because there is no overlap window where both old and new keys are served.
 
 ## 2. Create a shared Docker network (single-host testing)
 
@@ -122,7 +122,7 @@ docker run -d --name relay --network columbia -p 8081:8080 \
 
 ## 5. (Optional) Build and run the commons cache
 
-The cache is an example upstream target for the gateway. It fetches a public, sessionless URL once and serves it to many, with TTL, stale-while-revalidate, and single-flight. It's generic: point it at whatever public content you want by setting `UPSTREAM_BASE` and `UPSTREAM_PATH_TEMPLATE`, no code edit needed. It has to be listed in the gateway's `ALLOWED_TARGET_ORIGINS`.
+The cache is an example upstream target for the gateway. It fetches a public, sessionless URL once and serves it to many clients, with TTL, stale-while-revalidate, and single-flight. It is generic: point it at any public content by setting `UPSTREAM_BASE` and `UPSTREAM_PATH_TEMPLATE`, with no code edit. It must be listed in the gateway's `ALLOWED_TARGET_ORIGINS`.
 
 ```sh
 cd ../commons-cache
@@ -209,7 +209,7 @@ The relay is the one public surface, so it carries the abuse controls. All of th
 
 - **Per-IP rate limiting and a concurrency cap.** `RATE_LIMIT_RPM` (default 120) bounds requests per minute per client IP over a `RATE_WINDOW_MS` window (default 60000); set `RATE_LIMIT_RPM=0` to disable it. `MAX_INFLIGHT` (default 256) caps concurrent relays across the whole process. Anything over either limit gets a 429. `RATE_MAX_KEYS` (default 100000) bounds the limiter's memory so a spoofed-source flood can't grow the table. Behind a single managed ingress the per-IP key is read from the rightmost `X-Forwarded-For` entry, because the TCP peer is the ingress, not the client. **If the request crosses more than one proxy** (e.g. a CDN or Front Door in front of the platform ingress), the rightmost `X-Forwarded-For` entry is the nearest proxy, not the client, so every client collapses into one bucket and gets 429'd in aggregate — set `TRUSTED_CLIENT_IP_HEADER` to the front proxy's trusted client-IP header (`x-azure-clientip` for Azure Front Door, `cf-connecting-ip` for Cloudflare) to key per real client. That IP is used only as a transient counter key; it is never logged or forwarded to the gateway.
 - **Strict request shape.** The relay answers only `POST /relay` with `Content-Type: message/ohttp-req`. A wrong content type returns 415; any other path or method returns 404. There is no general proxy surface to probe.
-- **Client auth (`CLIENT_AUTH_MODE`).** `off` (default) relies on network controls only. `secret` requires a shared secret in the `CLIENT_AUTH_HEADER` (default `x-columbia-token`), checked in constant time against `CLIENT_SECRET`. Be honest about what this is: a shared secret shipped in a client is extractable, so `secret` mode is a speed-bump against casual abuse, not real client authentication. `token` mode is the real client gate: the relay reads the same header, verifies an anonymous blind-RSA token offline against the issuer's epoch public key, and enforces spend-once. Point it at the issuer with `ISSUER_KEYS_URL`; it fails closed if it has no issuer keys. See [section 6](#6-optional-build-and-run-the-token-issuer) and [`token-issuer/PROTOCOL.md`](./token-issuer/PROTOCOL.md).
+- **Client auth (`CLIENT_AUTH_MODE`).** `off` (default) relies on network controls only. `secret` requires a shared secret in the `CLIENT_AUTH_HEADER` (default `x-columbia-token`), checked in constant time against `CLIENT_SECRET`. A shared secret shipped in a client is extractable, so `secret` mode is a speed-bump against casual abuse, not real client authentication. `token` mode is the real client gate: the relay reads the same header, verifies an anonymous blind-RSA token offline against the issuer's epoch public key, and enforces spend-once. Point it at the issuer with `ISSUER_KEYS_URL`; it fails closed if it has no issuer keys. See [section 6](#6-optional-build-and-run-the-token-issuer) and [`token-issuer/PROTOCOL.md`](./token-issuer/PROTOCOL.md).
 
 ## Single public surface (internal gateway and commons)
 
@@ -264,7 +264,7 @@ Now identity (relay, operator B) and content (gateway, operator A) live in separ
 
 ## Optional: one example cloud deployment
 
-Plain Docker, as above, is the supported path. If you'd rather use a managed container host, the pattern is the same: build the image, push it to a registry, and run it as a container with the same env vars. [`deploy/README.md`](./deploy/README.md) collects the deployment notes and points to one example CI automation in [`.github/workflows/deploy-azure-reference.yml`](./.github/workflows/deploy-azure-reference.yml). The repo also includes one example script, [`commons-cache/deploy-ghcr.sh`](./commons-cache/deploy-ghcr.sh), that builds the cache image, pushes it to a container registry, and creates or updates a managed container app. It uses placeholder names you have to replace:
+Plain Docker, as above, is the supported path. For a managed container host, the pattern is the same: build the image, push it to a registry, and run it as a container with the same env vars. [`deploy/README.md`](./deploy/README.md) collects the deployment notes and points to one example CI automation in [`.github/workflows/deploy-azure-reference.yml`](./.github/workflows/deploy-azure-reference.yml). The repo also includes one example script, [`commons-cache/deploy-ghcr.sh`](./commons-cache/deploy-ghcr.sh), that builds the cache image, pushes it to a container registry, and creates or updates a managed container app. It uses placeholder names you have to replace:
 
 | Placeholder in the script | Replace with |
 |---|---|

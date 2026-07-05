@@ -1,6 +1,6 @@
 # Roadmap: Columbia
 
-The cryptographic data path is real and works end to end today. A client HPKE-seals a request, the relay forwards it without revealing the client, the gateway decrypts and fetches, and the response comes back sealed. What's left is hardening and decentralization: moving from operator-blind by construction to operator-blind you can verify.
+The cryptographic data path works end to end today. A client HPKE-seals a request, the relay forwards it without revealing the client, the gateway decrypts and fetches, and the response returns sealed. Remaining work is hardening and decentralization: moving from operator-blind by construction to operator-blind that can be verified.
 
 Legend: ✅ done, 🟡 partial, ⬜ not started, 💲 has a recurring cost, 🔗 needs another operator or an external dependency.
 
@@ -18,10 +18,10 @@ Legend: ✅ done, 🟡 partial, ⬜ not started, 💲 has a recurring cost, 🔗
 ## Remaining work
 
 ### (a) Relay at a separate operator, for true non-collusion ⬜🔗
-Run the relay and the gateway under genuinely different operators, so identity (relay) and content (gateway) live in separate trust domains. The relay is about 75 lines of stateless forwarding, so moving it to an independent host (an edge worker, say) also buys you global POPs. Lowest cost, highest trust gain.
+Run the relay and the gateway under genuinely different operators, so identity (relay) and content (gateway) live in separate trust domains. The relay is about 75 lines of stateless forwarding, so moving it to an independent host (such as an edge worker) also provides global POPs. Low cost, high trust gain.
 
 ### (b) Confidential-compute gateway on SEV-SNP ⬜🔗💲
-Run the gateway in an AMD SEV-SNP confidential VM so the host and operator can't read gateway memory. That closes the gap where today the operator could in principle read decrypted content or the HPKE key out of the process. Confidential SKUs cost more and usually don't scale to zero, so budget the always-on floor on purpose.
+Run the gateway in an AMD SEV-SNP confidential VM so the host and operator cannot read gateway memory. That closes the gap where the operator could otherwise read decrypted content or the HPKE key out of the process. Confidential SKUs cost more and usually do not scale to zero, so budget the always-on floor accordingly.
 
 ### (c) Client-side attestation verifier ⬜🔗
 Make verification mean attested, not just pinned. The client fetches the gateway's platform attestation (a DCAP quote or an MAA JWT), validates the signature chain to the hardware root, checks the launch measurement against a pinned known-good value, and only then trusts the channel. Depends on (b).

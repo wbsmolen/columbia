@@ -2,9 +2,9 @@
 
 The optional public-commons tier of Columbia. It fetches each public, sessionless item once and serves it to all clients (anything tied to a user's identity stays on their own device and never touches this path). It sits behind OHTTP so the operator can't profile reads. Dependency-free Node (global `fetch` plus built-in `http`).
 
-This service is the cache origin at the end of the operator-blind path (`relay -> gateway -> commons-cache -> upstream`). Because public reads are identical for every client, the cache turns N clients times M reads into M upstream fetches. That's the scale multiplier that lets a tiny footprint serve a lot of clients while upstream-facing volume stays flat. See the top-level [`../README.md`](../README.md) and [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
+This service is the cache origin at the end of the operator-blind path (`relay -> gateway -> commons-cache -> upstream`). Because public reads are identical for every client, the cache turns N clients times M reads into M upstream fetches, so upstream-facing volume stays flat as the number of clients grows. See the top-level [`../README.md`](../README.md) and [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 
-> Generic by design. This ships as a worked example that caches a public, sessionless upstream URL. Point it at whatever public content you want by adapting the upstream URL it builds in [`server.js`](./server.js), and set `UPSTREAM_UA` to match.
+> Generic by design. This ships as a worked example that caches a public, sessionless upstream URL. Point it at any public content by adapting the upstream URL it builds in [`server.js`](./server.js), and set `UPSTREAM_UA` to match.
 
 ## Endpoints
 | Route | Purpose |

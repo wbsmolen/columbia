@@ -15,7 +15,7 @@ OHTTP deliberately keeps who and what with two different parties:
 
 Neither party ever holds identity and content together. That's the operator-blind guarantee. The relay's job is to be the network endpoint the client connects to, and to forward the sealed bytes to the gateway without leaking who the client is.
 
-> Non-collusion caveat: for the guarantee to hold, the relay and gateway have to be run by different, non-colluding parties. Running both on one host proves the flow works but gives you no protection against the single operator. See [`../SELFHOSTING.md`](../SELFHOSTING.md).
+> Non-collusion caveat: for the guarantee to hold, the relay and gateway have to be run by different, non-colluding parties. Running both on one host proves the flow works but provides no protection against the single operator. See [`../SELFHOSTING.md`](../SELFHOSTING.md).
 
 ## The OHTTP request/response flow
 
@@ -97,7 +97,7 @@ is no per-request call to the issuer: the relay fetches the public key once from
 `ISSUER_KEYS_URL` and caches it, so the issuer never learns which token was spent.
 That offline, public verification is what keeps the token unlinkable. The issuer
 half lives in [`../token-issuer`](../token-issuer). The spend-once set is in-memory
-and single-process for now; the code marks where a shared store goes for a
+and single-process; the code marks where a shared store goes for a
 multi-replica deployment.
 
 ## Run locally

@@ -1,20 +1,20 @@
 # Columbia
 
-> A self-hostable HTTP proxy toolkit for personal use, built so that whoever runs the servers can't tell who fetched what. The privacy comes from what the system is unable to see, not from a promise that nobody will look.
+> A self-hostable HTTP proxy toolkit for personal use, built so that no operator can link who made a request to what was fetched. Privacy derives from what each party is structurally unable to observe, not from a policy commitment.
 
-Columbia is named after Apollo 11's Command and Service Module, the ship that stayed up in orbit while the lunar module descended to the surface, with no view of what happened down there.
+Columbia is named after Apollo 11's Command and Service Module, which stayed in orbit without visibility into the lunar surface operations below.
 
-It's a small toolkit with almost no dependencies. You point it at HTTP content and fetch through a split-trust path built on OHTTP ([RFC 9458](https://www.rfc-editor.org/rfc/rfc9458)). Three services carry the request path (relay, gateway, commons cache), and a fourth optional service (the token issuer) gates who may use the relay without identifying them. Each is a service you run yourself, on plain Docker, on whatever host you want.
+The toolkit has almost no dependencies. HTTP content is fetched through a split-trust path built on OHTTP ([RFC 9458](https://www.rfc-editor.org/rfc/rfc9458)). Three services carry the request path (relay, gateway, commons cache), and a fourth optional service (the token issuer) gates who may use the relay without identifying them. Each runs as a self-hosted service on Docker, on any host.
 
-The property that matters is this: no single operator ever holds your identity and your content at the same time. The relay sees your IP but only opaque ciphertext. The gateway decrypts and fetches but never sees your IP. Run those two as separate operators and neither one can connect you to what you read.
+No single operator ever holds both client identity and request content at the same time. The relay sees the client IP but only opaque ciphertext. The gateway decrypts and fetches but never sees the client IP. Run the two as separate operators and neither can link a client to the content it fetched.
 
-This is a toolkit, not a hosted service. You bring your own servers and your own keys. It's released for personal, non-commercial use (see [LICENSE](#license)).
+This is a toolkit, not a hosted service; it requires self-provided servers and keys. It is released for personal, non-commercial use (see [LICENSE](#license)).
 
 ---
 
 ## How it works
 
-*The OHTTP path. No single hop holds both your identity and your content.*
+*The OHTTP path. No single hop holds both client identity and request content.*
 
 ```mermaid
 flowchart LR
@@ -35,11 +35,11 @@ flowchart LR
 ```
 
 1. The client seals each request locally with HPKE. Only the gateway's public key can open it, and the sealed bytes mean nothing to anyone in between.
-2. The relay receives the sealed request. All it ever has is your IP and a blob of ciphertext, never the content and never the target. It forwards that ciphertext to the gateway in a fresh request with no client headers and no `X-Forwarded-For`, so the gateway has no way to learn who you are.
-3. The gateway decrypts the request, fetches the target, and encrypts the response on the way back. It sees the request content but not your IP, and it can only reach an allowlist of target origins (`ALLOWED_TARGET_ORIGINS`). Set that allowlist tightly. The gateway does NOT fail closed on its own: if `ALLOWED_TARGET_ORIGINS` is empty or unset, it becomes an open, anonymous proxy and an SSRF pivot that anyone can point at any origin. Matching is by exact `Host` string, so scheme, port, and subdomain are all literal (`example.com` does not cover `api.example.com`).
+2. The relay receives the sealed request. All it ever holds is the client IP and ciphertext, never the content and never the target. It forwards that ciphertext to the gateway in a fresh request with no client headers and no `X-Forwarded-For`, so the gateway cannot learn the client's identity.
+3. The gateway decrypts the request, fetches the target, and encrypts the response on the way back. It sees the request content but not the client IP, and it can only reach an allowlist of target origins (`ALLOWED_TARGET_ORIGINS`). Set that allowlist tightly. The gateway does NOT fail closed on its own: if `ALLOWED_TARGET_ORIGINS` is empty or unset, it becomes an open, anonymous proxy and an SSRF pivot that anyone can point at any origin. Matching is by exact `Host` string, so scheme, port, and subdomain are all literal (`example.com` does not cover `api.example.com`).
 4. The commons cache is optional. It fetches each public, sessionless item once and serves it to everyone. Because it sits behind the gateway, the operator can't profile reads even for cached content.
 
-So the relay has identity without content, and the gateway has content without identity. As long as different operators run them and the two don't collude, nobody can rebuild your reading history. Running both yourself is fine for testing, but it collapses that non-collusion property (see [SELFHOSTING.md](./SELFHOSTING.md)).
+The relay thus holds identity without content, and the gateway holds content without identity. As long as different operators run them and the two do not collude, no party can reconstruct a client's reading history. Running both under a single operator is acceptable for testing, but it collapses the non-collusion property (see [SELFHOSTING.md](./SELFHOSTING.md)).
 
 The full trust and threat model, the attestation chain, and the observability design are in [ARCHITECTURE.md](./ARCHITECTURE.md).
 
@@ -47,11 +47,11 @@ The full trust and threat model, the attestation chain, and the observability de
 
 ## What it's for
 
-- Fetching your own HTTP reads through a split-trust path, so neither hop can tie your network identity to what you asked for.
-- Caching public content without being able to see who read it. Put the commons cache in front of public, sessionless endpoints (listings, feeds, public APIs) and many reads collapse into a handful of upstream fetches.
-- A starting point for building operator-blind transports into your own apps. The pieces are small, they stick to published standards (RFC 9458, 9292, 9180 for the transport; RFC 9576, 9474, 9578 for the anonymous tokens), and they're short enough to read end to end.
+- Fetching HTTP reads through a split-trust path, so neither hop can tie a client's network identity to the content requested.
+- Caching public content without exposing who read it. Placing the commons cache in front of public, sessionless endpoints (listings, feeds, public APIs) collapses many reads into a small number of upstream fetches.
+- A starting point for building operator-blind transports into applications. The components are small and adhere to published standards (RFC 9458, 9292, 9180 for the transport; RFC 9576, 9474, 9578 for the anonymous tokens).
 
-Columbia is a read-path privacy layer, nothing more. It carries public, sessionless reads only. Authenticated and write requests are out of scope by design, not by limitation: your client makes those directly over its own session, so they never touch shared infrastructure at all, which is the more private place for them to run anyway. It is not a VPN, and it never pools or shares credentials.
+Columbia is a read-path privacy layer. It carries public, sessionless reads only. Authenticated and write requests are out of scope by design: the client makes those directly over its own session, so they never touch shared infrastructure. It is not a VPN, and it does not pool or share credentials.
 
 ---
 
@@ -62,12 +62,12 @@ Columbia is a read-path privacy layer, nothing more. It carries public, sessionl
 | [`ohttp-relay/`](./ohttp-relay) | Strips your IP and all headers, forwards opaque ciphertext to the gateway | your IP plus opaque bytes, never content |
 | [`ohttp-gateway/`](./ohttp-gateway) | Decapsulates the request, fetches the allowlisted target, re-encapsulates the response | request content, never your IP |
 | [`commons-cache/`](./commons-cache) | Fetches each public item once and serves all; TTL plus stale-while-revalidate plus single-flight | public content only, no user identity |
-| [`token-issuer/`](./token-issuer) | App Attest gated, blind-signs anonymous unlinkable tokens the relay verifies offline | the device id at issuance, never the spent token or your content |
+| [`token-issuer/`](./token-issuer) | App Attest gated, blind-signs anonymous unlinkable tokens the relay verifies offline | the device id at issuance, never the spent token or the content fetched |
 
 - `ohttp-relay/` is a Node service with no dependencies. It forwards `message/ohttp-req` bodies to the gateway in a fresh request that carries no client headers and no `X-Forwarded-For`. As the public surface it carries the abuse controls described below. Its logs are RED metrics only.
 - `ohttp-gateway/` is a vendored copy of Cloudflare's [`privacy-gateway-server-go`](https://github.com/cloudflare/privacy-gateway-server-go) (BSD-3, the RFC 9458 reference gateway). The source is unmodified apart from two small env-gated access controls; everything else it does is configured at runtime through environment variables. Provenance and the required attribution live in [`ohttp-gateway/VENDORED.md`](./ohttp-gateway/VENDORED.md).
 - `commons-cache/` is another dependency-free Node service, an optional cache origin for public, sessionless content. It serves `X-Cache: HIT|MISS|STALE` with CDN-ready `Cache-Control` and `Age` headers.
-- `token-issuer/` is its own service. It runs Apple App Attest verification and blind-signs ([RFC 9474](https://www.rfc-editor.org/rfc/rfc9474)) anonymous tokens so the relay can require a genuine, rate-limited client without a login. It is the one component that learns a device identity, and the blinding makes that knowledge useless: it never sees the finished tokens or the content they are spent on. Verifying a spent token at the relay is offline against the issuer's published epoch public key. See [`token-issuer/PROTOCOL.md`](./token-issuer/PROTOCOL.md) for the wire format and [`token-issuer/README.md`](./token-issuer).
+- `token-issuer/` is its own service. It runs Apple App Attest verification and blind-signs ([RFC 9474](https://www.rfc-editor.org/rfc/rfc9474)) anonymous tokens so the relay can require a genuine, rate-limited client without a login. It is the one component that learns a device identity; blinding prevents that identity from being linked to any finished token or to the content it is spent on. Verifying a spent token at the relay is offline against the issuer's published epoch public key. See [`token-issuer/PROTOCOL.md`](./token-issuer/PROTOCOL.md) for the wire format and [`token-issuer/README.md`](./token-issuer).
 
 ---
 
@@ -88,7 +88,7 @@ A CDN or WAF (for example a managed front door) can sit in front of the public r
 
 ## Quickstart
 
-You'll need [Docker](https://docs.docker.com/get-docker/) and OpenSSL. The fastest way to see the whole path on one machine:
+Prerequisites: [Docker](https://docs.docker.com/get-docker/) and OpenSSL. To run the full path on one machine:
 
 ```sh
 # 1. Generate the gateway's HPKE seed (32-byte hex). Keep this secret.
@@ -118,7 +118,7 @@ docker build -t columbia-commons .
 docker run -d --name commons -p 8082:8080 -e PORT=8080 columbia-commons
 ```
 
-> For the real walkthrough (a shared Docker network, generating and pinning the gateway key config, configuring the cache, and running the relay and gateway as separate operators so non-collusion actually holds) read [SELFHOSTING.md](./SELFHOSTING.md).
+> For the full walkthrough (a shared Docker network, generating and pinning the gateway key config, configuring the cache, and running the relay and gateway as separate operators so non-collusion holds), see [SELFHOSTING.md](./SELFHOSTING.md).
 
 An OHTTP client (any RFC 9458 library, for example one built on Apple CryptoKit or [`ohttp`](https://github.com/cloudflare/privacy-gateway-server-go)) seals a request against the gateway's published key config and POSTs the `message/ohttp-req` body to the relay. The relay hands back the encapsulated `message/ohttp-res`, which the client opens locally. The gateway publishes two key configs: a primary draft post-quantum suite (KEM `0x30`, `X25519+Kyber768-draft00`) and a legacy classical suite (KEM `0x20`, `DHKEM(X25519, HKDF-SHA256)`). A classical-only RFC 9458 client must select the legacy config; the primary config is a draft, non-RFC suite that not every client supports.
 
@@ -126,21 +126,21 @@ An OHTTP client (any RFC 9458 library, for example one built on Apple CryptoKit 
 
 ## Logging
 
-The whole thing falls apart if the logs record what the crypto hides, so the rule is RED metrics only (rate, errors, duration) and nothing else.
+The privacy property depends on logs not recording what the crypto hides, so the rule is RED metrics only (rate, errors, duration).
 
 - Each service writes structured JSON to stdout: `{ts, route, status, durationMs[, cache]}`. The `route` is always a template (`/relay`, `/v1/commons`), never a path that contains a target, a query value, or a body. Cardinality stays bounded because there's nothing high-cardinality to write.
 - The gateway logs operational events only, and with `LOG_SECRETS=false` the HPKE seed never reaches stdout.
-- You still get everything you need to run the thing: throughput, error rate, latency, cache hit-rate, per-component health. What you can't get, because it's never written down, is a user's reading history.
+- Operators get what they need to run the system: throughput, error rate, latency, cache hit-rate, per-component health. A user's reading history is not available because it is never written.
 
 ---
 
 ## Transparency
 
-The idea is that you verify the privacy property rather than take it on faith.
+The privacy property is designed to be verified rather than taken on trust.
 
-- It holds by construction, not by policy. The relay can't log content because it only ever holds ciphertext. The gateway can't log your IP because it never receives it.
-- Pin the gateway key. A client can pin the SHA-256 of the gateway's published HPKE key config and refuse to seal to anything else, which makes a swapped key obvious. Pinning only catches a key that CHANGES after first use; it does not catch a gateway that targets you with a unique key from the very first request (trust-on-first-use). Closing that gap means cross-checking that everyone sees the same key (RFC 9540 key consistency or a transparency log), which is not yet built.
-- Attestation is optional and more involved. Run the gateway in a confidential VM (AMD SEV-SNP) and have clients check a hardware attestation (DCAP or Microsoft Azure Attestation) before they seal. Then the channel is trusted only when the gateway is provably running the published, audited code, and the operator can't pull decrypted content or the HPKE key out of memory. Details are in [ARCHITECTURE.md](./ARCHITECTURE.md) and [ROADMAP.md](./ROADMAP.md).
+- It holds by construction, not by policy. The relay cannot log content because it only ever holds ciphertext. The gateway cannot log the client IP because it never receives it.
+- Pin the gateway key. A client can pin the SHA-256 of the gateway's published HPKE key config and refuse to seal to anything else, which makes a swapped key evident. Pinning only catches a key that CHANGES after first use; it does not catch a gateway that targets a client with a unique key from the first request (trust-on-first-use). Closing that gap requires cross-checking that all clients see the same key (RFC 9540 key consistency or a transparency log), which is not yet built.
+- Attestation is optional and more involved. Run the gateway in a confidential VM (AMD SEV-SNP) and have clients check a hardware attestation (DCAP or Microsoft Azure Attestation) before they seal. The channel is then trusted only when the gateway is provably running the published, audited code, and the operator cannot extract decrypted content or the HPKE key from memory. Details are in [ARCHITECTURE.md](./ARCHITECTURE.md) and [ROADMAP.md](./ROADMAP.md).
 
 ---
 
