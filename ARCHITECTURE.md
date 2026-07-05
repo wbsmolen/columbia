@@ -1,6 +1,6 @@
 # Architecture: Columbia
 
-An operator-blind HTTP proxy. You fetch public content through it without the person running the servers being able to link who you are to what you fetched. The privacy comes from what each party is structurally unable to see, not from a policy that promises not to look.
+An operator-blind HTTP proxy. It fetches public content without the operator being able to link a client's identity to the content fetched. Privacy derives from what each party is structurally unable to observe, not from a policy commitment.
 
 ## The path
 
@@ -54,7 +54,7 @@ A CDN or WAF can sit in front of the public relay and issuer to absorb DDoS and 
 
 ## Anonymous client tokens
 
-`token` mode answers a question the network controls cannot: let only a genuine, rate-limited client use the relay, without that gate becoming a way to identify the client. The token issuer is a separate service that plays the Attester and Issuer roles of the Privacy Pass architecture ([RFC 9576](https://www.rfc-editor.org/rfc/rfc9576)).
+`token` mode addresses a requirement the network controls cannot: allowing only a genuine, rate-limited client to use the relay without that gate identifying the client. The token issuer is a separate service that plays the Attester and Issuer roles of the Privacy Pass architecture ([RFC 9576](https://www.rfc-editor.org/rfc/rfc9576)).
 
 - The device proves it is genuine Apple hardware running an unmodified install with App Attest. The issuer is the one component allowed to see the device identity at issuance time.
 - The device blinds its token inputs locally and sends only the blinded messages. The issuer blind-signs each with the current epoch RSA private key ([RFC 9474](https://www.rfc-editor.org/rfc/rfc9474), `RSABSSA-SHA384-PSS`, the Apple Private Access Token construction from [RFC 9578](https://www.rfc-editor.org/rfc/rfc9578)) and returns blind signatures. It never unblinds, so it never sees a finished token.
@@ -67,11 +67,11 @@ The exact wire format, the App Attest binding, and the epoch model are in [`toke
 
 ## Trust and threat model
 
-The design keeps identity and content with two separate parties, so neither one can reconstruct your reading history.
+The design keeps identity and content with two separate parties, so neither one can reconstruct a client's reading history.
 
 | Party | Client IP? | Request content? | Notes |
 |---|---|---|---|
-| Client (you) | n/a | yes | holds the only key that can open the response |
+| Client | n/a | yes | holds the only key that can open the response |
 | Relay | yes | no | only ever holds `message/ohttp-req` ciphertext, can't decrypt |
 | Gateway | no | yes | the relay sends a fresh request with no client IP or headers; the gateway holds the HPKE seed |
 | Commons cache | no | public content only | sits behind the gateway, serves identical public content to everyone |
@@ -82,23 +82,23 @@ No single party ever holds identity and content at the same time. The relay has 
 
 ### Non-collusion
 
-This only holds if the relay and the gateway are run by different operators who don't collude. If one operator controls both, they can line up the IP they saw at the relay against the content they decrypted at the gateway, and the property is gone. Two ways to run it:
+This only holds if the relay and the gateway are run by different operators who do not collude. If one operator controls both, that operator can line up the IP seen at the relay against the content decrypted at the gateway, and the property no longer holds. Two ways to run it:
 
-- Single operator, for testing or convenience. Running both yourself proves the data path works end to end, but it gives you no protection against yourself. Use it to develop, or when you trust the single operator completely (it's you, and all you care about is hiding from upstream).
-- Two operators, for the real guarantee. Run the relay at one operator and the gateway at another. Ideally different organizations or providers, ideally not both you. Now identity and content sit in genuinely separate trust domains, and breaking the property takes both of them misbehaving together. [SELFHOSTING.md](./SELFHOSTING.md) covers how to split them.
+- Single operator, for testing or convenience. Running both under one operator verifies the data path end to end but provides no protection against that operator. Appropriate for development, or when the single operator is fully trusted and the only goal is hiding reads from upstream.
+- Two operators, for the full guarantee. Run the relay at one operator and the gateway at another, ideally different organizations or providers, and ideally not both operated by the client. Identity and content then sit in genuinely separate trust domains, and breaking the property requires both operators to misbehave together. [SELFHOSTING.md](./SELFHOSTING.md) covers how to split them.
 
 ### Residual risks
 
-Worth being straight about what this doesn't solve:
+Limitations this design does not address:
 
 - Per-user key targeting. A malicious gateway could hand one client a unique HPKE key to single them out. Pinning the key config fingerprint catches a change; checking that everyone sees the same key (RFC 9540 key consistency, or a transparency log) catches divergence. See [ROADMAP.md](./ROADMAP.md).
 - Gateway memory. Without confidential compute, the gateway operator could in principle read decrypted content or the HPKE key out of process memory. Attestation and key release (below) close that.
 - Traffic analysis. Correlating timing and size across the two hops is out of scope here. OHTTP stops the operators from linking you; it does nothing about a global passive adversary watching both networks at once.
-- Authenticated and write traffic is out of scope by design, not a gap. Columbia carries public, sessionless reads only; your client makes any request tied to your identity (including writes) directly over its own session, so it never passes through a shared gateway. Routing authenticated traffic through the gateway would put an identity-bound request in front of the operator and defeat the whole model, so keeping it on your own session is the deliberate choice.
+- Authenticated and write traffic is out of scope by design. Columbia carries public, sessionless reads only; the client makes any request tied to its identity (including writes) directly over its own session, so it never passes through a shared gateway. Routing authenticated traffic through the gateway would place an identity-bound request in front of the operator and defeat the model, so it is kept on the client's own session.
 
 ## Attestation chain (optional, advanced)
 
-To get rid of the "gateway operator could read memory" risk, and to turn key pinning into real verification, run the gateway in a confidential VM and have the client check a hardware attestation before it trusts the channel:
+To remove the "gateway operator could read memory" risk, and to turn key pinning into verification, run the gateway in a confidential VM and have the client check a hardware attestation before it trusts the channel:
 
 1. Confidential VM. Run the gateway in an AMD SEV-SNP confidential VM (or equivalent) so the host and operator can't read gateway memory.
 2. Attestation. The platform produces a signed attestation, either a DCAP quote or a Microsoft Azure Attestation (MAA) JWT, carrying the VM's launch measurement (the hash of the code and config that booted).
@@ -117,11 +117,11 @@ The rule is RED metrics only (rate, errors, duration). Never an IP, a user id, a
 
 - The relay and cache write structured JSON to stdout: `{ts, route, status, durationMs[, cache]}`. `route` is a template (`/relay`, `/v1/commons`), never a path with values in it. The relay logs `{"route":"/relay","status":200,"durationMs":212}`, which proves a request happened, not who made it or what it fetched.
 - The gateway logs operational events only, and `LOG_SECRETS=false` keeps the HPKE seed out of stdout.
-- This is enough to run the system on. You get throughput, error rate, latency, cache hit-rate, and per-component health, everything you need to operate and alert, while there is structurally no way to log a reading history. The privacy comes from what is never written, not from trusting a redactor to scrub it after the fact.
+- This is sufficient to operate the system: throughput, error rate, latency, cache hit-rate, and per-component health, while there is structurally no way to log a reading history. Privacy derives from what is never written, not from a redactor scrubbing logs after the fact.
 
 ## Scalability
 
 - The per-request path is stateless. The relay and gateway hold no per-user state, and HPKE is per-request, so they scale out horizontally with no coordination.
 - The cache is what multiplies throughput. Public reads are identical for everyone, so the commons cache turns N clients times M reads into M upstream fetches (TTL, stale-while-revalidate, single-flight). Upstream-facing volume stays flat as usage grows.
 - It's CDN-frontable. The cache emits `Cache-Control` and `Age` headers, so a CDN out front edge-caches public content and the cache tier only sees origin-shield traffic. Identical public content means there's no per-user signal to leak.
-- Confidential gateways (SEV-SNP CVM plus attestation) are the one tier that usually can't scale to zero. Size that capacity on purpose.
+- Confidential gateways (SEV-SNP CVM plus attestation) are the one tier that usually cannot scale to zero. Size that capacity accordingly.

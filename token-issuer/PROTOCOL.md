@@ -175,8 +175,8 @@ the next call.
 
 ## The binding hash (clientDataHash), byte for byte
 
-This is the heart of the contract and the thing the device's App Attest assertion
-signs. Get one byte wrong and every issuance fails.
+This is what the device's App Attest assertion signs. A single wrong byte fails
+every issuance.
 
 The issuer computes, in `expectedClientDataHash(epoch, blinded)`:
 
