@@ -104,8 +104,6 @@ func protobufHandler(binaryRequest []byte) ([]byte, error) {
 }
 ```
 
-That's it!
-
 ## Local development
 
 To deploy the server locally, first acquire a TLS certificate using [mkcert](https://github.com/FiloSottile/mkcert) as follows:

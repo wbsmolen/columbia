@@ -34,21 +34,21 @@ Two deviations from upstream: (1) the GCP App Engine example manifests (`gateway
 
 ## Added: relay auth + endpoint guard (`main.go`)
 
-Two surgical, env-gated additions to `main.go`; nothing else in the Go source changes:
+Two env-gated additions to `main.go`; nothing else in the Go source changes:
 
 - **Relay→gateway auth.** A `requireRelaySecret` middleware wraps the main gateway endpoint and rejects any request whose `X-Columbia-Relay-Auth` header doesn't match `RELAY_GATEWAY_SECRET` (constant-time compare), **before** HPKE decapsulation. Empty/unset = check disabled (open), preserving upstream behavior. Set the SAME value on the relay (`RELAY_GATEWAY_SECRET`) and the gateway; set it on the relay first, then the gateway, so there's no window where the gateway 401s all relay traffic.
 - **Endpoint registration guard.** Registration now skips any endpoint whose pattern is the empty string (Go's `http.HandleFunc` panics on `""`). In production set `ECHO_ENDPOINT=""` and `METADATA_ENDPOINT=""` to disable the reflective `/gateway-echo` and `/gateway-metadata` self-test handlers, which echo inbound request headers via `httputil.DumpRequest`. The in-code defaults are unchanged (`/gateway-echo`, `/gateway-metadata`), so the self-test path stays available in dev/staging.
 
 ## Removed: the GCP App Engine manifests
 
-Upstream ships GCP App Engine manifests (`gateway.yaml`, `gateway-protohttp.yaml`, `app.yaml`). The two `*.yaml` env-variable files carried publicly-known 16-byte placeholder seeds in a committed `SEED_SECRET_KEY:` field. A gateway booted with one of those derives a publicly known keypair and offers zero confidentiality, and committing any seed-shaped value to an open tree is the wrong default. They are not used by the supported deploy path (Docker), so they have been removed from this vendored copy.
+Upstream ships GCP App Engine manifests (`gateway.yaml`, `gateway-protohttp.yaml`, `app.yaml`). The two `*.yaml` env-variable files carried publicly-known 16-byte placeholder seeds in a committed `SEED_SECRET_KEY:` field. A gateway booted with one of those derives a publicly known keypair and offers no confidentiality, and committing a seed-shaped value to an open tree is an unsafe default. They are not used by the supported deploy path (Docker), so they are excluded from this vendored copy.
 
 Provide a fresh 32-byte seed at runtime through the environment, never in a file (see [`../SELFHOSTING.md`](../SELFHOSTING.md)). Never commit a seed.
 
 ## Why vendored instead of a submodule
 
-- Self-contained, auditable builds. `docker build` against this directory needs no network and no submodule init; the exact gateway bytes are right here.
-- Reproducibility. It pins the gateway to one reviewed commit, so upstream can't shift under us.
+- Self-contained, auditable builds. `docker build` against this directory needs no network and no submodule init; the exact gateway bytes are present.
+- Reproducibility. It pins the gateway to one reviewed commit, so upstream cannot shift underneath.
 - Transparency goal. The long-term aim (see [`../ROADMAP.md`](../ROADMAP.md)) is reproducible builds plus a public transparency log of attested measurements, which needs the precise source present and pinned.
 
 ## Updating the vendored copy

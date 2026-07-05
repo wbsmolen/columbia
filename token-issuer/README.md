@@ -1,27 +1,26 @@
 # token-issuer
 
-The token issuer is how Columbia answers a hard question: how do you let only a
-genuine, attested client use the relay, rate limit even your own users, and still
-never be able to link a user to the content they fetch?
+The token issuer gates relay access to genuine, attested clients, supports rate
+limiting, and preserves unlinkability between a user and the content they fetch.
 
-The issuer ships as a reference token-issuance gate for an iOS client using Apple
-App Attest. App Attest is inherently an Apple/iOS mechanism; on other platforms the
-attestation step is swapped for the equivalent device-integrity primitive and the
-rest of the Privacy Pass flow is unchanged.
+It is a reference token-issuance gate for a client using Apple App Attest. App
+Attest is an Apple/iOS mechanism; on other platforms the attestation step is
+replaced by the equivalent device-integrity primitive and the rest of the Privacy
+Pass flow is unchanged.
 
-The answer is the Privacy Pass pattern (the same one Apple's Private Access Tokens
-use). This service plays the **Attester** and **Issuer** roles of the Privacy Pass
-architecture ([RFC 9576](https://www.rfc-editor.org/rfc/rfc9576)). It is the one
-component in the system that is allowed to learn a device's identity, and the whole
-design makes that knowledge worthless: it only ever sees *blinded* token requests,
-it blind-signs them ([RFC 9474](https://www.rfc-editor.org/rfc/rfc9474) blind RSA),
-and it hands back blind signatures. It never sees the finished tokens, and it never
-sees the content those tokens are later spent on.
+The design uses the Privacy Pass pattern (as used by Apple's Private Access
+Tokens). This service plays the **Attester** and **Issuer** roles of the Privacy
+Pass architecture ([RFC 9576](https://www.rfc-editor.org/rfc/rfc9576)). It is the
+one component allowed to learn a device's identity; the design renders that
+knowledge unusable: it only ever sees *blinded* token requests, blind-signs them
+([RFC 9474](https://www.rfc-editor.org/rfc/rfc9474) blind RSA), and returns blind
+signatures. It never sees the finished tokens, and never sees the content those
+tokens are later spent on.
 
 The relay, run by a different operator, checks the tokens and sees content and IP
-but never the device id. So no single party ever holds identity and content
-together. That is the same operator-blind property the relay and gateway give you,
-extended to "prove you're a real, rate-limited client" without a login.
+but never the device id, so no single party holds identity and content together.
+This extends the operator-blind property of the relay and gateway to proving a
+genuine, rate-limited client without a login.
 
 ## How a token flows
 
@@ -173,8 +172,7 @@ half lives in the iOS client.
 
 ## What is production ready vs what still needs work
 
-Being honest about this matters, because the security of the whole pattern rests on
-these pieces.
+The security of the whole pattern rests on these pieces.
 
 **Production ready:**
 
@@ -338,8 +336,7 @@ a synthetic chain, pending one real-device confirmation."
 ## Dependencies
 
 Unlike the dependency-free relay and commons cache, this service uses npm packages,
-because doing blind RSA by hand is exactly the kind of custom crypto you should not
-write:
+because hand-rolling blind RSA is exactly the kind of custom cryptography to avoid:
 
 - `@cloudflare/blindrsa-ts` (RFC 9474 blind RSA, the Apple PAT construction). Its
   only transitive dependency is `sjcl` (the Stanford JS Crypto Library) for the
