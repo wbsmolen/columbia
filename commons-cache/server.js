@@ -36,6 +36,25 @@ const UPSTREAM_UA = process.env.UPSTREAM_UA ||
 const MAX_ENTRIES = parseInt(process.env.COMMONS_MAX_ENTRIES || '5000', 10);     // cache bound (LRU)
 const MAX_BODY_BYTES = parseInt(process.env.COMMONS_MAX_BODY_BYTES || '5000000', 10); // reject oversized bodies
 
+// When true, on a cache MISS (or background revalidation) forward the INCOMING
+// request's Authorization header to the upstream fetch, so this cache can front
+// an upstream that requires an app-level credential to serve its PUBLIC listings.
+//
+// ================================ SAFETY INVARIANT ================================
+// The cache key is (id, sort) ONLY - the Authorization header is NEVER part of the
+// key. That is correct precisely BECAUSE the upstream path is restricted to the
+// structured, PUBLIC, token-agnostic listing template ({id}/{sort}) - the same
+// public bytes for every caller regardless of which credential fetched them. So one
+// fetch is shared across all callers, and a HIT serves those shared public bytes
+// WITHOUT any upstream fetch and WITHOUT requiring the caller to present a credential.
+//
+// This is safe ONLY while the path template stays a public listing. If you EVER
+// widen UPSTREAM_PATH_TEMPLATE to an arbitrary or per-user/private path, this
+// becomes a cross-user data-leak: caller A's private response would be cached under
+// (id, sort) and served to caller B. Never point this at anything but public listings.
+// =================================================================================
+const FORWARD_UPSTREAM_AUTH = /^(1|true|yes|on)$/i.test(process.env.FORWARD_UPSTREAM_AUTH || '');
+
 // A sort/view is any short lowercase token. This validates input (prevents path
 // injection); it deliberately fixes no vocabulary - your upstream defines it.
 const SORT_RE = /^[a-z]+$/;
@@ -74,8 +93,9 @@ function safeContentType(raw) {
 }
 
 // Guard against the operator repointing UPSTREAM_BASE at an internal/private
-// surface, turning this cache into an SSRF relay. Validate once at startup.
-(function validateUpstreamBase() {
+// surface, turning this cache into an SSRF relay. Called once at startup (below,
+// only when run directly - not when required in-process by the test harness).
+function validateUpstreamBase() {
   let parsed;
   try {
     parsed = new URL(UPSTREAM_BASE);
@@ -97,21 +117,26 @@ function safeContentType(raw) {
     log({ event: 'fatal', reason: 'upstream_base_invalid' });
     process.exit(1);
   }
-})();
+}
 
-function upstreamHeaders() {
-  return {
+function upstreamHeaders(authHeader) {
+  const headers = {
     'User-Agent': UPSTREAM_UA,
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
   };
+  // Forward the caller's credential only when explicitly enabled. Used solely to
+  // fetch PUBLIC listings on a MISS - see the SAFETY INVARIANT above (the cache key
+  // never includes this header, so the fetched bytes are shared across all callers).
+  if (FORWARD_UPSTREAM_AUTH && authHeader) headers['Authorization'] = authHeader;
+  return headers;
 }
 
-async function fetchUpstream(url) {
+async function fetchUpstream(url, authHeader) {
   const started = Date.now();
   try {
     const res = await fetch(url, {
-      headers: upstreamHeaders(),
+      headers: upstreamHeaders(authHeader),
       redirect: 'manual',                 // never follow - a 3xx could point at an internal host (SSRF)
       signal: AbortSignal.timeout(10000), // bound slow/hung upstreams
     });
@@ -142,8 +167,12 @@ function upstreamUrl(id, sort) {
   return `${UPSTREAM_BASE}${path.startsWith('/') ? '' : '/'}${path}`;
 }
 
-// Cache with stale-while-revalidate semantics.
-async function getCachedFeed(id, sort) {
+// Cache with stale-while-revalidate semantics. authHeader is the caller's
+// credential to forward on a fetch (MISS or background revalidation) when
+// FORWARD_UPSTREAM_AUTH is enabled; it is NEVER part of the cache key. A HIT below
+// returns before any fetch, so a cached (shared, public) response is served without
+// touching the upstream and without requiring the caller to present a credential.
+async function getCachedFeed(id, sort, authHeader) {
   const key = `${id}/${sort}`;
   const url = upstreamUrl(id, sort);
   const now = Date.now();
@@ -156,10 +185,10 @@ async function getCachedFeed(id, sort) {
       // Serve stale immediately; refresh in the background (single-flight).
       if (!entry.revalidating) {
         entry.revalidating = true;
-        fetchUpstream(url)
+        fetchUpstream(url, authHeader)
           .then((up) => {
             if (up.status === 200 && !up.error) {
-              cacheSet(key, { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), revalidating: false });
+              cacheSet(key, { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), upstreamStatus: up.status, revalidating: false });
             }
           })
           .catch(() => {})
@@ -170,9 +199,9 @@ async function getCachedFeed(id, sort) {
   }
 
   // Cold or rotten - fetch synchronously.
-  const up = await fetchUpstream(url);
+  const up = await fetchUpstream(url, authHeader);
   if (up.status === 200 && !up.error) {
-    const fresh = { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), revalidating: false };
+    const fresh = { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), upstreamStatus: up.status, revalidating: false };
     cacheSet(key, fresh);
     return { ...fresh, cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms };
   }
@@ -217,7 +246,10 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'require ?id=<feed-id>&sort=<sort>' }));
       } else {
-        const out = await getCachedFeed(id, sort);
+        // Forward the caller's credential only on a fetch (MISS/revalidate) and only
+        // when enabled; a HIT never reaches the upstream so it needs no credential.
+        const authHeader = FORWARD_UPSTREAM_AUTH ? (req.headers['authorization'] || undefined) : undefined;
+        const out = await getCachedFeed(id, sort, authHeader);
         cacheState = out.cacheState;
         if (out.upstreamError) {
           // Fixed 502 - never leak upstream status, body, or error text.
@@ -237,6 +269,9 @@ const server = http.createServer(async (req, res) => {
           res.writeHead(status, {
             'Content-Type': safeContentType(out.contentType),
             'X-Cache': cacheState,
+            // Upstream status behind the cached bytes. Only 200s are ever cached, so
+            // this is 200 on HIT/STALE/MISS; the client reads it for transparency.
+            'X-Upstream-Status': String(out.upstreamStatus || 200),
             'X-Content-Type-Options': 'nosniff',
             'Cache-Control': `public, max-age=${Math.floor(TTL_MS / 1000)}, stale-while-revalidate=${Math.floor(SWR_MS / 1000)}`,
             'Age': String(ageS),
@@ -259,4 +294,13 @@ const server = http.createServer(async (req, res) => {
   log({ route, method: req.method, status, cache: cacheState, durationMs: Date.now() - started });
 });
 
-server.listen(PORT, () => log({ event: 'listen', port: PORT, ttlMs: TTL_MS, swrMs: SWR_MS }));
+// Production runs `node server.js` directly, so require.main === module: the SSRF
+// guard runs and the server binds. Under `require`/`import` (the in-process test
+// harness) neither fires, letting the test point the fetch/cache path at a local
+// mock upstream without tripping the loopback SSRF guard or double-binding a port.
+if (require.main === module) {
+  validateUpstreamBase();
+  server.listen(PORT, () => log({ event: 'listen', port: PORT, ttlMs: TTL_MS, swrMs: SWR_MS }));
+}
+
+module.exports = { server, getCachedFeed, fetchUpstream, upstreamUrl, cache, validateUpstreamBase };
