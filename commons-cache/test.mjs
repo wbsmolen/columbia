@@ -23,13 +23,18 @@ let lastAuth;
 const mock = http.createServer((req, res) => {
   upstreamHits++;
   lastAuth = req.headers['authorization'];
-  if (req.url.includes('rsssub')) {
-    res.writeHead(200, { 'Content-Type': 'application/rss+xml' });
-    res.end(RSS_PAYLOAD);
-  } else {
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON_PAYLOAD);
-  }
+  const respond = () => {
+    if (req.url.includes('rsssub')) {
+      res.writeHead(200, { 'Content-Type': 'application/rss+xml' });
+      res.end(RSS_PAYLOAD);
+    } else {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON_PAYLOAD);
+    }
+  };
+  // 'slowsub' responds after a delay so concurrent requests overlap the in-flight
+  // fetch — exercises cold-miss single-flight (test f).
+  if (req.url.includes('slowsub')) setTimeout(respond, 100); else respond();
 });
 await new Promise((r) => mock.listen(0, '127.0.0.1', r));
 const mockPort = mock.address().port;
@@ -90,7 +95,17 @@ try {
   assert.match(r.ctype, /^application\/rss\+xml/, 'e: RSS content-type');
   assert.equal(r.body, RSS_PAYLOAD, 'e: RSS body byte-for-byte');
 
-  console.log('PASS: all commons-cache self-tests passed (a-e)');
+  // (f) COLD-MISS SINGLE-FLIGHT: N concurrent requests for one cold key coalesce
+  // to ONE upstream fetch — thundering-herd protection for the shared credential.
+  const before = upstreamHits;
+  const results = await Promise.all(Array.from({ length: 12 }, () =>
+    get('/v1/commons?id=slowsub&sort=hot', { Authorization: 'Bearer AAA' })));
+  assert.equal(upstreamHits - before, 1, 'f: 12 concurrent cold reads = ONE upstream fetch (single-flight)');
+  assert.ok(results.every((x) => x.status === 200 && x.body === JSON_PAYLOAD), 'f: every coalesced request still gets the body');
+  assert.equal(results.filter((x) => x.xcache === 'MISS').length, 1, 'f: exactly one MISS (the leader)');
+  assert.equal(results.filter((x) => x.xcache === 'COALESCED').length, 11, 'f: the other 11 COALESCED onto it');
+
+  console.log('PASS: all commons-cache self-tests passed (a-f)');
 } catch (err) {
   failed = true;
   console.error('FAIL:', err.message);

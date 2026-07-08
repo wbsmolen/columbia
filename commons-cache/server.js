@@ -167,6 +167,11 @@ function upstreamUrl(id, sort) {
   return `${UPSTREAM_BASE}${path.startsWith('/') ? '' : '/'}${path}`;
 }
 
+// Cold-miss single-flight: concurrent requests for the same un-cached key share
+// ONE upstream fetch instead of each hitting the upstream — thundering-herd
+// protection for a shared, rate-limited upstream credential. Keyed by `id/sort`.
+const inflight = new Map();
+
 // Cache with stale-while-revalidate semantics. authHeader is the caller's
 // credential to forward on a fetch (MISS or background revalidation) when
 // FORWARD_UPSTREAM_AUTH is enabled; it is NEVER part of the cache key. A HIT below
@@ -198,12 +203,23 @@ async function getCachedFeed(id, sort, authHeader) {
     }
   }
 
-  // Cold or rotten - fetch synchronously.
-  const up = await fetchUpstream(url, authHeader);
+  // Cold or rotten - fetch with SINGLE-FLIGHT. The first request for this key (the
+  // leader) performs the upstream fetch; concurrent requests (followers) await the
+  // SAME promise instead of each hitting the upstream. Collapses a stampede on one
+  // key to ONE upstream request, protecting the shared credential budget.
+  let promise = inflight.get(key);
+  const isLeader = !promise;
+  if (isLeader) {
+    promise = fetchUpstream(url, authHeader).finally(() => inflight.delete(key));
+    inflight.set(key, promise);
+  }
+  const up = await promise;
   if (up.status === 200 && !up.error) {
-    const fresh = { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), upstreamStatus: up.status, revalidating: false };
-    cacheSet(key, fresh);
-    return { ...fresh, cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms };
+    if (isLeader) {
+      cacheSet(key, { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), upstreamStatus: up.status, revalidating: false });
+    }
+    // Leader logs MISS (it fetched); followers coalesced onto its single fetch.
+    return { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), upstreamStatus: up.status, cacheState: isLeader ? 'MISS' : 'COALESCED', upstreamMs: up.ms };
   }
   // Upstream failed - fixed error result, no upstream body/status leaked downstream.
   return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true };
