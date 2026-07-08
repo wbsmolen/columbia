@@ -42,16 +42,22 @@ const MAX_BODY_BYTES = parseInt(process.env.COMMONS_MAX_BODY_BYTES || '5000000',
 //
 // ================================ SAFETY INVARIANT ================================
 // The cache key is (id, sort) ONLY - the Authorization header is NEVER part of the
-// key. That is correct precisely BECAUSE the upstream path is restricted to the
-// structured, PUBLIC, token-agnostic listing template ({id}/{sort}) - the same
-// public bytes for every caller regardless of which credential fetched them. So one
-// fetch is shared across all callers, and a HIT serves those shared public bytes
-// WITHOUT any upstream fetch and WITHOUT requiring the caller to present a credential.
+// key. One upstream fetch is shared across all callers; a HIT serves those shared
+// bytes with no upstream fetch and no credential. This is safe ONLY under BOTH of:
 //
-// This is safe ONLY while the path template stays a public listing. If you EVER
-// widen UPSTREAM_PATH_TEMPLATE to an arbitrary or per-user/private path, this
-// becomes a cross-user data-leak: caller A's private response would be cached under
-// (id, sort) and served to caller B. Never point this at anything but public listings.
+//   1) UPSTREAM_PATH_TEMPLATE stays a structured PUBLIC listing ({id}/{sort}) -
+//      never an arbitrary or per-user/private path, or caller A's private response
+//      gets cached under (id,sort) and served to caller B.
+//
+//   2) With FORWARD_UPSTREAM_AUTH on, the forwarded credential MUST be an ANONYMOUS
+//      / app-level one. NOTE: an authenticated JSON listing API (e.g. an OAuth
+//      listing) embeds per-USER fields keyed to the fetching bearer (vote state,
+//      saved, hidden). Those are shareable ONLY because an anonymous credential has
+//      no such state (they come back null/false, identical for every anon caller).
+//      If a PER-USER token were ever forwarded, its vote/saved state would be cached
+//      under (id,sort) and leaked cross-user. The client MUST only ever forward an
+//      anonymous credential here (Lander seals only its app-only token). Do NOT
+//      relax that, and do NOT forward a user token even to a "public" listing.
 // =================================================================================
 const FORWARD_UPSTREAM_AUTH = /^(1|true|yes|on)$/i.test(process.env.FORWARD_UPSTREAM_AUTH || '');
 
