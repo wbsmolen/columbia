@@ -65,8 +65,9 @@ const MAX_BODY_BYTES = parseInt(process.env.COMMONS_MAX_BODY_BYTES || '5000000',
 //      no such state (they come back null/false, identical for every anon caller).
 //      If a PER-USER token were ever forwarded, its vote/saved state would be cached
 //      under (id,sort) and leaked cross-user. The client MUST only ever forward an
-//      anonymous credential here (Lander seals only its app-only token). Do NOT
-//      relax that, and do NOT forward a user token even to a "public" listing.
+//      anonymous credential here (the client seals only its app-only, anonymous
+//      token). Do NOT relax that, and do NOT forward a user token even to a
+//      "public" listing.
 // =================================================================================
 const FORWARD_UPSTREAM_AUTH = /^(1|true|yes|on)$/i.test(process.env.FORWARD_UPSTREAM_AUTH || '');
 
