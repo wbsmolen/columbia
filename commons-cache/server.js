@@ -22,6 +22,15 @@
 //                     ?id=<feed-id>&sort=<sort>
 
 const http = require('http');
+const crypto = require('crypto');
+
+// Front door origin lock (mirrors the relay). When REQUIRE_FDID is set, a request
+// is accepted only if it arrives through a front door (a CDN/WAF, e.g. Azure Front
+// Door) that injects the X-Azure-FDID header carrying the front door's profile id.
+// This pins the public origin so the cache can't be driven directly (which would
+// burn the upstream credential budget). Inert until an operator sets REQUIRE_FDID.
+// The value is NEVER logged.
+const REQUIRE_FDID = process.env.REQUIRE_FDID || '';
 
 const PORT = parseInt(process.env.PORT || '8080', 10); // non-root can't bind <1024
 const TTL_MS = parseInt(process.env.COMMONS_TTL_MS || '60000', 10);        // fresh window
@@ -244,11 +253,46 @@ async function handleProbe() {
   return results;
 }
 
+// Constant-time string compare (hash both, then timingSafeEqual) so the FDID
+// check can't be probed by timing.
+function timingSafeEqualStr(presented, expected) {
+  if (typeof presented !== 'string' || presented.length === 0) return false;
+  const ha = crypto.createHash('sha256').update(presented).digest();
+  const hb = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+// True if the request may proceed: lock disabled, or a matching X-Azure-FDID is
+// present (a repeated header is comma-joined by Node; accept if ANY token matches).
+function frontDoorAllowed(req) {
+  if (!REQUIRE_FDID) return true;
+  const raw = req.headers['x-azure-fdid'];
+  if (typeof raw !== 'string' || raw.length === 0) return false;
+  for (const tok of raw.split(',')) {
+    if (timingSafeEqualStr(tok.trim(), REQUIRE_FDID)) return true;
+  }
+  return false;
+}
+
+// Only the platform health probe is exempt (it hits /health in-environment with
+// no front door in that hop). /v1/commons + /v1/probe require the FDID.
+function fdidExempt(req, path) {
+  return req.method === 'GET' && path === '/health';
+}
+
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
   const u = new URL(req.url, `http://localhost`);
   const route = u.pathname;
   let status = 404, cacheState = '-';
+
+  // Front door origin lock: when REQUIRE_FDID is set, every non-exempt request
+  // must arrive through the front door (which injects X-Azure-FDID), else 403.
+  if (REQUIRE_FDID && !fdidExempt(req, route) && !frontDoorAllowed(req)) {
+    res.writeHead(403); res.end();
+    log({ route, status: 403, cacheState: '-', durationMs: Date.now() - started });
+    return;
+  }
 
   try {
     if (route === '/health') {
