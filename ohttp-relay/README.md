@@ -87,6 +87,12 @@ No IP, no content, no headers, no target. `route` is a fixed template.
 | `ISSUER_KEYS_TTL_MS` | `300000` | how often the relay refreshes the cached issuer public keys |
 | `TOKEN_PSS_SALT_LEN` | `48` | RSA-PSS salt length for token verification (SHA-384 digest length) |
 | `REDEMPTION_MAX_KEYS` | `5000000` | spend-once set memory bound (single replica; a shared store is the real fix) |
+| `RATE_LIMIT_RPM` | `120` | per-IP requests per minute; `0` disables per-IP limiting |
+| `MAX_INFLIGHT` | `256` | global cap on concurrent relays; further requests get a 429 |
+| `TRUSTED_CLIENT_IP_HEADER` | _(empty)_ | header a trusted front proxy sets to the real client IP (e.g. `x-azure-clientip`, `cf-connecting-ip`). Set it whenever a request crosses more than one proxy (front proxy + platform ingress), or every client collapses into one rate-limit bucket. Empty keeps single-proxy rightmost-`X-Forwarded-For` behaviour |
+| `RELAY_GATEWAY_SECRET` | (none) | shared secret sent to the gateway as `X-Columbia-Relay-Auth`; set the SAME value on the gateway so it rejects traffic that did not come through the relay |
+| `GATEWAY_CONFIGS_URL` | gateway host + `/ohttp-configs` | where the relay fetches the gateway key config it passes through at `GET /ohttp-configs` |
+| `REQUIRE_FDID` | (none) | front-door origin lock: when set, reject any request that did not arrive through the edge front door (which injects `X-Azure-FDID`). `GET /health` is exempt. Unset disables the check |
 
 ### Token mode (Privacy Pass)
 

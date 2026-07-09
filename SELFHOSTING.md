@@ -62,6 +62,7 @@ docker run -d --name gateway --network columbia -p 8080:8080 \
 | `ALLOWED_TARGET_ORIGINS` | yes | comma-separated allowlist of fetchable origins; everything else is 403 |
 | `LOG_SECRETS` | recommended `false` | keeps the seed from ever being printed |
 | `PORT` | `8080` | listen port (runs as non-root; below 1024 needs privilege) |
+| `GATEWAY_MAX_QPM` | `0` (off) | optional global cap on total outbound fetches per minute across all clients; over-budget requests get a `429` + `Retry-After` instead of a call (see [Shared egress](#shared-egress-one-ip-one-credential-one-budget)) |
 | `RELAY_GATEWAY_SECRET` | (none) | when set, the gateway rejects `/gateway` requests that lack a matching `X-Columbia-Relay-Auth`; set the SAME value as the relay |
 | `ECHO_ENDPOINT` | `/gateway-echo` | set to `""` in production to unregister the reflective echo self-test endpoint |
 | `METADATA_ENDPOINT` | `/gateway-metadata` | set to `""` in production to unregister the reflective metadata self-test endpoint |
@@ -90,9 +91,11 @@ docker build -t columbia-relay .
 
 docker run -d --name relay --network columbia -p 8081:8080 \
   -e PORT=8080 \
-  -e GATEWAY_URL="http://gateway:8080/gateway" \
+  -e GATEWAY_URL="https://gateway:8080/gateway" \
   columbia-relay
 ```
+
+> The relay requires TLS to the gateway: it hard-exits at startup on a non-`https` `GATEWAY_URL`. Give the gateway a certificate (set its `CERT`/`KEY`, or terminate TLS at an ingress in front of it; a managed platform ingress does this for you). For single-host local testing against a self-signed gateway cert, set `NODE_TLS_REJECT_UNAUTHORIZED=0` on the relay to accept it. Local testing only, never in production.
 
 | Env var | Required | Purpose |
 |---|---|---|
@@ -122,7 +125,7 @@ docker run -d --name relay --network columbia -p 8081:8080 \
 
 ## 5. (Optional) Build and run the commons cache
 
-The cache is an example upstream target for the gateway. It fetches a public, sessionless URL once and serves it to many clients, with TTL, stale-while-revalidate, and single-flight. It is generic: point it at any public content by setting `UPSTREAM_BASE` and `UPSTREAM_PATH_TEMPLATE`, with no code edit. It must be listed in the gateway's `ALLOWED_TARGET_ORIGINS`.
+The commons cache is one kind of upstream target: the right one for public, sessionless content that many clients read identically. It is not required: the gateway can target any allowlisted origin, including a direct API (see [Routing an authenticated public API](#routing-an-authenticated-public-api)), and you can run the path with no cache at all. When you do use it, the cache fetches a public URL once and serves it to many clients, with TTL, stale-while-revalidate, and single-flight. It is generic: point it at any public content by setting `UPSTREAM_BASE` and `UPSTREAM_PATH_TEMPLATE`, with no code edit. It must be listed in the gateway's `ALLOWED_TARGET_ORIGINS`.
 
 ```sh
 cd ../commons-cache
@@ -148,8 +151,12 @@ docker run -d --name commons --network columbia -p 8082:8080 \
 | `UPSTREAM_UA` | a generic UA string | `User-Agent` sent to the upstream origin |
 | `COMMONS_MAX_ENTRIES` | `5000` | LRU bound on cached keys |
 | `COMMONS_MAX_BODY_BYTES` | `5000000` | reject and never cache an upstream body larger than this |
+| `FORWARD_UPSTREAM_AUTH` | `off` | when on, forward the incoming request's `Authorization` header to the upstream on a MISS or a background revalidate, for an upstream that gates its PUBLIC listings behind a credential. The header is NEVER part of the cache key, so a HIT serves the shared public bytes with no credential. Forward ONLY an anonymous, app-level credential, and ONLY for the public-listing path template. A per-user token would get its per-user response cached under `(id, sort)` and served to another caller (see the safety invariant in [`commons-cache/README.md`](./commons-cache/README.md)) |
+| `REQUIRE_FDID` | (none) | when set, reject any request that did not arrive through the edge front door (see [Edge front door](#edge-front-door-cdn--waf)); the front door injects `X-Azure-FDID` and the cache checks it constant-time. Only `GET /health` is exempt. Unset disables the check |
 
 Responses carry `X-Cache: HIT|MISS|STALE` and CDN-ready `Cache-Control` and `Age` headers, so you can put a CDN in front later.
+
+If you run the commons cache behind the same edge front door as the relay (see [Edge front door](#edge-front-door-cdn--waf)), set `REQUIRE_FDID` on it too, to the same front-door identifier. That pins the cache origin to the front door so nobody can drive it directly and burn the shared upstream credential budget.
 
 ## 6. (Optional) Build and run the token issuer
 
@@ -203,11 +210,53 @@ curl http://localhost:8083/health   # token issuer (if running)
 
 To exercise the full encrypted path, use an OHTTP client. Fetch the gateway's key config (`/ohttp-configs`), HPKE-seal a `message/bhttp` request against it, and `POST` the resulting `message/ohttp-req` body to the relay. The relay returns the `message/ohttp-res` body for the client to open locally. Any RFC 9458 client library works, including the test client that ships with the upstream gateway.
 
+## Routing an authenticated public API
+
+The gateway forwards the inner request's headers to the target, so a public API that needs a **non-identifying, app-level** credential can be fetched through the split-trust path. Use this only for a credential that authenticates the *application* and is shared across all users; never route a per-user or login-bound credential (see the scope note in [README.md](./README.md#what-its-for)).
+
+1. Allowlist the API origin on the gateway. Add the exact `Host` to `ALLOWED_TARGET_ORIGINS` (scheme, host, and port are literal):
+
+   ```sh
+   -e ALLOWED_TARGET_ORIGINS="https://api.example.com"
+   ```
+
+   The target must be reachable from the GATEWAY's egress IP. The gateway makes the outbound fetch, not the client, so allowlisting a host the gateway itself cannot route to still fails.
+
+2. On the client, build the inner `message/bhttp` request with the credential in the headers:
+
+   ```
+   GET https://api.example.com/v1/resource
+   Authorization: Bearer <anonymous app-level credential>
+   User-Agent: your-app/1.0 (+https://YOUR_API_HOST)
+   ```
+
+   HPKE-seal it against the gateway key config (`/ohttp-configs`) and `POST` the `message/ohttp-req` body to the relay, exactly as for any other read. The `Authorization` and `User-Agent` headers ride inside the sealed BHTTP, so the relay never sees them; the gateway decrypts, checks the allowlist, and forwards those headers to the target verbatim.
+
+3. The gateway returns the sealed `message/ohttp-res` for the client to open. A target not on the allowlist comes back as a BHTTP `403`; a momentarily exhausted upstream budget comes back as `429` with `Retry-After` (see [Shared egress](#shared-egress-one-ip-one-credential-one-budget)).
+
+The relay still holds identity without content, and the gateway still holds content without identity. What changes is that the gateway now additionally sees the app-level credential, acceptable only because that credential names the app, not the client.
+
+## Shared egress: one IP, one credential, one budget
+
+Everything routed through a single gateway shares that gateway's egress. That sharing is the point (one shared fetcher is what makes reads unlinkable), but it has operational consequences you have to size for:
+
+- **One egress IP.** Every routed fetch leaves from the gateway's IP. To the target, all clients look like one caller, so any per-IP limit or per-IP block the target applies is global; it hits everyone at once.
+- **One shared credential.** When you route an app-level credential, every client presents the same credential to the target. Any per-credential quota the target enforces is a single global budget shared across your whole user base, not per client.
+- **One point of failure.** If the target rate-limits or blocks that IP or credential, or the gateway tier is down, every client loses the routed path at once. Design the client to degrade; see fail-open vs fail-closed in [README.md](./README.md#fail-open-vs-fail-closed-client-choice).
+
+Throttle your own outbound volume so you stay under the target's ceiling instead of tripping it. The gateway has an opt-in global outbound rate limit, `GATEWAY_MAX_QPM`, which caps total forwarded requests per minute across all clients:
+
+```sh
+-e GATEWAY_MAX_QPM=6000
+```
+
+When the budget is momentarily spent the gateway refuses with `429` + `Retry-After` rather than making the call, so clients back off instead of piling onto a budget that is already spent. Because the budget is global and shared, size it against the target's published limit, not against per-client expectations.
+
 ## Abuse controls
 
 The relay is the one public surface, so it carries the abuse controls. All of them keep state in memory only, key nothing to request content, and are never logged, so they do not weaken the operator-blind property. They are off or permissive by default; turn them on for a public deployment.
 
-- **Per-IP rate limiting and a concurrency cap.** `RATE_LIMIT_RPM` (default 120) bounds requests per minute per client IP over a `RATE_WINDOW_MS` window (default 60000); set `RATE_LIMIT_RPM=0` to disable it. `MAX_INFLIGHT` (default 256) caps concurrent relays across the whole process. Anything over either limit gets a 429. `RATE_MAX_KEYS` (default 100000) bounds the limiter's memory so a spoofed-source flood can't grow the table. Behind a single managed ingress the per-IP key is read from the rightmost `X-Forwarded-For` entry, because the TCP peer is the ingress, not the client. **If the request crosses more than one proxy** (e.g. a CDN or Front Door in front of the platform ingress), the rightmost `X-Forwarded-For` entry is the nearest proxy, not the client, so every client collapses into one bucket and gets 429'd in aggregate — set `TRUSTED_CLIENT_IP_HEADER` to the front proxy's trusted client-IP header (`x-azure-clientip` for Azure Front Door, `cf-connecting-ip` for Cloudflare) to key per real client. That IP is used only as a transient counter key; it is never logged or forwarded to the gateway.
+- **Per-IP rate limiting and a concurrency cap.** `RATE_LIMIT_RPM` (default 120) bounds requests per minute per client IP over a `RATE_WINDOW_MS` window (default 60000); set `RATE_LIMIT_RPM=0` to disable it. `MAX_INFLIGHT` (default 256) caps concurrent relays across the whole process. Anything over either limit gets a 429. `RATE_MAX_KEYS` (default 100000) bounds the limiter's memory so a spoofed-source flood can't grow the table. Behind a single managed ingress the per-IP key is read from the rightmost `X-Forwarded-For` entry, because the TCP peer is the ingress, not the client. **If the request crosses more than one proxy** (e.g. a CDN or Front Door in front of the platform ingress), the rightmost `X-Forwarded-For` entry is the nearest proxy, not the client, so every client collapses into one bucket and gets 429'd in aggregate. Set `TRUSTED_CLIENT_IP_HEADER` to the front proxy's trusted client-IP header (`x-azure-clientip` for Azure Front Door, `cf-connecting-ip` for Cloudflare) to key per real client. That IP is used only as a transient counter key; it is never logged or forwarded to the gateway.
 - **Strict request shape.** The relay answers only `POST /relay` with `Content-Type: message/ohttp-req`. A wrong content type returns 415; any other path or method returns 404. There is no general proxy surface to probe.
 - **Client auth (`CLIENT_AUTH_MODE`).** `off` (default) relies on network controls only. `secret` requires a shared secret in the `CLIENT_AUTH_HEADER` (default `x-columbia-token`), checked in constant time against `CLIENT_SECRET`. A shared secret shipped in a client is extractable, so `secret` mode is a speed-bump against casual abuse, not real client authentication. `token` mode is the real client gate: the relay reads the same header, verifies an anonymous blind-RSA token offline against the issuer's epoch public key, and enforces spend-once. Point it at the issuer with `ISSUER_KEYS_URL`; it fails closed if it has no issuer keys. See [section 6](#6-optional-build-and-run-the-token-issuer) and [`token-issuer/PROTOCOL.md`](./token-issuer/PROTOCOL.md).
 
@@ -239,8 +288,9 @@ To stop someone from bypassing the front door and hitting the origin host direct
 - `GET /health` is exempt on both services, so the platform's in-environment health probe still passes.
 - The issuer also exempts `GET /issuer-keys`, because the relay fetches it directly, in-environment, and it is public key material.
 - Every other route requires the header: `POST /relay` and `GET /ohttp-configs` on the relay, and `POST /issue` on the issuer.
+- The commons cache implements the same `REQUIRE_FDID` lock. It runs on internal ingress by default (see [Single public surface](#single-public-surface-internal-gateway-and-commons)), but a deployment that exposes it publicly instead sets `REQUIRE_FDID` on it to the same identifier so the front door pins it too. On the cache only `GET /health` is exempt; `GET /v1/commons` and `GET /v1/probe` require the header.
 
-This pairs with the single-public-surface posture above: the gateway and commons cache are internal, while the relay and issuer face the internet only through the front door.
+This pairs with the single-public-surface posture above: by default the gateway and commons cache are internal, while the relay and issuer face the internet only through the front door. A deployment that instead exposes the commons cache publicly fronts it with the same origin lock.
 
 ## Running relay and gateway as separate operators
 

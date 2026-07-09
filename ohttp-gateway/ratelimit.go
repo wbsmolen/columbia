@@ -13,8 +13,8 @@ import (
 //
 // It is deliberately per-process and in-memory: when a deployment runs N gateway
 // replicas, configure each replica's limit to the global budget divided by N.
-// This keeps the mechanism generic and stateless — no shared store, no external
-// dependency — at the cost of some slack when load is uneven across replicas.
+// This keeps the mechanism generic and stateless (no shared store, no external
+// dependency) at the cost of some slack when load is uneven across replicas.
 //
 // Disabled by default: newGlobalRateLimiter returns nil when the configured
 // rate is not positive, and a nil *globalRateLimiter always allows, so the
