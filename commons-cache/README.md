@@ -46,7 +46,14 @@ Some public JSON APIs still require an app-level credential on the request even 
 | `UPSTREAM_BASE` | `https://example.com` | upstream origin the cache fetches from (https only, validated at startup) |
 | `UPSTREAM_PATH_TEMPLATE` | `/{id}/{sort}.rss` | path appended to `UPSTREAM_BASE`, with `{id}` and `{sort}` substituted (each sanitized then percent-encoded). Set the layout for your upstream without editing code, for example `/feed/{id}/{sort}.xml` (RSS) or `/r/{id}/{sort}?raw_json=1` (JSON). **Public listings only** — see the safety invariant above. |
 | `UPSTREAM_UA` | a generic UA string | `User-Agent` sent to the upstream origin |
+| `COMMONS_MAX_ENTRIES` | `5000` | LRU bound on cached keys; the oldest insertion is evicted past this |
+| `COMMONS_MAX_BODY_BYTES` | `5000000` | reject and never cache an upstream body larger than this (memory-DoS guard) |
 | `FORWARD_UPSTREAM_AUTH` | `false` | when `true`, forward the incoming request's `Authorization` header to the upstream on a MISS/revalidation (for upstreams that gate public listings behind an anonymous app-level credential). The header is **never** part of the cache key; a HIT serves shared public bytes with no credential. Safe **only** for the public-listing path template — see the safety invariant above. |
+| `REQUIRE_FDID` | (none) | front-door origin lock. When set, reject any request that did not arrive through the edge front door, which injects `X-Azure-FDID`; the cache checks that header constant-time and 403s a mismatch. Only `GET /health` is exempt. Unset disables the check. See below. |
+
+### Front-door origin lock (`REQUIRE_FDID`)
+
+The cache runs on internal ingress by default, so it needs no origin lock. If you instead expose it publicly behind a CDN or WAF, set `REQUIRE_FDID` to the front door's identifier and configure the front door to inject an `X-Azure-FDID` header carrying that value (and to strip any client-supplied copy). The cache then serves only requests that arrive through the front door and 403s anything hitting the origin host directly. That matters here because a direct caller could otherwise drive `/v1/commons` and burn the shared upstream credential budget. `GET /health` stays open so the platform health probe still passes. A repeated header carrying several comma-joined values passes if any one matches, and the value is never logged. See the top-level [`../SELFHOSTING.md`](../SELFHOSTING.md#edge-front-door-cdn--waf) for the front-door setup.
 
 ## Observability
 Structured JSON logs to stdout carry RED metrics only: route templates, method, status, cache state, duration. No IPs, no user data, no bodies.
