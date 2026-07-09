@@ -95,7 +95,7 @@ docker run -d --name relay --network columbia -p 8081:8080 \
   columbia-relay
 ```
 
-> The relay requires TLS to the gateway: it hard-exits at startup on a non-`https` `GATEWAY_URL`. Give the gateway a certificate (set its `CERT`/`KEY`, or terminate TLS at an ingress in front of it — a managed platform ingress does this for you). For single-host local testing against a self-signed gateway cert, set `NODE_TLS_REJECT_UNAUTHORIZED=0` on the relay to accept it — local testing only, never in production.
+> The relay requires TLS to the gateway: it hard-exits at startup on a non-`https` `GATEWAY_URL`. Give the gateway a certificate (set its `CERT`/`KEY`, or terminate TLS at an ingress in front of it; a managed platform ingress does this for you). For single-host local testing against a self-signed gateway cert, set `NODE_TLS_REJECT_UNAUTHORIZED=0` on the relay to accept it. Local testing only, never in production.
 
 | Env var | Required | Purpose |
 |---|---|---|
@@ -125,7 +125,7 @@ docker run -d --name relay --network columbia -p 8081:8080 \
 
 ## 5. (Optional) Build and run the commons cache
 
-The commons cache is one kind of upstream target — the right one for public, sessionless content that many clients read identically. It is not required: the gateway can target any allowlisted origin, including a direct API (see [Routing an authenticated public API](#routing-an-authenticated-public-api)), and you can run the path with no cache at all. When you do use it, the cache fetches a public URL once and serves it to many clients, with TTL, stale-while-revalidate, and single-flight. It is generic: point it at any public content by setting `UPSTREAM_BASE` and `UPSTREAM_PATH_TEMPLATE`, with no code edit. It must be listed in the gateway's `ALLOWED_TARGET_ORIGINS`.
+The commons cache is one kind of upstream target: the right one for public, sessionless content that many clients read identically. It is not required: the gateway can target any allowlisted origin, including a direct API (see [Routing an authenticated public API](#routing-an-authenticated-public-api)), and you can run the path with no cache at all. When you do use it, the cache fetches a public URL once and serves it to many clients, with TTL, stale-while-revalidate, and single-flight. It is generic: point it at any public content by setting `UPSTREAM_BASE` and `UPSTREAM_PATH_TEMPLATE`, with no code edit. It must be listed in the gateway's `ALLOWED_TARGET_ORIGINS`.
 
 ```sh
 cd ../commons-cache
@@ -220,7 +220,7 @@ The gateway forwards the inner request's headers to the target, so a public API 
    -e ALLOWED_TARGET_ORIGINS="https://api.example.com"
    ```
 
-   The target must be reachable from the GATEWAY's egress IP — the gateway makes the outbound fetch, not the client, so allowlisting a host the gateway itself cannot route to still fails.
+   The target must be reachable from the GATEWAY's egress IP. The gateway makes the outbound fetch, not the client, so allowlisting a host the gateway itself cannot route to still fails.
 
 2. On the client, build the inner `message/bhttp` request with the credential in the headers:
 
@@ -234,15 +234,15 @@ The gateway forwards the inner request's headers to the target, so a public API 
 
 3. The gateway returns the sealed `message/ohttp-res` for the client to open. A target not on the allowlist comes back as a BHTTP `403`; a momentarily exhausted upstream budget comes back as `429` with `Retry-After` (see [Shared egress](#shared-egress-one-ip-one-credential-one-budget)).
 
-The relay still holds identity without content, and the gateway still holds content without identity. What changes is that the gateway now additionally sees the app-level credential — acceptable only because that credential names the app, not the client.
+The relay still holds identity without content, and the gateway still holds content without identity. What changes is that the gateway now additionally sees the app-level credential, acceptable only because that credential names the app, not the client.
 
 ## Shared egress: one IP, one credential, one budget
 
-Everything routed through a single gateway shares that gateway's egress. That sharing is the point — one shared fetcher is what makes reads unlinkable — but it has operational consequences you have to size for:
+Everything routed through a single gateway shares that gateway's egress. That sharing is the point (one shared fetcher is what makes reads unlinkable), but it has operational consequences you have to size for:
 
-- **One egress IP.** Every routed fetch leaves from the gateway's IP. To the target, all clients look like one caller, so any per-IP limit or per-IP block the target applies is global — it hits everyone at once.
+- **One egress IP.** Every routed fetch leaves from the gateway's IP. To the target, all clients look like one caller, so any per-IP limit or per-IP block the target applies is global; it hits everyone at once.
 - **One shared credential.** When you route an app-level credential, every client presents the same credential to the target. Any per-credential quota the target enforces is a single global budget shared across your whole user base, not per client.
-- **One point of failure.** If the target rate-limits or blocks that IP or credential, or the gateway tier is down, every client loses the routed path at once. Design the client to degrade — see fail-open vs fail-closed in [README.md](./README.md#fail-open-vs-fail-closed-client-choice).
+- **One point of failure.** If the target rate-limits or blocks that IP or credential, or the gateway tier is down, every client loses the routed path at once. Design the client to degrade; see fail-open vs fail-closed in [README.md](./README.md#fail-open-vs-fail-closed-client-choice).
 
 Throttle your own outbound volume so you stay under the target's ceiling instead of tripping it. The gateway has an opt-in global outbound rate limit, `GATEWAY_MAX_QPM`, which caps total forwarded requests per minute across all clients:
 
@@ -256,7 +256,7 @@ When the budget is momentarily spent the gateway refuses with `429` + `Retry-Aft
 
 The relay is the one public surface, so it carries the abuse controls. All of them keep state in memory only, key nothing to request content, and are never logged, so they do not weaken the operator-blind property. They are off or permissive by default; turn them on for a public deployment.
 
-- **Per-IP rate limiting and a concurrency cap.** `RATE_LIMIT_RPM` (default 120) bounds requests per minute per client IP over a `RATE_WINDOW_MS` window (default 60000); set `RATE_LIMIT_RPM=0` to disable it. `MAX_INFLIGHT` (default 256) caps concurrent relays across the whole process. Anything over either limit gets a 429. `RATE_MAX_KEYS` (default 100000) bounds the limiter's memory so a spoofed-source flood can't grow the table. Behind a single managed ingress the per-IP key is read from the rightmost `X-Forwarded-For` entry, because the TCP peer is the ingress, not the client. **If the request crosses more than one proxy** (e.g. a CDN or Front Door in front of the platform ingress), the rightmost `X-Forwarded-For` entry is the nearest proxy, not the client, so every client collapses into one bucket and gets 429'd in aggregate — set `TRUSTED_CLIENT_IP_HEADER` to the front proxy's trusted client-IP header (`x-azure-clientip` for Azure Front Door, `cf-connecting-ip` for Cloudflare) to key per real client. That IP is used only as a transient counter key; it is never logged or forwarded to the gateway.
+- **Per-IP rate limiting and a concurrency cap.** `RATE_LIMIT_RPM` (default 120) bounds requests per minute per client IP over a `RATE_WINDOW_MS` window (default 60000); set `RATE_LIMIT_RPM=0` to disable it. `MAX_INFLIGHT` (default 256) caps concurrent relays across the whole process. Anything over either limit gets a 429. `RATE_MAX_KEYS` (default 100000) bounds the limiter's memory so a spoofed-source flood can't grow the table. Behind a single managed ingress the per-IP key is read from the rightmost `X-Forwarded-For` entry, because the TCP peer is the ingress, not the client. **If the request crosses more than one proxy** (e.g. a CDN or Front Door in front of the platform ingress), the rightmost `X-Forwarded-For` entry is the nearest proxy, not the client, so every client collapses into one bucket and gets 429'd in aggregate. Set `TRUSTED_CLIENT_IP_HEADER` to the front proxy's trusted client-IP header (`x-azure-clientip` for Azure Front Door, `cf-connecting-ip` for Cloudflare) to key per real client. That IP is used only as a transient counter key; it is never logged or forwarded to the gateway.
 - **Strict request shape.** The relay answers only `POST /relay` with `Content-Type: message/ohttp-req`. A wrong content type returns 415; any other path or method returns 404. There is no general proxy surface to probe.
 - **Client auth (`CLIENT_AUTH_MODE`).** `off` (default) relies on network controls only. `secret` requires a shared secret in the `CLIENT_AUTH_HEADER` (default `x-columbia-token`), checked in constant time against `CLIENT_SECRET`. A shared secret shipped in a client is extractable, so `secret` mode is a speed-bump against casual abuse, not real client authentication. `token` mode is the real client gate: the relay reads the same header, verifies an anonymous blind-RSA token offline against the issuer's epoch public key, and enforces spend-once. Point it at the issuer with `ISSUER_KEYS_URL`; it fails closed if it has no issuer keys. See [section 6](#6-optional-build-and-run-the-token-issuer) and [`token-issuer/PROTOCOL.md`](./token-issuer/PROTOCOL.md).
 

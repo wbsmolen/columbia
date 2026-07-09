@@ -33,7 +33,7 @@ const mock = http.createServer((req, res) => {
     }
   };
   // 'slowsub' responds after a delay so concurrent requests overlap the in-flight
-  // fetch — exercises cold-miss single-flight (test f).
+  // fetch; exercises cold-miss single-flight (test f).
   if (req.url.includes('slowsub')) setTimeout(respond, 100); else respond();
 });
 await new Promise((r) => mock.listen(0, '127.0.0.1', r));
@@ -96,7 +96,7 @@ try {
   assert.equal(r.body, RSS_PAYLOAD, 'e: RSS body byte-for-byte');
 
   // (f) COLD-MISS SINGLE-FLIGHT: N concurrent requests for one cold key coalesce
-  // to ONE upstream fetch — thundering-herd protection for the shared credential.
+  // to ONE upstream fetch: thundering-herd protection for the shared credential.
   const before = upstreamHits;
   const results = await Promise.all(Array.from({ length: 12 }, () =>
     get('/v1/commons?id=slowsub&sort=hot', { Authorization: 'Bearer AAA' })));

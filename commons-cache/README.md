@@ -33,9 +33,9 @@ node server.js
 Some public JSON APIs still require an app-level credential on the request even though the *content* they return is public and identical for every caller. Set `FORWARD_UPSTREAM_AUTH=true` and, on a cache **MISS** (or a background revalidation), the proxy forwards the **incoming** request's `Authorization` header to the upstream fetch. On a **HIT** it serves the shared cached bytes with no upstream fetch and requires no `Authorization` at all.
 
 ### Safety invariant (public listings only)
-> The cache key is `(id, sort)` **only** — the `Authorization` header is **never** part of the key. This is correct **precisely because** `UPSTREAM_PATH_TEMPLATE` is restricted to the structured, public, token-agnostic listing form (`{id}`/`{sort}`): the upstream returns the *same public bytes* for every caller regardless of which credential fetched them, so one fetch is safely shared across all callers.
+> The cache key is `(id, sort)` **only**. The `Authorization` header is **never** part of the key. This is correct **precisely because** `UPSTREAM_PATH_TEMPLATE` is restricted to the structured, public, token-agnostic listing form (`{id}`/`{sort}`): the upstream returns the *same public bytes* for every caller regardless of which credential fetched them, so one fetch is safely shared across all callers.
 >
-> **Never widen `UPSTREAM_PATH_TEMPLATE` to an arbitrary or per-user/private path.** If you did, one caller's private response would be cached under `(id, sort)` and served to a different caller — a cross-user data leak. Forward-auth caching-by-path is safe *only* for public listings.
+> **Never widen `UPSTREAM_PATH_TEMPLATE` to an arbitrary or per-user/private path.** If you did, one caller's private response would be cached under `(id, sort)` and served to a different caller: a cross-user data leak. Forward-auth caching-by-path is safe *only* for public listings.
 
 ## Configuration
 | Env var | Default | Purpose |
@@ -44,11 +44,11 @@ Some public JSON APIs still require an app-level credential on the request even 
 | `COMMONS_TTL_MS` | `60000` | fresh window before a feed is treated as stale |
 | `COMMONS_SWR_MS` | `300000` | serve-stale window past TTL (background revalidate) |
 | `UPSTREAM_BASE` | `https://example.com` | upstream origin the cache fetches from (https only, validated at startup) |
-| `UPSTREAM_PATH_TEMPLATE` | `/{id}/{sort}.rss` | path appended to `UPSTREAM_BASE`, with `{id}` and `{sort}` substituted (each sanitized then percent-encoded). Set the layout for your upstream without editing code, for example `/feed/{id}/{sort}.xml` (RSS) or `/r/{id}/{sort}?raw_json=1` (JSON). **Public listings only** — see the safety invariant above. |
+| `UPSTREAM_PATH_TEMPLATE` | `/{id}/{sort}.rss` | path appended to `UPSTREAM_BASE`, with `{id}` and `{sort}` substituted (each sanitized then percent-encoded). Set the layout for your upstream without editing code, for example `/feed/{id}/{sort}.xml` (RSS) or `/r/{id}/{sort}?raw_json=1` (JSON). **Public listings only**. See the safety invariant above. |
 | `UPSTREAM_UA` | a generic UA string | `User-Agent` sent to the upstream origin |
 | `COMMONS_MAX_ENTRIES` | `5000` | LRU bound on cached keys; the oldest insertion is evicted past this |
 | `COMMONS_MAX_BODY_BYTES` | `5000000` | reject and never cache an upstream body larger than this (memory-DoS guard) |
-| `FORWARD_UPSTREAM_AUTH` | `false` | when `true`, forward the incoming request's `Authorization` header to the upstream on a MISS/revalidation (for upstreams that gate public listings behind an anonymous app-level credential). The header is **never** part of the cache key; a HIT serves shared public bytes with no credential. Safe **only** for the public-listing path template — see the safety invariant above. |
+| `FORWARD_UPSTREAM_AUTH` | `false` | when `true`, forward the incoming request's `Authorization` header to the upstream on a MISS/revalidation (for upstreams that gate public listings behind an anonymous app-level credential). The header is **never** part of the cache key; a HIT serves shared public bytes with no credential. Safe **only** for the public-listing path template. See the safety invariant above. |
 | `REQUIRE_FDID` | (none) | front-door origin lock. When set, reject any request that did not arrive through the edge front door, which injects `X-Azure-FDID`; the cache checks that header constant-time and 403s a mismatch. Only `GET /health` is exempt. Unset disables the check. See below. |
 
 ### Front-door origin lock (`REQUIRE_FDID`)
@@ -69,7 +69,7 @@ curl localhost:8099/health
 curl 'localhost:8099/v1/commons?id=example&sort=latest'
 ```
 
-Run the self-test (Node built-ins only, no framework — spins the server against a local mock upstream):
+Run the self-test (Node built-ins only, no framework; spins the server against a local mock upstream):
 ```sh
 node test.mjs
 ```

@@ -184,7 +184,7 @@ function upstreamUrl(id, sort) {
 }
 
 // Cold-miss single-flight: concurrent requests for the same un-cached key share
-// ONE upstream fetch instead of each hitting the upstream — thundering-herd
+// ONE upstream fetch instead of each hitting the upstream: thundering-herd
 // protection for a shared, rate-limited upstream credential. Keyed by `id/sort`.
 const inflight = new Map();
 
