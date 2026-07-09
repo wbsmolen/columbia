@@ -49,9 +49,25 @@ The full trust and threat model, the attestation chain, and the observability de
 
 - Fetching HTTP reads through a split-trust path, so neither hop can tie a client's network identity to the content requested.
 - Caching public content without exposing who read it. Placing the commons cache in front of public, sessionless endpoints (listings, feeds, public APIs) collapses many reads into a small number of upstream fetches.
+- Routing an anonymous, app-level authenticated read. When a public API needs a non-identifying app-level credential (a shared key that authenticates the *application*, not a user), a host on the gateway's `ALLOWED_TARGET_ORIGINS` allowlist can be reached by sealing a `message/bhttp` `GET` that carries `Authorization` and `User-Agent`; the gateway forwards those inner headers to the target. The target must be reachable from the GATEWAY's egress IP, since the gateway makes the outbound fetch, not the client.
 - A starting point for building operator-blind transports into applications. The components are small and adhere to published standards (RFC 9458, 9292, 9180 for the transport; RFC 9576, 9474, 9578 for the anonymous tokens).
 
-Columbia is a read-path privacy layer. It carries public, sessionless reads only. Authenticated and write requests are out of scope by design: the client makes those directly over its own session, so they never touch shared infrastructure. It is not a VPN, and it does not pool or share credentials.
+Columbia is a read-path privacy layer, not a general tunnel: it is not a VPN. Whether it will route a request depends on *what the credential identifies*, not merely on whether the request is "authenticated":
+
+- **User-identity-bound auth is out of scope by design.** A credential that names a person or account — a login session, a per-user token — must not be routed. Putting an identifying credential in front of the gateway hands the operator the very identity the split-trust design exists to remove, which defeats the model. The client makes those requests directly over its own session, so they never touch shared infrastructure.
+- **Anonymous, app-level auth MAY be routed.** A credential shared across all users that authenticates the *application* rather than any one client can be sealed into the BHTTP request. The `Authorization` header travels inside the HPKE-sealed body, so the relay never sees it and only the gateway does; because it links to the app and not to a client identity, the relay-holds-identity / gateway-holds-content split still holds. Columbia still does not pool or share *user* credentials — a shared app-level credential is already common to everyone by definition.
+
+### Connection check ≠ routing
+
+A liveness or reachability probe from the client (can I reach the relay? is the path up?) is not the same thing as routing a fetch through it. The former only confirms the hop answers; the latter seals a real request end to end. Health-checking the relay tells you nothing about whether a given target is allowlisted or reachable from the gateway — that is exercised only by an actual sealed request the gateway forwards.
+
+### Fail-open vs fail-closed (client choice)
+
+When a sealed read fails — the target is not on `ALLOWED_TARGET_ORIGINS` (the gateway returns a BHTTP `403`), the gateway's shared upstream budget is momentarily spent (`429` with `Retry-After`), or the path is down — the client decides how to degrade. *Fail-open*: fall back to a direct fetch over its own session, trading the split-trust property for availability. *Fail-closed*: surface the error and route nothing, keeping the privacy property even when the path is unavailable. Columbia takes no position; the choice is the client's policy.
+
+### Key configs: `/ohttp-configs` vs `/ohttp-keys`
+
+The gateway publishes its HPKE key material at two endpoints. `GET /ohttp-configs` returns a single classical X25519 config (`DHKEM(X25519, HKDF-SHA256)`) — the one a simple RFC 9458 client pins, and the only one the relay proxies. `GET /ohttp-keys` returns the full list (the draft post-quantum `X25519+Kyber768-draft00` hybrid *plus* the classical X25519 config); a client that wants the hybrid selects from this list. The relay currently passes through `/ohttp-configs` only, so a hybrid-capable client behind a relay-only public surface reaches `/ohttp-keys` on the gateway's own host.
 
 ---
 
@@ -105,11 +121,13 @@ docker run -d --name gateway -p 8080:8080 \
   columbia-gateway
 
 # 3. Build and run the relay, pointed at the gateway.
+#    GATEWAY_URL must be https: the relay hard-exits on a plain-http value.
+#    See SELFHOSTING.md for presenting TLS to the gateway (local testing included).
 cd ../ohttp-relay
 docker build -t columbia-relay .
 docker run -d --name relay -p 8081:8080 \
   -e PORT=8080 \
-  -e GATEWAY_URL="http://gateway:8080/gateway" \
+  -e GATEWAY_URL="https://gateway:8080/gateway" \
   columbia-relay
 
 # 4. (Optional) Build and run the commons cache as the gateway's upstream target.
