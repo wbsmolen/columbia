@@ -89,6 +89,10 @@ const RELAY_GATEWAY_HEADER = 'x-columbia-relay-auth';
 // so the check is inert until an operator sets REQUIRE_FDID at deploy time once a
 // front door is provisioned. The FDID value is NEVER logged.
 const REQUIRE_FDID = process.env.REQUIRE_FDID || '';
+// Header the edge front door injects to prove a request came through it. Azure
+// Front Door uses X-Azure-FDID; override FDID_HEADER for a non-Azure CDN/WAF.
+// Node lowercases all incoming header names, so match on the lowercase form.
+const FDID_HEADER = (process.env.FDID_HEADER || 'x-azure-fdid').toLowerCase();
 
 // --- Public key-config passthrough ------------------------------------------
 // When the gateway runs internal-only, clients can no longer fetch its public
@@ -352,7 +356,7 @@ function timingSafeEqualStr(presented, expected) {
 // REQUIRE_FDID via the constant-time compare. The header value is NEVER logged.
 function frontDoorAllowed(req) {
   if (!REQUIRE_FDID) return true; // lock disabled => behavior unchanged
-  const raw = req.headers['x-azure-fdid'];
+  const raw = req.headers[FDID_HEADER];
   if (typeof raw !== 'string' || raw.length === 0) return false;
   for (const tok of raw.split(',')) {
     if (timingSafeEqualStr(tok.trim(), REQUIRE_FDID)) return true;

@@ -87,6 +87,10 @@ const ISSUER_SIGNING_KEY_B64 = process.env.ISSUER_SIGNING_KEY || '';
 // directly, in-environment, with no front door in that hop, and it is public key
 // material. Every other route (/issue and any /attest* endpoints) requires it.
 const REQUIRE_FDID = process.env.REQUIRE_FDID || '';
+// Header the edge front door injects to prove a request came through it. Azure
+// Front Door uses X-Azure-FDID; override FDID_HEADER for a non-Azure CDN/WAF.
+// Node lowercases all incoming header names, so match on the lowercase form.
+const FDID_HEADER = (process.env.FDID_HEADER || 'x-azure-fdid').toLowerCase();
 
 // RSA-PSS / blind-RSA parameters. SHA-384, 2048-bit modulus, deterministic PSS -
 // the Apple PAT / RFC 9578 Token Type 2 suite.
@@ -546,7 +550,7 @@ function timingSafeEqualStr(presented, expected) {
 // compare. The header value is NEVER logged.
 function frontDoorAllowed(req) {
   if (!REQUIRE_FDID) return true; // lock disabled => behavior unchanged
-  const raw = req.headers['x-azure-fdid'];
+  const raw = req.headers[FDID_HEADER];
   if (typeof raw !== 'string' || raw.length === 0) return false;
   for (const tok of raw.split(',')) {
     if (timingSafeEqualStr(tok.trim(), REQUIRE_FDID)) return true;

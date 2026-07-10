@@ -120,6 +120,7 @@ docker run -d --name relay --network columbia -p 8081:8080 \
 | `GATEWAY_CONFIGS_URL` | gateway host + `/ohttp-configs` | where the relay fetches the key config to pass through |
 | `CONFIG_TTL_MS` | `120000` | how long the relay caches the passed-through key config |
 | `REQUIRE_FDID` | (none) | when set, reject any request that did not arrive through the edge front door (see [Edge front door](#edge-front-door-cdn--waf)); unset disables the check |
+| `FDID_HEADER` | `x-azure-fdid` | name of the header the edge front door injects for the `REQUIRE_FDID` lock above; override for a non-Azure CDN or WAF that injects a differently named header |
 
 > The relay forwards only the ciphertext body plus `Content-Type: message/ohttp-req`. Dropping every client header is the security property, not an oversight. The one extra header it adds to the outbound request is `X-Columbia-Relay-Auth` (when `RELAY_GATEWAY_SECRET` is set), which identifies the relay, never the client.
 
@@ -153,6 +154,7 @@ docker run -d --name commons --network columbia -p 8082:8080 \
 | `COMMONS_MAX_BODY_BYTES` | `5000000` | reject and never cache an upstream body larger than this |
 | `FORWARD_UPSTREAM_AUTH` | `off` | when on, forward the incoming request's `Authorization` header to the upstream on a MISS or a background revalidate, for an upstream that gates its PUBLIC listings behind a credential. The header is NEVER part of the cache key, so a HIT serves the shared public bytes with no credential. Forward ONLY an anonymous, app-level credential, and ONLY for the public-listing path template. A per-user token would get its per-user response cached under `(id, sort)` and served to another caller (see the safety invariant in [`commons-cache/README.md`](./commons-cache/README.md)) |
 | `REQUIRE_FDID` | (none) | when set, reject any request that did not arrive through the edge front door (see [Edge front door](#edge-front-door-cdn--waf)); the front door injects `X-Azure-FDID` and the cache checks it constant-time. Only `GET /health` is exempt. Unset disables the check |
+| `FDID_HEADER` | `x-azure-fdid` | name of the header the edge front door injects for the `REQUIRE_FDID` lock above; override for a non-Azure CDN or WAF that injects a differently named header |
 
 Responses carry `X-Cache: HIT|MISS|STALE` and CDN-ready `Cache-Control` and `Age` headers, so you can put a CDN in front later.
 
@@ -192,6 +194,7 @@ docker run -d --name issuer --network columbia -p 8083:8080 \
 | `APPLE_APP_ATTEST_AAGUID` | `appattest` | `appattest` for production, `appattestdevelop` for dev or TestFlight builds |
 | `APP_ATTEST_CLOCK_SKEW_MS` | `300000` | tolerance when checking the attestation cert validity windows, for clock drift |
 | `REQUIRE_FDID` | (none) | when set, reject any request that did not arrive through the edge front door (see [Edge front door](#edge-front-door-cdn--waf)); `GET /health` and `GET /issuer-keys` stay reachable |
+| `FDID_HEADER` | `x-azure-fdid` | name of the header the edge front door injects for the `REQUIRE_FDID` lock above; override for a non-Azure CDN or WAF that injects a differently named header |
 
 > Generate a local test signing key with `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -outform DER | base64 | tr -d '\n'`. In production the key comes from your secret store at runtime, never from the repo, exactly like the gateway's `SEED_SECRET_KEY`.
 
@@ -282,7 +285,7 @@ In production, also unregister the reflective self-test endpoints on the gateway
 
 A CDN or WAF in front of the two public origins (the relay and the issuer) absorbs DDoS and applies per-IP rate limiting at the edge, before traffic reaches your container. A managed front door is one way to run this; any CDN or WAF that can inject a request header the origin can verify works the same way.
 
-To stop someone from bypassing the front door and hitting the origin host directly, set `REQUIRE_FDID` on the relay and the issuer to the front door's identifier. Each origin reads the `X-Azure-FDID` request header and rejects any request whose value does not match `REQUIRE_FDID`. A managed Azure Front Door injects this header for its own profile id; a generic CDN or WAF works the same way as long as you configure it to inject a header named `X-Azure-FDID` carrying the value you set in `REQUIRE_FDID`, and to strip any client-supplied copy. A repeated header carrying several comma-joined values passes if any one of them matches. The comparison is constant-time and the value is never logged.
+To stop someone from bypassing the front door and hitting the origin host directly, set `REQUIRE_FDID` on the relay and the issuer to the front door's identifier. Each origin reads the `X-Azure-FDID` request header and rejects any request whose value does not match `REQUIRE_FDID`. A managed Azure Front Door injects this header for its own profile id; a generic CDN or WAF works the same way as long as you configure it to inject a header named `X-Azure-FDID` (or whatever you set `FDID_HEADER` to) carrying the value you set in `REQUIRE_FDID`, and to strip any client-supplied copy. A repeated header carrying several comma-joined values passes if any one of them matches. The comparison is constant-time and the value is never logged.
 
 - The check is inert when `REQUIRE_FDID` is unset, so you can deploy the origins first and turn the lock on once the front door is provisioned.
 - `GET /health` is exempt on both services, so the platform's in-environment health probe still passes.
