@@ -50,6 +50,7 @@ Some public JSON APIs still require an app-level credential on the request even 
 | `COMMONS_MAX_BODY_BYTES` | `5000000` | reject and never cache an upstream body larger than this (memory-DoS guard) |
 | `FORWARD_UPSTREAM_AUTH` | `false` | when `true`, forward the incoming request's `Authorization` header to the upstream on a MISS/revalidation (for upstreams that gate public listings behind an anonymous app-level credential). The header is **never** part of the cache key; a HIT serves shared public bytes with no credential. Safe **only** for the public-listing path template. See the safety invariant above. |
 | `REQUIRE_FDID` | (none) | front-door origin lock. When set, reject any request that did not arrive through the edge front door, which injects `X-Azure-FDID`; the cache checks that header constant-time and 403s a mismatch. Only `GET /health` is exempt. Unset disables the check. See below. |
+| `FDID_HEADER` | `x-azure-fdid` | name of the header the edge front door injects for the `REQUIRE_FDID` lock above; override for a non-Azure CDN or WAF that injects a differently named header |
 
 ### Front-door origin lock (`REQUIRE_FDID`)
 

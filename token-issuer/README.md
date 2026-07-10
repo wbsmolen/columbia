@@ -145,6 +145,7 @@ so they self-expire when the epoch rolls.
 | `APP_ATTEST_CLOCK_SKEW_MS` | `300000` | tolerance (ms) when checking the x5c certs' validity windows, for issuer/Apple clock drift |
 | `REQUIRE_CLIENT_DATA_BINDING` | `1` (on) | require the App Attest `clientDataHash` to commit to the exact `blinded[]` batch + epoch (see below). Set to `0` only during client bring-up, before the iOS client computes the matching hash |
 | `REQUIRE_FDID` | unset | when set, reject any request whose `X-Azure-FDID` header does not match, so the issuer only accepts traffic that arrived through your front door (a CDN or WAF, for example Azure Front Door). `/health` and `/issuer-keys` are exempt. Empty/unset disables the check |
+| `FDID_HEADER` | `x-azure-fdid` | name of the header the edge front door injects for the `REQUIRE_FDID` lock above; override for a non-Azure CDN or WAF that injects a differently named header |
 
 The signing key is injected exactly like the gateway's `SEED_SECRET_KEY`: from your
 host's secret store at runtime, never written to disk in this repo.

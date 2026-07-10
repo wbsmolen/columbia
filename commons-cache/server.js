@@ -31,6 +31,10 @@ const crypto = require('crypto');
 // burn the upstream credential budget). Inert until an operator sets REQUIRE_FDID.
 // The value is NEVER logged.
 const REQUIRE_FDID = process.env.REQUIRE_FDID || '';
+// Header the edge front door injects to prove a request came through it. Azure
+// Front Door uses X-Azure-FDID; override FDID_HEADER for a non-Azure CDN/WAF.
+// Node lowercases all incoming header names, so match on the lowercase form.
+const FDID_HEADER = (process.env.FDID_HEADER || 'x-azure-fdid').toLowerCase();
 
 const PORT = parseInt(process.env.PORT || '8080', 10); // non-root can't bind <1024
 const TTL_MS = parseInt(process.env.COMMONS_TTL_MS || '60000', 10);        // fresh window
@@ -267,7 +271,7 @@ function timingSafeEqualStr(presented, expected) {
 // present (a repeated header is comma-joined by Node; accept if ANY token matches).
 function frontDoorAllowed(req) {
   if (!REQUIRE_FDID) return true;
-  const raw = req.headers['x-azure-fdid'];
+  const raw = req.headers[FDID_HEADER];
   if (typeof raw !== 'string' || raw.length === 0) return false;
   for (const tok of raw.split(',')) {
     if (timingSafeEqualStr(tok.trim(), REQUIRE_FDID)) return true;
