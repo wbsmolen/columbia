@@ -1,8 +1,10 @@
 # Changelog
 
-Notable changes to Columbia. Releases are git tags; the most recent tagged release is `v1.2.0`. This file starts from the unreleased work that follows it.
+Notable changes to Columbia. Releases are git tags; the most recent tagged release is `v1.3.0`.
 
 ## Unreleased
+
+## v1.3.0 (2026-07-08)
 
 ### Documentation
 
