@@ -1,8 +1,14 @@
 # Changelog
 
-Notable changes to Columbia. Releases are git tags; the most recent tagged release is `v1.3.0`.
+Notable changes to Columbia. Releases are git tags; the most recent tagged release is `v1.4.0`.
 
 ## Unreleased
+
+## v1.4.0 (2026-07-10)
+
+### Changed
+
+- The front-door origin lock now reads a configurable request header. Set `FDID_HEADER` to change the header name the relay, commons cache, and token issuer check for the `REQUIRE_FDID` lock; it defaults to `x-azure-fdid`, so existing deployments are unchanged. This lets a deployment behind a non-Azure CDN or WAF point the lock at whatever header its edge injects.
 
 ## v1.3.0 (2026-07-08)
 
