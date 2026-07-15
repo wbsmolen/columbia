@@ -125,8 +125,11 @@ leaks nothing finer than "this token was issued in epoch E". A coarse epoch keep
 the anonymity set large: everyone issued in the same epoch is indistinguishable at
 spend time.
 
-The per-device quota and the relay's spend-once set are both scoped to the epoch,
-so they self-expire when the epoch rolls.
+The issuer's per-device quota is scoped to the epoch and self-expires when it
+rolls. The relay's in-memory spend-once set is not epoch-scoped — it's bounded
+by `REDEMPTION_MAX_KEYS` with oldest-inserted eviction, cleared on restart. A
+production, multi-replica deployment should move it to a shared, epoch-TTL'd
+store (see PROTOCOL.md).
 
 ## Configuration
 

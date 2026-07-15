@@ -10,15 +10,21 @@ Legend: ✅ done, 🟡 partial, ⬜ not started, 💲 has a recurring cost, 🔗
 
 - ✅ OHTTP data path, end to end. Client HPKE-seal -> relay -> gateway (HPKE-decrypt) -> target -> back. Standard RFC 9458 / 9292 / 9180.
 - ✅ OHTTP relay. Strips the client IP and all headers, forwards only the opaque `message/ohttp-req` ciphertext to the gateway.
-- ✅ Vendored gateway. Cloudflare `privacy-gateway-server-go`, pinned commit, unmodified source, BSD-3 license preserved.
+- ✅ Vendored gateway. Cloudflare `privacy-gateway-server-go`, pinned commit, BSD-3 license preserved. Three small, documented Columbia-local additions on top (relay-auth check, endpoint guard, outbound rate limiter) — see `ohttp-gateway/VENDORED.md` for the full list.
 - ✅ Commons cache. Optional public-content cache origin: TTL, stale-while-revalidate, single-flight, `X-Cache: HIT|MISS|STALE`, CDN-ready `Cache-Control` and `Age` headers.
 - ✅ RED-only observability. Every service logs `{ts, route(template), status, durationMs[, cache]}`. No IP, no content, no bodies, and `LOG_SECRETS=false` on the gateway.
 - ✅ Key-config pinning. Clients can pin the gateway's HPKE key-config SHA-256 fingerprint to catch a swapped key.
+- ✅ Token issuer (Privacy Pass). Issues per-device, per-epoch tokens gated on real Apple App Attest validation; the relay verifies and spends a token before forwarding a request.
+- ✅ Relay abuse controls. Per-client rate limiting and a configurable trusted client-IP header, for deployments that sit behind another proxy.
+- ✅ Gateway outbound rate limit. Optional global cap on outbound requests (`GATEWAY_MAX_QPM`), so a burst of client traffic can't turn into a burst of upstream traffic.
+- ✅ Configurable front-door origin lock. `FDID_HEADER` sets which request header the origin lock checks, so it isn't tied to any one CDN or WAF.
+- ✅ Anonymous app-level authenticated read routing. The gateway forwards inner BHTTP headers (`Authorization`, `User-Agent`) verbatim to an allowlisted target, and the commons cache can optionally forward `Authorization` upstream on a cache miss (`FORWARD_UPSTREAM_AUTH`) — for a non-identifying, app-level credential only, not a user's own login session.
+- ✅ Two-operator split. The relay and gateway can already run under separate operators: deploy each as its own container on different infrastructure and point one at the other. See SELFHOSTING.md. Identity (relay) and content (gateway) then sit in genuinely separate trust domains, no code changes required.
 
 ## Remaining work
 
-### (a) Relay at a separate operator, for true non-collusion ⬜🔗
-Run the relay and the gateway under genuinely different operators, so identity (relay) and content (gateway) live in separate trust domains. The relay is about 75 lines of stateless forwarding, so moving it to an independent host (such as an edge worker) also provides global POPs. Low cost, high trust gain.
+### (a) Relay as a maintained edge worker, for global POPs ⬜🔗
+The two-operator split (see Working today) already gets identity and content into separate trust domains. What's still missing is a relay implementation built for an edge-worker platform (Cloudflare Workers, Fastly Compute, etc.) — the relay is about 75 lines of stateless forwarding, a good fit for that model, and it would give a maintained, third-party-operated relay with points of presence close to clients everywhere, rather than a self-hoster's own single-region container.
 
 ### (b) Confidential-compute gateway on SEV-SNP ⬜🔗💲
 Run the gateway in an AMD SEV-SNP confidential VM so the host and operator cannot read gateway memory. That closes the gap where the operator could otherwise read decrypted content or the HPKE key out of the process. Confidential SKUs cost more and usually do not scale to zero, so budget the always-on floor accordingly.
@@ -35,8 +41,8 @@ Stop per-user key targeting, where a gateway hands one client a unique key to de
 ### (f) CDN in front of the cache tier ⬜💲
 The commons cache already emits CDN-ready headers. Put a CDN in front so public content is edge-cached globally and the cache tier only sees origin-shield traffic. It serves identical public content, so there's no per-user signal to leak.
 
-### (g) Shared cache ⬜💲
-Each cache replica has its own in-memory store, so hit-rate drops as replicas fan out. A shared store (Redis, for instance) makes hit-rate replica-independent; keep single-flight across replicas with a distributed lock. Largely moot once (f) is in place.
+### (g) Shared cache and shared redemption store ⬜💲
+Each cache replica has its own in-memory store, so hit-rate drops as replicas fan out. A shared store (Redis, for instance) makes hit-rate replica-independent; keep single-flight across replicas with a distributed lock. Largely moot once (f) is in place. The relay's spend-once (nullifier) set has the same per-replica limitation, for a different reason: it should move to a shared, epoch-TTL'd store (e.g. Redis `SET NX`, keyed by nullifier, with a TTL past the token's epoch) so a token can't be double-spent across replicas and redemption state expires with the epoch instead of only on restart or a size cap.
 
 ### (h) Retries and resilience ⬜
 The relay and cache make single-attempt upstream calls today. Add bounded retries with backoff and jitter, per-call timeouts, and circuit-breaking, so a transient upstream hiccup doesn't surface as a user-visible failure. Keep it RED-observable.

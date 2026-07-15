@@ -10,12 +10,14 @@ By default, the gateway exposes the following API endpoints:
 
 - "/gateway": An endpoint that will accept OHTTP requests, fetch the corresponding target resource, and return an OHTTP response.
 - "/gateway-echo": An endpoint that will echo the contents of the encapsulated OHTTP request back in an OHTTP response.
-- "/ohttp-configs": An endpoint that will provide an [encoded KeyConfig](https://datatracker.ietf.org/doc/html/draft-ietf-ohai-ohttp-02#section-3.1).
+- "/gateway-metadata": An endpoint that will echo request metadata (headers, etc.) back to the caller, useful as a relay-stripping self-test.
+- "/ohttp-configs": An endpoint that will provide the legacy [encoded KeyConfig](https://datatracker.ietf.org/doc/html/draft-ietf-ohai-ohttp-02#section-3.1), classical X25519 only.
+- "/ohttp-keys": An endpoint that will provide the full encoded KeyConfig list, the primary post-quantum-hybrid config plus the legacy classical X25519 config.
 - "/health": An endpoint for inspecting the health of the gateway (returns 200 in normal conditions).
 
-The gateway only supports the [HPKE](https://datatracker.ietf.org/doc/html/rfc9180) ciphersuite based on DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, and AES-128-GCM.
+The gateway publishes two HPKE key configs: a primary config using KEM `X25519+Kyber768-draft00`, a draft post-quantum hybrid, and a legacy config using [HPKE](https://datatracker.ietf.org/doc/html/rfc9180)'s classical `DHKEM(X25519, HKDF-SHA256)`. Both pair the KEM with HKDF-SHA256 and AES-128-GCM. A classical-only client should select the legacy config.
 
-The gateway _does not_ currently support key rotation. [This issue](https://github.com/cloudflare/app-relay-gateway-go/issues/11) tracks adding this feature.
+The gateway _does not_ currently support key rotation. [This issue](https://github.com/cloudflare/privacy-gateway-server-go/issues/11) tracks adding this feature.
 
 # Deployment
 
@@ -32,8 +34,10 @@ The behavior of the gateway is configurable via a number of environment variable
 - LOG_FORMAT: This environment variable controls the format in which events are logged. Supported values are:
 	- `default`: events are run through [`slog.TextHandler`](https://pkg.go.dev/log/slog@master#TextHandler).
 	- `json`: events are run through [`slog.JSONHandler`](https://pkg.go.dev/log/slog#JSONHandler).
-- LOG_LEVEL: This environment variable controls how noisy logs are. The supported values correspond to the [`slog.Level` values](https://pkg.go.dev/log/slog@master#Level).
+- LOG_LEVEL: This environment variable controls how noisy logs are. The supported values correspond to the [`slog.Level` values](https://pkg.go.dev/log/slog@master#Level). Never set to `debug` in production — see `../SELFHOSTING.md`.
 - TARGET_REWRITES: This environment variable contains a JSON document instructing the gateway to rewrite the target URL found in an encapsulated request to some specified scheme and host.
+- RELAY_GATEWAY_SECRET: Columbia-local addition, not upstream. When set, the gateway rejects `/gateway` requests whose `X-Columbia-Relay-Auth` header doesn't match. See `VENDORED.md`.
+- GATEWAY_MAX_QPM: Columbia-local addition, not upstream. Optional global cap on outbound requests per minute; over-budget requests get a 429. See `VENDORED.md`.
 
 ### Target URL rewrites
 
@@ -161,8 +165,8 @@ $ export KEY=/etc/letsencrypt/live/example.com/privkey.pem
 3. Clone and build the server:
 
 ```
-$ git clone git@github.com:cloudflare/app-relay-gateway-go.git
-$ cd app-relay-gateway-go
+$ git clone git@github.com:cloudflare/privacy-gateway-server-go.git
+$ cd privacy-gateway-server-go
 $ go build ./...
 ```
 

@@ -83,12 +83,20 @@ No IP, no content, no headers, no target. `route` is a fixed template.
 | `PORT` | `8080` | listen port (non-root can't bind below 1024) |
 | `GATEWAY_URL` | required | full gateway endpoint, e.g. `https://<gateway-host>/gateway` |
 | `CLIENT_AUTH_MODE` | `off` | `off`, `secret`, or `token` (Privacy Pass / Private Access Token) |
+| `CLIENT_SECRET` | (none) | required in `secret` mode; the credential clients present in `CLIENT_AUTH_HEADER`. Unset in `secret` mode fails closed (every request rejected) |
+| `CLIENT_AUTH_HEADER` | `x-columbia-token` | header clients present their credential in, for both `secret` and `token` mode |
 | `ISSUER_KEYS_URL` | unset | in `token` mode, the issuer's `GET /issuer-keys`, e.g. `https://<issuer-host>/issuer-keys` |
 | `ISSUER_KEYS_TTL_MS` | `300000` | how often the relay refreshes the cached issuer public keys |
 | `TOKEN_PSS_SALT_LEN` | `48` | RSA-PSS salt length for token verification (SHA-384 digest length) |
 | `REDEMPTION_MAX_KEYS` | `5000000` | spend-once set memory bound (single replica; a shared store is the real fix) |
 | `RATE_LIMIT_RPM` | `120` | per-IP requests per minute; `0` disables per-IP limiting |
+| `RATE_WINDOW_MS` | `60000` | the window `RATE_LIMIT_RPM` is measured over |
+| `RATE_MAX_KEYS` | `100000` | per-IP rate-limit bucket memory bound |
 | `MAX_INFLIGHT` | `256` | global cap on concurrent relays; further requests get a 429 |
+| `MAX_BODY_BYTES` | `65536` | request body size cap |
+| `MAX_RESP_BYTES` | `1000000` | gateway response size cap |
+| `GW_TIMEOUT_MS` | `15000` | timeout for a relay→gateway request |
+| `CONFIG_TTL_MS` | `120000` | how long the `GET /ohttp-configs` passthrough response is cached |
 | `TRUSTED_CLIENT_IP_HEADER` | _(empty)_ | header a trusted front proxy sets to the real client IP (e.g. `x-azure-clientip`, `cf-connecting-ip`). Set it whenever a request crosses more than one proxy (front proxy + platform ingress), or every client collapses into one rate-limit bucket. Empty keeps single-proxy rightmost-`X-Forwarded-For` behaviour |
 | `RELAY_GATEWAY_SECRET` | (none) | shared secret sent to the gateway as `X-Columbia-Relay-Auth`; set the SAME value on the gateway so it rejects traffic that did not come through the relay |
 | `GATEWAY_CONFIGS_URL` | gateway host + `/ohttp-configs` | where the relay fetches the gateway key config it passes through at `GET /ohttp-configs` |

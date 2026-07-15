@@ -44,15 +44,28 @@ The gateway HPKE-decrypts requests and fetches targets. Two settings matter most
 
 > Warning: always set `ALLOWED_TARGET_ORIGINS`. The gateway does NOT fail closed on its own. If you leave it empty or unset, the gateway becomes an open, anonymous proxy that anyone can point at any origin, including an SSRF pivot into your internal network. Matching is by exact `Host` string: scheme, port, and subdomain are all literal, so `example.com` does not cover `api.example.com` or `https://example.com:8443`. List every origin you mean to allow, exactly.
 
+The relay (step 4) requires TLS to the gateway, so the gateway needs a certificate before the relay can reach it. For single-host local testing, generate a self-signed one:
+
+```sh
+mkdir -p certs
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -keyout certs/key.pem -out certs/cert.pem -subj "/CN=gateway"
+```
+
+For a real deployment, use a certificate from your own CA/ACME setup (or terminate TLS at an ingress in front of the gateway instead — a managed platform ingress does this for you, in which case skip `CERT`/`KEY` here and set `GATEWAY_URL` in step 4 to that ingress's `https` address).
+
 ```sh
 cd ohttp-gateway
 docker build -t columbia-gateway .
 
 docker run -d --name gateway --network columbia -p 8080:8080 \
+  -v "$(pwd)/../certs:/certs:ro" \
   -e PORT=8080 \
   -e SEED_SECRET_KEY="$SEED_SECRET_KEY" \
   -e LOG_SECRETS=false \
   -e ALLOWED_TARGET_ORIGINS="http://commons:8080" \
+  -e CERT=/certs/cert.pem \
+  -e KEY=/certs/key.pem \
   columbia-gateway
 ```
 
@@ -66,6 +79,8 @@ docker run -d --name gateway --network columbia -p 8080:8080 \
 | `RELAY_GATEWAY_SECRET` | (none) | when set, the gateway rejects `/gateway` requests that lack a matching `X-Columbia-Relay-Auth`; set the SAME value as the relay |
 | `ECHO_ENDPOINT` | `/gateway-echo` | set to `""` in production to unregister the reflective echo self-test endpoint |
 | `METADATA_ENDPOINT` | `/gateway-metadata` | set to `""` in production to unregister the reflective metadata self-test endpoint |
+| `LOG_LEVEL` | `info` | **never set to `debug` in production** — at `debug`, a couple of error paths log the target `Host` and `URL`, which breaks the "never a target" observability guarantee in [ARCHITECTURE.md](./ARCHITECTURE.md#observability) |
+| `GATEWAY_DEBUG` | (none) | **never set in production** — includes internal debug detail in HTTP error responses instead of a generic status message |
 
 The `RELAY_GATEWAY_SECRET`, `ECHO_ENDPOINT`, and `METADATA_ENDPOINT` controls are described in detail in [`ohttp-gateway/VENDORED.md`](./ohttp-gateway/VENDORED.md). See [Abuse controls](#abuse-controls) below for how to set the shared secret without a window where the gateway 401s all relay traffic.
 
@@ -92,10 +107,11 @@ docker build -t columbia-relay .
 docker run -d --name relay --network columbia -p 8081:8080 \
   -e PORT=8080 \
   -e GATEWAY_URL="https://gateway:8080/gateway" \
+  -e NODE_TLS_REJECT_UNAUTHORIZED=0 \
   columbia-relay
 ```
 
-> The relay requires TLS to the gateway: it hard-exits at startup on a non-`https` `GATEWAY_URL`. Give the gateway a certificate (set its `CERT`/`KEY`, or terminate TLS at an ingress in front of it; a managed platform ingress does this for you). For single-host local testing against a self-signed gateway cert, set `NODE_TLS_REJECT_UNAUTHORIZED=0` on the relay to accept it. Local testing only, never in production.
+> The relay requires TLS to the gateway: it hard-exits at startup on a non-`https` `GATEWAY_URL`. The gateway is now serving the self-signed cert from step 3, so the relay also needs `NODE_TLS_REJECT_UNAUTHORIZED=0` above to accept it — the command generates a self-signed cert and turns off certificate verification, so it is **local testing only, never production**. For a real deployment, give the gateway a certificate from a real CA/ACME (or terminate TLS at an ingress in front of it) and drop `NODE_TLS_REJECT_UNAUTHORIZED=0` entirely.
 
 | Env var | Required | Purpose |
 |---|---|---|

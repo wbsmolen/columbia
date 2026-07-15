@@ -26,18 +26,22 @@ The crypto is HPKE (RFC 9180). The gateway publishes two key configs: a primary 
 
 ## Local modifications
 
-Two deviations from upstream: (1) the GCP App Engine example manifests (`gateway.yaml`, `gateway-protohttp.yaml`, `app.yaml`) were removed (see below); (2) two small env-gated access controls were added to `main.go` (see "Added: relay auth + endpoint guard" below). The vendored dependency tree is byte-identical to the upstream commit above, and the Go source is byte-identical apart from those two additions in `main.go`. Other deployment-specific behavior is supplied entirely at runtime through environment variables (documented in the upstream `README.md`), not by patching the source:
+Three deviations from upstream: (1) the GCP App Engine example manifests (`gateway.yaml`, `gateway-protohttp.yaml`, `app.yaml`) were removed (see below); (2) two small env-gated access controls were added to `main.go` (see "Added: relay auth + endpoint guard" below); (3) an optional global outbound rate limiter was added as a new file, `ratelimit.go` (see below), with a call site in `handler.go`. Other deployment-specific behavior is supplied entirely at runtime through environment variables (documented in the upstream `README.md`), not by patching the source:
 
 - `SEED_SECRET_KEY`, the 32-byte HPKE seed, injected at deploy time from the host's secret store and never committed. The gateway runs with `LOG_SECRETS=false`, so the seed is never printed.
 - `ALLOWED_TARGET_ORIGINS`, restricts the gateway to an allowlist of origins it may fetch (everything else is refused). Matching is on the exact inner-request `Host`. The gateway forwards the decapsulated inner request as-is: it neither adds nor strips the sealed inner headers, and it enforces ONLY the exact-Host allowlist on that request. That passthrough is what lets an app-credential public read go through: the client seals an `Authorization` header inside the BHTTP `GET`, the relay never sees it, and the gateway forwards it to the allowlisted target verbatim.
 - `RELAY_GATEWAY_SECRET`, the shared secret the relay attaches as `X-Columbia-Relay-Auth`; the gateway rejects `/gateway` requests without it (see below). Empty/unset = open.
+- `GATEWAY_MAX_QPM`, an optional global cap on outbound requests to targets (see below). Empty/unset = disabled (no limit), preserving upstream behavior.
 
-## Added: relay auth + endpoint guard (`main.go`)
+The vendored dependency tree tracks the upstream commit above, plus documented security-patch bumps to indirect dependencies (see `CHANGELOG.md` — e.g. the `golang.org/x/crypto`/`x/sys` bump that cleared a set of Dependabot alerts). Aside from those patch bumps and the three deviations above, the dependency tree and Go source are unmodified from upstream.
 
-Two env-gated additions to `main.go`; nothing else in the Go source changes:
+## Added: relay auth, endpoint guard, and rate limiter (`main.go`, `handler.go`, `ratelimit.go`)
+
+Three env-gated additions; nothing else in the Go source changes:
 
 - **Relay→gateway auth.** A `requireRelaySecret` middleware wraps the main gateway endpoint and rejects any request whose `X-Columbia-Relay-Auth` header doesn't match `RELAY_GATEWAY_SECRET` (constant-time compare), **before** HPKE decapsulation. Empty/unset = check disabled (open), preserving upstream behavior. Set the SAME value on the relay (`RELAY_GATEWAY_SECRET`) and the gateway; set it on the relay first, then the gateway, so there's no window where the gateway 401s all relay traffic.
 - **Endpoint registration guard.** Registration now skips any endpoint whose pattern is the empty string (Go's `http.HandleFunc` panics on `""`). In production set `ECHO_ENDPOINT=""` and `METADATA_ENDPOINT=""` to disable the reflective `/gateway-echo` and `/gateway-metadata` self-test handlers, which echo inbound request headers via `httputil.DumpRequest`. The in-code defaults are unchanged (`/gateway-echo`, `/gateway-metadata`), so the self-test path stays available in dev/staging.
+- **Outbound rate limit.** `ratelimit.go` is a new file implementing an optional global limiter (`GATEWAY_MAX_QPM`) on requests the gateway makes to targets. `handler.go`'s request path checks it before fetching; a request over the limit gets a `429` with `Retry-After` instead of reaching the target. Empty/unset = disabled, preserving upstream behavior.
 
 ## Removed: the GCP App Engine manifests
 
@@ -47,7 +51,7 @@ Provide a fresh 32-byte seed at runtime through the environment, never in a file
 
 ## Why vendored instead of a submodule
 
-- Self-contained, auditable builds. `docker build` against this directory needs no network and no submodule init; the exact gateway bytes are present.
+- Self-contained, auditable builds. `docker build` against this directory needs no submodule init, and the vendored `vendor/` tree means `go build` itself needs no network; the exact gateway bytes are present.
 - Reproducibility. It pins the gateway to one reviewed commit, so upstream cannot shift underneath.
 - Transparency goal. The long-term aim (see [`../ROADMAP.md`](../ROADMAP.md)) is reproducible builds plus a public transparency log of attested measurements, which needs the precise source present and pinned.
 

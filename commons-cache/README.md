@@ -21,7 +21,7 @@ This service is the cache origin at the end of the operator-blind path (`relay -
 - Every 200 carries `X-Cache` (`HIT`/`MISS`/`STALE`) and `X-Upstream-Status` so the client can see the cache decision and the origin status behind the bytes. Only `200`s are cached, so `X-Upstream-Status` is `200` on a served response.
 
 ## Caching an authenticated JSON API
-The cache is content-agnostic: it stores whatever bytes and `Content-Type` the upstream returns (allowlisted to feed/JSON media types), so the same code fronts a JSON listing API as easily as an RSS feed. Point the path template at a JSON endpoint and add `application/json` is already accepted:
+The cache is content-agnostic: it stores whatever bytes and `Content-Type` the upstream returns (allowlisted to feed/JSON media types), so the same code fronts a JSON listing API as easily as an RSS feed. Point the path template at a JSON endpoint — `application/json` is already an accepted content type:
 
 ```sh
 UPSTREAM_BASE=https://api.example.com \

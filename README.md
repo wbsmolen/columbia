@@ -81,7 +81,7 @@ The gateway publishes its HPKE key material at two endpoints. `GET /ohttp-config
 | [`token-issuer/`](./token-issuer) | App Attest gated, blind-signs anonymous unlinkable tokens the relay verifies offline | the device id at issuance, never the spent token or the content fetched |
 
 - `ohttp-relay/` is a Node service with no dependencies. It forwards `message/ohttp-req` bodies to the gateway in a fresh request that carries no client headers and no `X-Forwarded-For`. As the one public surface it also carries the abuse controls (per-IP rate limiting, a concurrency cap, a strict request shape, and a pluggable client-auth hook), all keeping ephemeral state that is never logged. For the hardened topology it can run as the sole public hop, with the gateway and cache on internal ingress, and pass the gateway's public key config through to clients. See [SELFHOSTING.md](./SELFHOSTING.md). Its logs are RED metrics only.
-- `ohttp-gateway/` is a vendored copy of Cloudflare's [`privacy-gateway-server-go`](https://github.com/cloudflare/privacy-gateway-server-go) (BSD-3, the RFC 9458 reference gateway). The source is unmodified apart from two small env-gated access controls; everything else it does is configured at runtime through environment variables. Provenance and the required attribution live in [`ohttp-gateway/VENDORED.md`](./ohttp-gateway/VENDORED.md).
+- `ohttp-gateway/` is a vendored copy of Cloudflare's [`privacy-gateway-server-go`](https://github.com/cloudflare/privacy-gateway-server-go) (BSD-3, the RFC 9458 reference gateway). The source carries three small, env-gated additions (a relay-auth check, an endpoint guard, and an optional outbound rate limiter); everything else it does is configured at runtime through environment variables. Provenance, the full list of additions, and the required attribution live in [`ohttp-gateway/VENDORED.md`](./ohttp-gateway/VENDORED.md).
 - `commons-cache/` is another dependency-free Node service, an optional cache origin for public, sessionless content. It serves `X-Cache: HIT|MISS|STALE` with CDN-ready `Cache-Control` and `Age` headers.
 - `token-issuer/` is its own service. It runs Apple App Attest verification and blind-signs ([RFC 9474](https://www.rfc-editor.org/rfc/rfc9474)) anonymous tokens so the relay can require a genuine, rate-limited client without a login. It is the one component that learns a device identity; blinding prevents that identity from being linked to any finished token or to the content it is spent on. Verifying a spent token at the relay is offline against the issuer's published epoch public key. See [`token-issuer/PROTOCOL.md`](./token-issuer/PROTOCOL.md) for the wire format and [`token-issuer/README.md`](./token-issuer).
 
@@ -107,36 +107,47 @@ A CDN or WAF (for example a managed front door) can sit in front of the public r
 Prerequisites: [Docker](https://docs.docker.com/get-docker/) and OpenSSL. To run the full path on one machine:
 
 ```sh
-# 1. Generate the gateway's HPKE seed (32-byte hex). Keep this secret.
+# 0. Create a shared network so the containers can reach each other by name.
+docker network create columbia
+
+# 1. Generate the gateway's HPKE seed (32-byte hex) and a local test certificate.
+#    The self-signed cert + NODE_TLS_REJECT_UNAUTHORIZED below are local-testing
+#    only, never production — see SELFHOSTING.md for a real deployment.
 export SEED_SECRET_KEY="$(openssl rand -hex 32)"
+mkdir -p certs
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -keyout certs/key.pem -out certs/cert.pem -subj "/CN=gateway"
 
 # 2. Build and run the gateway. ALLOWED_TARGET_ORIGINS restricts what it may fetch.
 cd ohttp-gateway
 docker build -t columbia-gateway .
-docker run -d --name gateway -p 8080:8080 \
+docker run -d --name gateway --network columbia -p 8080:8080 \
+  -v "$(pwd)/../certs:/certs:ro" \
   -e PORT=8080 \
   -e SEED_SECRET_KEY="$SEED_SECRET_KEY" \
   -e LOG_SECRETS=false \
   -e ALLOWED_TARGET_ORIGINS="http://commons:8080" \
+  -e CERT=/certs/cert.pem \
+  -e KEY=/certs/key.pem \
   columbia-gateway
 
 # 3. Build and run the relay, pointed at the gateway.
 #    GATEWAY_URL must be https: the relay hard-exits on a plain-http value.
-#    See SELFHOSTING.md for presenting TLS to the gateway (local testing included).
 cd ../ohttp-relay
 docker build -t columbia-relay .
-docker run -d --name relay -p 8081:8080 \
+docker run -d --name relay --network columbia -p 8081:8080 \
   -e PORT=8080 \
   -e GATEWAY_URL="https://gateway:8080/gateway" \
+  -e NODE_TLS_REJECT_UNAUTHORIZED=0 \
   columbia-relay
 
 # 4. (Optional) Build and run the commons cache as the gateway's upstream target.
 cd ../commons-cache
 docker build -t columbia-commons .
-docker run -d --name commons -p 8082:8080 -e PORT=8080 columbia-commons
+docker run -d --name commons --network columbia -p 8082:8080 -e PORT=8080 columbia-commons
 ```
 
-> For the full walkthrough (a shared Docker network, generating and pinning the gateway key config, configuring the cache, and running the relay and gateway as separate operators so non-collusion holds), see [SELFHOSTING.md](./SELFHOSTING.md).
+> For the full walkthrough (generating and pinning the gateway key config, configuring the cache, and running the relay and gateway as separate operators so non-collusion holds), see [SELFHOSTING.md](./SELFHOSTING.md).
 
 An OHTTP client (any RFC 9458 library, for example one built on Apple CryptoKit or [`ohttp`](https://github.com/cloudflare/privacy-gateway-server-go)) seals a request against the gateway's published key config and POSTs the `message/ohttp-req` body to the relay. The relay hands back the encapsulated `message/ohttp-res`, which the client opens locally. The gateway publishes two key configs: a primary draft post-quantum suite (KEM `0x30`, `X25519+Kyber768-draft00`) and a legacy classical suite (KEM `0x20`, `DHKEM(X25519, HKDF-SHA256)`). A classical-only RFC 9458 client must select the legacy config; the primary config is a draft, non-RFC suite that not every client supports.
 
@@ -177,12 +188,13 @@ flowchart TD
     commons["commons-cache/: optional public-content cache origin (Node)"]
     commonsfiles["server.js, Dockerfile, deploy-ghcr.sh, README.md"]
     gateway["ohttp-gateway/: VENDORED Cloudflare OHTTP gateway (Go, BSD-3)"]
-    vendored["VENDORED.md: upstream repo + pinned commit + license note"]
-    gatewaysrc["… (unmodified upstream source + vendored Go deps)"]
+    vendored["VENDORED.md: upstream repo + pinned commit + local modifications"]
+    gatewaysrc["… (mostly-upstream source + vendored Go deps)"]
     relay["ohttp-relay/: OHTTP relay (Node)"]
     relayfiles["server.js, Dockerfile, README.md"]
     issuer["token-issuer/: App Attest + blind-RSA token issuer (Node)"]
     issuerfiles["server.js, appattest.js, PROTOCOL.md, Dockerfile, README.md"]
+    deploy["deploy/: optional reference deploy config, one example among many"]
 
     root --> readme
     root --> arch
@@ -200,6 +212,7 @@ flowchart TD
     relay --> relayfiles
     root --> issuer
     issuer --> issuerfiles
+    root --> deploy
 ```
 
 ## Standards
