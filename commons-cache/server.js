@@ -49,6 +49,15 @@ const UPSTREAM_UA = process.env.UPSTREAM_UA ||
 const MAX_ENTRIES = parseInt(process.env.COMMONS_MAX_ENTRIES || '5000', 10);     // cache bound (LRU)
 const MAX_BODY_BYTES = parseInt(process.env.COMMONS_MAX_BODY_BYTES || '5000000', 10); // reject oversized bodies
 
+// Imgur album resolution (/v1/imgur?id=<albumId>). imgur killed keyless album
+// access, but its OWN web client uses a public embed Client-ID (not a registered
+// app, not a secret - it ships in imgur.com's JS). We hold it HERE, server-side,
+// so the app never carries an imgur key. The route fetches the album's image
+// list and returns it normalized; cached like everything else (public, shared).
+const IMGUR_BASE = (process.env.IMGUR_BASE || 'https://api.imgur.com').replace(/\/+$/, '');
+const IMGUR_CLIENT_ID = process.env.IMGUR_CLIENT_ID || '546c25a59c58ad7';
+const IMGUR_ID_RE = /^[A-Za-z0-9]{1,15}$/; // imgur album ids are short alphanumerics
+
 // When true, on a cache MISS (or background revalidation) forward the INCOMING
 // request's Authorization header to the upstream fetch, so this cache can front
 // an upstream that requires an app-level credential to serve its PUBLIC listings.
@@ -245,6 +254,65 @@ async function getCachedFeed(id, sort, authHeader) {
   return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true };
 }
 
+// Imgur album: fetch the image list with the server-side public Client-ID and
+// normalize to { images: [{ url, type, w, h }] }. Never surfaces imgur error text.
+async function fetchImgurAlbum(id) {
+  const url = `${IMGUR_BASE}/3/album/${encodeURIComponent(id)}/images`;
+  const started = Date.now();
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': UPSTREAM_UA,
+        'Accept': 'application/json',
+        'Authorization': `Client-ID ${IMGUR_CLIENT_ID}`,
+      },
+      redirect: 'manual',                 // never follow a 3xx (SSRF guard)
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.status !== 200) return { status: res.status, error: true, ms: Date.now() - started };
+    const j = await res.json();
+    const images = (Array.isArray(j.data) ? j.data : [])
+      .map((i) => ({ url: i.link, type: i.type, w: i.width, h: i.height }))
+      .filter((x) => typeof x.url === 'string' && x.url.startsWith('https://'));
+    const body = Buffer.from(JSON.stringify({ images }));
+    if (body.length > MAX_BODY_BYTES) return { status: 200, error: true, ms: Date.now() - started };
+    return { status: 200, body, contentType: 'application/json', ms: Date.now() - started };
+  } catch {
+    return { status: 0, error: true, ms: Date.now() - started };
+  }
+}
+
+// Cached imgur album - same TTL / stale-while-revalidate / single-flight semantics
+// as getCachedFeed (public, shared bytes; keyed imgur/<id>, never per-caller).
+async function getCachedImgur(id) {
+  const key = `imgur/${id}`;
+  const now = Date.now();
+  const entry = cache.get(key);
+  if (entry) {
+    const age = now - entry.fetchedAt;
+    if (age < TTL_MS) return { ...entry, cacheState: 'HIT' };
+    if (age < TTL_MS + SWR_MS) {
+      if (!entry.revalidating) {
+        entry.revalidating = true;
+        fetchImgurAlbum(id)
+          .then((up) => { if (up.status === 200 && !up.error) cacheSet(key, { body: up.body, contentType: 'application/json', fetchedAt: Date.now(), upstreamStatus: 200, revalidating: false }); })
+          .catch(() => {})
+          .finally(() => { entry.revalidating = false; });
+      }
+      return { ...entry, cacheState: 'STALE' };
+    }
+  }
+  let promise = inflight.get(key);
+  const isLeader = !promise;
+  if (isLeader) { promise = fetchImgurAlbum(id).finally(() => inflight.delete(key)); inflight.set(key, promise); }
+  const up = await promise;
+  if (up.status === 200 && !up.error) {
+    if (isLeader) cacheSet(key, { body: up.body, contentType: 'application/json', fetchedAt: Date.now(), upstreamStatus: 200, revalidating: false });
+    return { body: up.body, contentType: 'application/json', fetchedAt: Date.now(), upstreamStatus: 200, cacheState: isLeader ? 'MISS' : 'COALESCED', upstreamMs: up.ms };
+  }
+  return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true };
+}
+
 async function handleProbe() {
   // Does this host reach the upstream's public surfaces? Try a few; report status only.
   const targets = [
@@ -350,9 +418,36 @@ const server = http.createServer(async (req, res) => {
           res.end(out.body);
         }
       }
+    } else if (route === '/v1/imgur') {
+      const id = (u.searchParams.get('id') || '').trim();
+      if (!IMGUR_ID_RE.test(id)) {
+        status = 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'require ?id=<imgur album id>' }));
+      } else {
+        const out = await getCachedImgur(id);
+        cacheState = out.cacheState;
+        if (out.upstreamError) {
+          status = 502; // fixed - never leak imgur status/body/error text
+          res.writeHead(status, { 'Content-Type': 'application/json', 'X-Cache': cacheState, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ error: 'upstream unavailable' }));
+        } else {
+          status = 200;
+          const ageS = out.fetchedAt ? Math.max(0, Math.floor((Date.now() - out.fetchedAt) / 1000)) : 0;
+          res.writeHead(status, {
+            'Content-Type': 'application/json',
+            'X-Cache': cacheState,
+            'X-Upstream-Status': String(out.upstreamStatus || 200),
+            'X-Content-Type-Options': 'nosniff',
+            'Cache-Control': `public, max-age=${Math.floor(TTL_MS / 1000)}, stale-while-revalidate=${Math.floor(SWR_MS / 1000)}`,
+            'Age': String(ageS),
+          });
+          res.end(out.body);
+        }
+      }
     } else {
       res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort='] }));
+      res.end(JSON.stringify({ error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort=', '/v1/imgur?id='] }));
     }
   } catch {
     // Fixed 500 - never place exception text into the response body.
