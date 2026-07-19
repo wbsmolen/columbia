@@ -1,8 +1,14 @@
 # Changelog
 
-Notable changes to Columbia. Releases are git tags; the most recent tagged release is `v1.4.1`.
+Notable changes to Columbia. Releases are git tags; the most recent tagged release is `v1.4.2`.
 
 ## Unreleased
+
+## v1.4.2 (2026-07-19)
+
+### Added
+
+- `commons-cache`: a second cache route, `GET /v1/imgur?id=<album-id>`, that resolves a public imgur album to its ordered image list. imgur ended keyless album access, so the route holds imgur's own **public** web-embed Client-ID server-side — the id that ships in imgur.com's JavaScript, a public embed id and not a secret — and fetches `GET /3/album/{id}/images` with it, so a downstream client resolves albums without carrying any imgur credential of its own. Normalizes to `{ images: [{ url, type, w, h }] }` and caches under `imgur/<id>` with the same TTL / stale-while-revalidate / single-flight semantics as `/v1/commons` (public, shared bytes, never keyed per caller). Album ids are validated against `[A-Za-z0-9]{1,15}`, redirects are never followed (SSRF guard), and any upstream failure returns a fixed `502` that never leaks imgur's status, body, or error text. Configurable via `IMGUR_BASE` and `IMGUR_CLIENT_ID`.
 
 ## v1.4.1 (2026-07-14)
 

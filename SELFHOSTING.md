@@ -169,6 +169,8 @@ docker run -d --name commons --network columbia -p 8082:8080 \
 | `COMMONS_MAX_ENTRIES` | `5000` | LRU bound on cached keys |
 | `COMMONS_MAX_BODY_BYTES` | `5000000` | reject and never cache an upstream body larger than this |
 | `FORWARD_UPSTREAM_AUTH` | `off` | when on, forward the incoming request's `Authorization` header to the upstream on a MISS or a background revalidate, for an upstream that gates its PUBLIC listings behind a credential. The header is NEVER part of the cache key, so a HIT serves the shared public bytes with no credential. Forward ONLY an anonymous, app-level credential, and ONLY for the public-listing path template. A per-user token would get its per-user response cached under `(id, sort)` and served to another caller (see the safety invariant in [`commons-cache/README.md`](./commons-cache/README.md)) |
+| `IMGUR_BASE` | `https://api.imgur.com` | imgur API origin the `GET /v1/imgur` album resolver fetches from (`https` only) |
+| `IMGUR_CLIENT_ID` | imgur's public web-embed id | `Client-ID` sent to the imgur API for `/v1/imgur`. Defaults to the public embed id that ships in imgur.com's JavaScript (public, not a secret); override to use your own registered Client-ID |
 | `REQUIRE_FDID` | (none) | when set, reject any request that did not arrive through the edge front door (see [Edge front door](#edge-front-door-cdn--waf)); the front door injects `X-Azure-FDID` and the cache checks it constant-time. Only `GET /health` is exempt. Unset disables the check |
 | `FDID_HEADER` | `x-azure-fdid` | name of the header the edge front door injects for the `REQUIRE_FDID` lock above; override for a non-Azure CDN or WAF that injects a differently named header |
 
@@ -307,7 +309,7 @@ To stop someone from bypassing the front door and hitting the origin host direct
 - `GET /health` is exempt on both services, so the platform's in-environment health probe still passes.
 - The issuer also exempts `GET /issuer-keys`, because the relay fetches it directly, in-environment, and it is public key material.
 - Every other route requires the header: `POST /relay` and `GET /ohttp-configs` on the relay, and `POST /issue` on the issuer.
-- The commons cache implements the same `REQUIRE_FDID` lock. It runs on internal ingress by default (see [Single public surface](#single-public-surface-internal-gateway-and-commons)), but a deployment that exposes it publicly instead sets `REQUIRE_FDID` on it to the same identifier so the front door pins it too. On the cache only `GET /health` is exempt; `GET /v1/commons` and `GET /v1/probe` require the header.
+- The commons cache implements the same `REQUIRE_FDID` lock. It runs on internal ingress by default (see [Single public surface](#single-public-surface-internal-gateway-and-commons)), but a deployment that exposes it publicly instead sets `REQUIRE_FDID` on it to the same identifier so the front door pins it too. On the cache only `GET /health` is exempt; `GET /v1/commons`, `GET /v1/probe`, and `GET /v1/imgur` require the header.
 
 This pairs with the single-public-surface posture above: by default the gateway and commons cache are internal, while the relay and issuer face the internet only through the front door. A deployment that instead exposes the commons cache publicly fronts it with the same origin lock.
 

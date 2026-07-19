@@ -12,6 +12,7 @@ This service is the cache origin at the end of the operator-blind path (`relay -
 | `GET /health` | liveness |
 | `GET /v1/probe` | diagnostic: can this host reach the configured upstream surfaces? Reports status codes only |
 | `GET /v1/commons?id=<feed-id>&sort=<sort>` | cached public feed, TTL plus stale-while-revalidate, `X-Cache: HIT\|MISS\|STALE` plus `X-Upstream-Status` |
+| `GET /v1/imgur?id=<album-id>` | resolves a public imgur album to its ordered image list, cached; uses imgur's own public web-embed Client-ID held server-side so callers carry no imgur credential. See [Imgur album resolution](#imgur-album-resolution-v1imgur) |
 
 ## Caching behavior
 - TTL (`COMMONS_TTL_MS`, default `60000`, 60s): the fresh window, served as `X-Cache: HIT`.
@@ -37,6 +38,14 @@ Some public JSON APIs still require an app-level credential on the request even 
 >
 > **Never widen `UPSTREAM_PATH_TEMPLATE` to an arbitrary or per-user/private path.** If you did, one caller's private response would be cached under `(id, sort)` and served to a different caller: a cross-user data leak. Forward-auth caching-by-path is safe *only* for public listings.
 
+## Imgur album resolution (`/v1/imgur`)
+
+A second worked example of the same operator-blind cache pattern, aimed at a concrete public API instead of a feed. imgur ended keyless album access, but imgur's own web embed uses a **public** Client-ID that ships in imgur.com's JavaScript — a public embed id, not a registered app and not a secret. Holding that id **server-side** lets a downstream client resolve public imgur albums without carrying any imgur credential of its own.
+
+`GET /v1/imgur?id=<album-id>` fetches `GET {IMGUR_BASE}/3/album/{id}/images` with the Client-ID, normalizes the response to `{ images: [{ url, type, w, h }] }`, and caches it under `imgur/<id>` with the same TTL / stale-while-revalidate / single-flight semantics as `/v1/commons` — public, shared bytes, never keyed per caller. Album ids are validated against `[A-Za-z0-9]{1,15}` before use and redirects are never followed (SSRF guards). On any upstream failure the route returns a fixed `502`; imgur's status, body, and error text never reach the caller. Reached through the OHTTP relay like every other route, it stays operator-blind.
+
+Point `IMGUR_CLIENT_ID` at your own registered Client-ID to use one instead of the public embed default.
+
 ## Configuration
 | Env var | Default | Purpose |
 |---|---|---|
@@ -49,6 +58,8 @@ Some public JSON APIs still require an app-level credential on the request even 
 | `COMMONS_MAX_ENTRIES` | `5000` | LRU bound on cached keys; the oldest insertion is evicted past this |
 | `COMMONS_MAX_BODY_BYTES` | `5000000` | reject and never cache an upstream body larger than this (memory-DoS guard) |
 | `FORWARD_UPSTREAM_AUTH` | `false` | when `true`, forward the incoming request's `Authorization` header to the upstream on a MISS/revalidation (for upstreams that gate public listings behind an anonymous app-level credential). The header is **never** part of the cache key; a HIT serves shared public bytes with no credential. Safe **only** for the public-listing path template. See the safety invariant above. |
+| `IMGUR_BASE` | `https://api.imgur.com` | imgur API origin the `/v1/imgur` album resolver fetches from (https only) |
+| `IMGUR_CLIENT_ID` | imgur's public web-embed id | `Client-ID` sent to the imgur API for `/v1/imgur`. Defaults to the public embed id that ships in imgur.com's JavaScript (public, not a secret); override to use your own registered Client-ID |
 | `REQUIRE_FDID` | (none) | front-door origin lock. When set, reject any request that did not arrive through the edge front door, which injects `X-Azure-FDID`; the cache checks that header constant-time and 403s a mismatch. Only `GET /health` is exempt. Unset disables the check. See below. |
 | `FDID_HEADER` | `x-azure-fdid` | name of the header the edge front door injects for the `REQUIRE_FDID` lock above; override for a non-Azure CDN or WAF that injects a differently named header |
 
