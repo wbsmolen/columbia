@@ -10,6 +10,9 @@
 //   (c) a different Authorization on the same (id, sort) shares the one cache entry
 //   (d) a JSON body/content-type passes through byte-for-byte
 //   (e) RSS mode still works (backward compatible)
+//   (f) cold single-flight: concurrent misses coalesce onto one upstream fetch
+//   (g-j) /v1/imgur: album normalization (https-only, imgur {data:[…]} -> {images:[…]}),
+//         cache HIT with no re-fetch, id-validation/SSRF 400, and upstream-failure 502 with no leak
 
 import http from 'node:http';
 import assert from 'node:assert/strict';
@@ -44,6 +47,27 @@ process.env.UPSTREAM_BASE = `http://127.0.0.1:${mockPort}`;
 process.env.UPSTREAM_PATH_TEMPLATE = '/{id}/{sort}';
 process.env.FORWARD_UPSTREAM_AUTH = 'true';
 process.env.COMMONS_TTL_MS = '60000'; // keep HITs fresh through the whole test
+
+// --- mock imgur API: the /v1/imgur route fetches IMGUR_BASE/3/album/{id}/images,
+//     separate from UPSTREAM_BASE. 'failalbum' returns a non-200 to exercise the
+//     fixed-502-no-leak path; 'goodalbum' returns imgur's {data:[{link,...}]} shape. ---
+let imgurHits = 0;
+const imgurMock = http.createServer((req, res) => {
+  imgurHits++;
+  if (req.url.includes('/3/album/failalbum/images')) {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: false, status: 500, data: { error: 'imgur boom' } }));
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ success: true, status: 200, data: [
+    { link: 'https://i.imgur.com/a1.jpeg', type: 'image/jpeg', width: 800, height: 600 },
+    { link: 'https://i.imgur.com/a2.png', type: 'image/png', width: 100, height: 100 },
+    { link: 'http://i.imgur.com/insecure.gif', type: 'image/gif', width: 50, height: 50 }, // dropped: https-only
+  ] }));
+});
+await new Promise((r) => imgurMock.listen(0, '127.0.0.1', r));
+process.env.IMGUR_BASE = `http://127.0.0.1:${imgurMock.address().port}`;
 
 const { server } = (await import('./server.js')).default;
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -105,12 +129,42 @@ try {
   assert.equal(results.filter((x) => x.xcache === 'MISS').length, 1, 'f: exactly one MISS (the leader)');
   assert.equal(results.filter((x) => x.xcache === 'COALESCED').length, 11, 'f: the other 11 COALESCED onto it');
 
-  console.log('PASS: all commons-cache self-tests passed (a-f)');
+  // (g) imgur MISS: fetch imgur once and normalize {data:[{link,type,width,height}]}
+  //     -> {images:[{url,type,w,h}]}, keeping https-only urls in order.
+  r = await get('/v1/imgur?id=goodalbum');
+  assert.equal(r.status, 200, 'g: 200');
+  assert.equal(r.xcache, 'MISS', 'g: X-Cache MISS');
+  assert.equal(imgurHits, 1, 'g: MISS hits imgur exactly once');
+  const alb = JSON.parse(r.body);
+  assert.equal(alb.images.length, 2, 'g: 3 imgur items -> 2 https images (http dropped)');
+  assert.deepEqual(alb.images[0], { url: 'https://i.imgur.com/a1.jpeg', type: 'image/jpeg', w: 800, h: 600 }, 'g: link/type/width/height mapped to url/type/w/h');
+  assert.equal(alb.images[1].url, 'https://i.imgur.com/a2.png', 'g: second https image kept, in order');
+  assert.ok(!alb.images.some((i) => String(i.url).startsWith('http://')), 'g: non-https image filtered out');
+
+  // (h) imgur HIT: a second read serves cached bytes with no second imgur fetch.
+  r = await get('/v1/imgur?id=goodalbum');
+  assert.equal(r.status, 200, 'h: 200');
+  assert.equal(r.xcache, 'HIT', 'h: X-Cache HIT');
+  assert.equal(imgurHits, 1, 'h: HIT does NOT re-fetch imgur');
+
+  // (i) imgur id validation is the SSRF guard (id is interpolated into the imgur
+  //     path): a malformed id is 400'd BEFORE any upstream fetch.
+  r = await get('/v1/imgur?id=bad!id');
+  assert.equal(r.status, 400, 'i: malformed id -> 400');
+  assert.equal(imgurHits, 1, 'i: rejected id never touches imgur');
+
+  // (j) imgur upstream failure -> fixed 502 that never leaks imgur status/body/error.
+  r = await get('/v1/imgur?id=failalbum');
+  assert.equal(r.status, 502, 'j: upstream non-200 -> 502');
+  assert.ok(!/imgur boom/.test(r.body), 'j: imgur error text never leaks downstream');
+
+  console.log('PASS: all commons-cache self-tests passed (a-j)');
 } catch (err) {
   failed = true;
   console.error('FAIL:', err.message);
 } finally {
   server.close();
   mock.close();
+  imgurMock.close();
   process.exit(failed ? 1 : 0);
 }
