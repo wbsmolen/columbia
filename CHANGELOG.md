@@ -4,6 +4,10 @@ Notable changes to Columbia. Releases are git tags; the most recent tagged relea
 
 ## Unreleased
 
+### Changed
+
+- `ohttp-relay`, `commons-cache`, `token-issuer`: successful `GET /health` probe hits are no longer logged. At platform probe cadence they were ~315k log rows/day (~98% of all console-log ingestion) drowning the real RED signal and billing Log Analytics for noise. Failing probes remain observable (they never reach the success branch, and the platform records its own probe events). `LOG_HEALTH=1` re-enables success logging for a debugging session.
+
 ## v1.4.2 (2026-07-19)
 
 ### Added

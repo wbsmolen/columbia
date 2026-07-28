@@ -454,7 +454,14 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('ok');
-    log({ route: '/health', status: 200, durationMs: Date.now() - start });
+    // Successful platform probes are NOT logged: at Container Apps probe
+    // cadence they were ~125k rows/day/replica of pure Log Analytics
+    // ingestion cost drowning the real RED signal. LOG_HEALTH=1 re-enables
+    // for a debugging session. (A failing probe never reaches this branch,
+    // so failures remain observable via the platform's own probe events.)
+    if (process.env.LOG_HEALTH === '1') {
+      log({ route: '/health', status: 200, durationMs: Date.now() - start });
+    }
     return;
   }
 

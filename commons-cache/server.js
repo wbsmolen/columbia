@@ -457,7 +457,12 @@ const server = http.createServer(async (req, res) => {
   }
 
   // RED metric - route TEMPLATE only, no IPs, no query values, no bodies.
-  log({ route, method: req.method, status, cache: cacheState, durationMs: Date.now() - started });
+  // Successful platform probes are NOT logged (they were ~80k rows/day of
+  // Log Analytics ingestion drowning the real signal); LOG_HEALTH=1
+  // re-enables for a debugging session. Non-200 health responses still log.
+  if (route !== '/health' || status !== 200 || process.env.LOG_HEALTH === '1') {
+    log({ route, method: req.method, status, cache: cacheState, durationMs: Date.now() - started });
+  }
 });
 
 // Production runs `node server.js` directly, so require.main === module: the SSRF

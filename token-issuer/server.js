@@ -590,7 +590,12 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('ok');
-    log({ route: '/health', status: 200, durationMs: Date.now() - start });
+    // Successful platform probes are NOT logged (~110k rows/day of Log
+    // Analytics ingestion drowning the real signal); LOG_HEALTH=1 re-enables
+    // for a debugging session. Failing probes never reach this branch.
+    if (process.env.LOG_HEALTH === '1') {
+      log({ route: '/health', status: 200, durationMs: Date.now() - start });
+    }
     return;
   }
 
