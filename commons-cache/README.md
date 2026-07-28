@@ -62,6 +62,7 @@ Point `IMGUR_CLIENT_ID` at your own registered Client-ID to use one instead of t
 | `IMGUR_CLIENT_ID` | imgur's public web-embed id | `Client-ID` sent to the imgur API for `/v1/imgur`. Defaults to the public embed id that ships in imgur.com's JavaScript (public, not a secret); override to use your own registered Client-ID |
 | `REQUIRE_FDID` | (none) | front-door origin lock. When set, reject any request that did not arrive through the edge front door, which injects `X-Azure-FDID`; the cache checks that header constant-time and 403s a mismatch. Only `GET /health` is exempt. Unset disables the check. See below. |
 | `FDID_HEADER` | `x-azure-fdid` | name of the header the edge front door injects for the `REQUIRE_FDID` lock above; override for a non-Azure CDN or WAF that injects a differently named header |
+| `LOG_HEALTH` | unset | successful `GET /health` probe hits are not logged (at platform probe cadence they are almost all log volume, drowning the RED signal); set `1` to log them again for a debugging session. Failing probes are unaffected |
 
 ### Front-door origin lock (`REQUIRE_FDID`)
 
