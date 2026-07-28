@@ -104,6 +104,22 @@ A CDN or WAF (for example a managed front door) can sit in front of the public r
 
 ## Quickstart
 
+### Homebrew (macOS)
+
+```sh
+brew tap wbsmolen/columbia
+brew install columbia
+
+columbia commons            # or: relay | gateway | issuer
+```
+
+One `columbia` launcher runs any of the four services; each is configured by
+the environment variables in its service README (and [SELFHOSTING.md](./SELFHOSTING.md)).
+Running everything on one machine is for development only — the operator-blind
+guarantee requires the relay and gateway under separate, non-colluding operators.
+
+### Docker
+
 Prerequisites: [Docker](https://docs.docker.com/get-docker/) and OpenSSL. To run the full path on one machine:
 
 ```sh
