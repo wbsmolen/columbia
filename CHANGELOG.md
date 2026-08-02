@@ -4,6 +4,22 @@ Notable changes to Columbia. Releases are git tags; the most recent tagged relea
 
 ## Unreleased
 
+### Fixed
+
+- `ohttp-gateway`: a target response body that fails **mid-read** (e.g. the target resets the connection while streaming) now yields an inner (encapsulated) `500` instead of `400`, on both the binary-HTTP and protobuf paths. Clients fail open on 5xx but treat 4xx as a hard error, so the old mapping turned transient upstream hiccups into user-visible failures. Request-decode failures still return `400`. Covered by regression tests in `handler_test.go`.
+- `ohttp-relay`: an error on the gateway **response** stream was an unhandled `'error'` event that killed the whole process; it is now handled (502 to the client, in-flight slot released, `reason: 'gres_error'` logged). Top-level `uncaughtException`/`unhandledRejection` handlers log a structured trace before exiting non-zero, so a crash always leaves evidence.
+- `ohttp-relay`: 502s are now attributable — the gateway-request error path logs `reason`, `err.code`, and whether the socket was reused (`gw_error`), and the oversize-response path logs `reason: 'resp_too_large'` with the byte count, instead of discarding the error object.
+
+### Changed
+
+- `ohttp-gateway`: the upstream `http.Client` now has a 30s `Timeout` (was unbounded), so a stalled target can't pin a gateway worker forever.
+- `ohttp-relay`: the relay→gateway hop uses a keep-alive `https.Agent` (`maxSockets: 128`) instead of a fresh TLS handshake per request, and retries a gateway `POST` **exactly once** on a fresh socket when a kept-alive socket is reset by the peer (`ECONNRESET` on a reused socket, nothing sent to the client yet — safe because the request body is fully buffered). Retries are logged as `reason: 'gw_retry'`.
+- `ohttp-relay`: `MAX_RESP_BYTES` default raised from 1 MB to 5 MB — large comment threads legitimately exceeded the old cap. The env override is unchanged.
+
+### Added
+
+- `ohttp-relay/test.mjs`: dependency-free self-test (mirrors `commons-cache/test.mjs`, `node test.mjs`) driving the real `server.js` against an in-process mock https gateway: happy path, RST-on-reused-socket → single retry → success, mid-response gateway error → 502 without crashing, and in-flight-slot release afterwards.
+
 ## v1.4.3 (2026-07-28)
 
 ### Changed

@@ -118,7 +118,7 @@ docker run -d --name relay --network columbia -p 8081:8080 \
 | `GATEWAY_URL` | yes | full gateway endpoint, e.g. `https://<gateway-host>/gateway` (must be `https`) |
 | `PORT` | `8080` | listen port |
 | `MAX_BODY_BYTES` | `65536` | cap on the inbound ciphertext body buffered per request |
-| `MAX_RESP_BYTES` | `1000000` | cap on the gateway response buffered per request |
+| `MAX_RESP_BYTES` | `5000000` | cap on the gateway response buffered per request |
 | `GW_TIMEOUT_MS` | `15000` | timeout on the relay-to-gateway request |
 | `RATE_LIMIT_RPM` | `120` | per-IP requests per minute; `0` disables per-IP limiting |
 | `RATE_WINDOW_MS` | `60000` | length of the fixed rate-limit window |

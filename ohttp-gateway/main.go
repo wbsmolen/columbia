@@ -19,6 +19,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/chris-wood/ohttp-go"
 	"github.com/cloudflare/circl/hpke"
@@ -292,7 +293,9 @@ func main() {
 
 	// Create the default HTTP handler
 	httpHandler := FilteredHttpRequestHandler{
-		client:         HTTPClientRequestHandler{client: &http.Client{}},
+		// Timeout bounds the WHOLE upstream exchange (connect + headers + body) so a
+		// stalled target can't pin a gateway worker forever.
+		client:         HTTPClientRequestHandler{client: &http.Client{Timeout: 30 * time.Second}},
 		allowedOrigins: allowedOrigins,
 		targetRewrites: targetRewrites,
 		limiter:        limiter,

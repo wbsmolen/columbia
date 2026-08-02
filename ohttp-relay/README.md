@@ -94,7 +94,7 @@ No IP, no content, no headers, no target. `route` is a fixed template.
 | `RATE_MAX_KEYS` | `100000` | per-IP rate-limit bucket memory bound |
 | `MAX_INFLIGHT` | `256` | global cap on concurrent relays; further requests get a 429 |
 | `MAX_BODY_BYTES` | `65536` | request body size cap |
-| `MAX_RESP_BYTES` | `1000000` | gateway response size cap |
+| `MAX_RESP_BYTES` | `5000000` | gateway response size cap |
 | `GW_TIMEOUT_MS` | `15000` | timeout for a relay→gateway request |
 | `CONFIG_TTL_MS` | `120000` | how long the `GET /ohttp-configs` passthrough response is cached |
 | `TRUSTED_CLIENT_IP_HEADER` | _(empty)_ | header a trusted front proxy sets to the real client IP (e.g. `x-azure-clientip`, `cf-connecting-ip`). Set it whenever a request crosses more than one proxy (front proxy + platform ingress), or every client collapses into one rate-limit bucket. Empty keeps single-proxy rightmost-`X-Forwarded-For` behaviour |

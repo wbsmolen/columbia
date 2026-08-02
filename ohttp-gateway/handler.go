@@ -229,13 +229,15 @@ func (h ProtoHTTPAppHandler) Handle(binaryRequest []byte, metrics Metrics) ([]by
 	protoResponse, err := responseToProtoHTTP(httpResponse)
 	if err != nil {
 		metrics.Fire(metricsResultResponseTranslationFailed)
-		return h.wrappedError(PayloadMarshallingError, metrics)
+		// Response-side failure (e.g. the target's body errored mid-read): this is
+		// an upstream/server problem, not a bad client request, so surface 500.
+		return h.wrappedError(GatewayInternalServerError, metrics)
 	}
 
 	marshalledProtoResponse, err := proto.Marshal(protoResponse)
 	if err != nil {
 		metrics.Fire(metricsResultContentEncodingFailed)
-		return h.wrappedError(PayloadMarshallingError, metrics)
+		return h.wrappedError(GatewayInternalServerError, metrics)
 	}
 	metrics.Fire(metricsPayloadStatusPrefix + "200")
 	var r error = nil
@@ -284,7 +286,9 @@ func (h BinaryHTTPAppHandler) Handle(binaryRequest []byte, metrics Metrics) ([]b
 	binaryRespEnc, err := binaryResp.Marshal()
 	if err != nil {
 		metrics.Fire(metricsResultContentEncodingFailed)
-		return h.wrappedError(PayloadMarshallingError, metrics)
+		// Marshal reads the target response body; a mid-read failure is an
+		// upstream/server problem, not a bad client request, so surface 500.
+		return h.wrappedError(GatewayInternalServerError, metrics)
 	}
 
 	metrics.Fire(metricsPayloadStatusPrefix + "200")

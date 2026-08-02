@@ -24,7 +24,8 @@ const GATEWAY = process.env.GATEWAY_URL; // e.g. https://<gateway-host>/gateway
 // DoS bounds: cap how much we buffer in either direction so a single connection
 // can't exhaust relay memory. Both are overridable via env.
 const MAX_BODY = parseInt(process.env.MAX_BODY_BYTES || '65536', 10);
-const MAX_RESP_BYTES = parseInt(process.env.MAX_RESP_BYTES || '1000000', 10);
+// 5 MB: large comment threads legitimately exceed the old 1 MB cap.
+const MAX_RESP_BYTES = parseInt(process.env.MAX_RESP_BYTES || '5000000', 10);
 const GW_TIMEOUT_MS = parseInt(process.env.GW_TIMEOUT_MS || '15000', 10);
 
 // --- Abuse controls (all in-memory, ephemeral, NEVER logged) ----------------
@@ -121,6 +122,11 @@ if (gw.protocol !== 'https:') {
   process.exit(1);
 }
 const GW_PORT = gw.port || 443; // honor a non-default port instead of hardcoding 443
+
+// Keep-alive pool for the relay→gateway hop (always https, enforced above).
+// Reusing sockets avoids a TCP+TLS handshake per relay request; maxSockets
+// bounds the pool (excess requests queue on the agent).
+const gwAgent = new https.Agent({ keepAlive: true, maxSockets: 128 });
 
 // The gateway's /ohttp-configs URL, derived from GATEWAY_URL (same host) unless
 // explicitly overridden. The relay reaches the gateway at the same host whether
@@ -396,6 +402,7 @@ function serveConfig(res, start) {
     path: cfgGw.pathname,
     method: 'GET',
     timeout: GW_TIMEOUT_MS,
+    agent: gwAgent, // same host as the gateway POST, share the keep-alive pool
   };
   const creq = https.request(opts, (cres) => {
     const cc = [];
@@ -535,62 +542,102 @@ const server = http.createServer((req, res) => {
   });
   req.on('end', () => {
     if (aborted) return;
-    const body = Buffer.concat(chunks);
+    forwardToGateway(Buffer.concat(chunks), res, start, releaseSlot, false);
+  });
+});
 
-    // Forward ONLY the opaque ciphertext + its content type. Deliberately send a
-    // fresh request with NO client headers, NO X-Forwarded-For - the gateway must
-    // not learn who the client is. The ONLY additional header is the relay→gateway
-    // shared secret, which identifies the RELAY (not the client) so the gateway
-    // can refuse traffic that didn't come through us.
-    const outHeaders = { 'Content-Type': 'message/ohttp-req', 'Content-Length': body.length };
-    if (RELAY_GATEWAY_SECRET) outHeaders[RELAY_GATEWAY_HEADER] = RELAY_GATEWAY_SECRET;
-    const opts = {
-      hostname: gw.hostname,
-      port: GW_PORT,
-      path: gw.pathname,
-      method: 'POST',
-      timeout: GW_TIMEOUT_MS,
-      headers: outHeaders,
-    };
-    const greq = https.request(opts, (gres) => {
-      const rc = [];
-      let rcLen = 0;
-      let respAborted = false;
-      gres.on('data', (d) => {
-        if (respAborted) return;
-        rcLen += d.length;
-        if (rcLen > MAX_RESP_BYTES) {
-          // Gateway response too large: drop it and fail closed.
-          respAborted = true;
-          gres.destroy();
-          if (!res.headersSent) { res.writeHead(502); res.end(); }
-          log({ route: '/relay', status: 502, durationMs: Date.now() - start });
-          releaseSlot();
-          return;
-        }
-        rc.push(d);
-      });
-      gres.on('end', () => {
-        if (respAborted) return;
-        const rb = Buffer.concat(rc);
-        // Pin the response content-type - never echo the gateway's header back.
-        res.writeHead(gres.statusCode || 502, { 'Content-Type': 'message/ohttp-res' });
-        res.end(rb);
-        log({ route: '/relay', status: gres.statusCode || 502, durationMs: Date.now() - start });
+// Forward the (fully buffered) ciphertext to the gateway and stream the answer
+// back to the client. Forward ONLY the opaque ciphertext + its content type.
+// Deliberately send a fresh request with NO client headers, NO X-Forwarded-For -
+// the gateway must not learn who the client is. The ONLY additional header is the
+// relay→gateway shared secret, which identifies the RELAY (not the client) so the
+// gateway can refuse traffic that didn't come through us.
+//
+// isRetry: because the body is a complete in-memory Buffer (never a stream), a
+// resend is always safe; we retry ONCE when a kept-alive socket was reset by the
+// gateway (the classic keep-alive race: the server closed the idle socket just as
+// we reused it).
+function forwardToGateway(body, res, start, releaseSlot, isRetry) {
+  const outHeaders = { 'Content-Type': 'message/ohttp-req', 'Content-Length': body.length };
+  if (RELAY_GATEWAY_SECRET) outHeaders[RELAY_GATEWAY_HEADER] = RELAY_GATEWAY_SECRET;
+  const opts = {
+    hostname: gw.hostname,
+    port: GW_PORT,
+    path: gw.pathname,
+    method: 'POST',
+    timeout: GW_TIMEOUT_MS,
+    headers: outHeaders,
+    agent: gwAgent,
+  };
+  const greq = https.request(opts, (gres) => {
+    const rc = [];
+    let rcLen = 0;
+    let respAborted = false;
+    gres.on('data', (d) => {
+      if (respAborted) return;
+      rcLen += d.length;
+      if (rcLen > MAX_RESP_BYTES) {
+        // Gateway response too large: drop it and fail closed.
+        respAborted = true;
+        gres.destroy();
+        if (!res.headersSent) { res.writeHead(502); res.end(); }
+        log({ route: '/relay', status: 502, reason: 'resp_too_large', bytes: rcLen, durationMs: Date.now() - start });
         releaseSlot();
-      });
+        return;
+      }
+      rc.push(d);
     });
-    greq.on('timeout', () => {
-      greq.destroy(new Error('gw timeout'));
-    });
-    greq.on('error', () => {
-      if (!res.headersSent) { res.writeHead(502); res.end(); }
-      log({ route: '/relay', status: 502, durationMs: Date.now() - start });
+    gres.on('end', () => {
+      if (respAborted) return;
+      const rb = Buffer.concat(rc);
+      // Pin the response content-type - never echo the gateway's header back.
+      res.writeHead(gres.statusCode || 502, { 'Content-Type': 'message/ohttp-res' });
+      res.end(rb);
+      log({ route: '/relay', status: gres.statusCode || 502, durationMs: Date.now() - start });
       releaseSlot();
     });
-    greq.write(body);
-    greq.end();
+    // The gateway reset/errored MID-response. Without this handler that is an
+    // unhandled 'error' event, which kills the whole process.
+    gres.on('error', (err) => {
+      if (respAborted) return;
+      respAborted = true;
+      greq.destroy();
+      if (!res.headersSent) { res.writeHead(502); res.end(); }
+      log({ route: '/relay', status: 502, reason: 'gres_error', code: err.code, durationMs: Date.now() - start });
+      releaseSlot();
+    });
   });
+  greq.on('timeout', () => {
+    greq.destroy(new Error('gw timeout'));
+  });
+  greq.on('error', (err) => {
+    // Keep-alive race: the gateway closed the pooled socket just as we reused it.
+    // Nothing was delivered, the body is fully buffered - retry once, fresh socket.
+    if (!isRetry && err.code === 'ECONNRESET' && greq.reusedSocket && !res.headersSent) {
+      log({ route: '/relay', reason: 'gw_retry', code: err.code, durationMs: Date.now() - start });
+      forwardToGateway(body, res, start, releaseSlot, true);
+      return;
+    }
+    if (!res.headersSent) { res.writeHead(502); res.end(); }
+    log({ route: '/relay', status: 502, reason: 'gw_error', code: err.code, reused: greq.reusedSocket, durationMs: Date.now() - start });
+    releaseSlot();
+  });
+  greq.write(body);
+  greq.end();
+}
+
+// Crash forensics: an uncaught throw or unhandled rejection used to kill the
+// process with NOTHING in the structured log stream. Log a trace first, then
+// exit non-zero so the platform restarts the replica. Nothing request-derived
+// is logged - just the error itself.
+process.on('uncaughtException', (err) => {
+  log({ event: 'uncaught_exception', code: err && err.code, message: err && err.message, stack: err && err.stack });
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  const e = reason instanceof Error ? reason : new Error(String(reason));
+  log({ event: 'unhandled_rejection', code: e.code, message: e.message, stack: e.stack });
+  process.exit(1);
 });
 
 // Connection-level timeouts so slow-loris style clients can't pin sockets open.
