@@ -4,7 +4,11 @@ Notable changes to Columbia. Releases are git tags; the most recent tagged relea
 
 ## Unreleased
 
-_Nothing yet._
+### Documentation
+
+- Caught the docs up to what v1.4.4 actually shipped. `ROADMAP.md` (h) "Retries and resilience" moves from ⬜ to 🟡: the relay→gateway keep-alive retry, the gateway's inner-`500` mapping that lets a client fail open, the bounded upstream timeout, and the relay's crash-safety all landed; the gateway's fetch to the target and the cache's fetch upstream are still single-attempt, the one retry has no backoff or jitter, and nothing circuit-breaks. (g) is unchanged and still fully open.
+- Corrected a claim that had drifted again: the vendored gateway's local modifications are no longer three env-gated additions. v1.4.4 patched the vendored Go source unconditionally in two places — the response-side `400`→`500` mapping in `handler.go` and the bounded `http.Client` timeout in `main.go` — plus a Columbia-added `handler_test.go`. `ohttp-gateway/VENDORED.md` now lists four deviations and describes both behavior fixes; `README.md` and `ROADMAP.md` no longer say the source carries only the three env-gated additions.
+- Documented the relay's failure `reason` vocabulary (`gw_error`, `gres_error`, `resp_too_large`, `gw_retry`) and its crash log in `ohttp-relay/README.md`, `ARCHITECTURE.md`, `README.md`, and `ROADMAP.md`'s observability bullet, all of which still described the relay log line as only `{ts, route, status, durationMs}`. Also noted the keep-alive pool and the one-shot retry in the relay README's forwarding section.
 
 ## v1.4.4 - 2026-08-02
 

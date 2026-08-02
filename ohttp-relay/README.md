@@ -66,6 +66,8 @@ When it relays to the gateway, the service builds a fresh request and sends only
 
 It leaves out every client header and never adds `X-Forwarded-For`, so the gateway can't learn the client's IP. (See `server.js`. That omission is the security property, not an oversight.)
 
+That fresh request goes out over a keep-alive pool rather than a new TLS handshake per request, and is retried exactly once, on a new socket, if a pooled socket is reset by the gateway before anything has been sent back to the client. The body is fully buffered, so replaying it is safe; nothing else is retried.
+
 ## Observability
 
 RED metrics only, structured JSON to stdout:
@@ -75,6 +77,17 @@ RED metrics only, structured JSON to stdout:
 ```
 
 No IP, no content, no headers, no target. `route` is a fixed template.
+
+A failure adds a bounded `reason` and the underlying error `code`, so a 502 is attributable:
+
+| `reason` | Meaning |
+|---|---|
+| `gw_error` | the request to the gateway errored; also logs `reused` (whether the socket came from the keep-alive pool) |
+| `gres_error` | the gateway errored part-way through its response |
+| `resp_too_large` | the gateway response exceeded `MAX_RESP_BYTES`; also logs `bytes` |
+| `gw_retry` | a reused socket was reset, so the request was retried once on a fresh socket |
+
+An uncaught exception or unhandled rejection logs `{event, code, message, stack}` and exits non-zero, so a crash always leaves evidence. Every one of these describes the relay-to-gateway hop; none of it is derived from the client or the request.
 
 ## Configuration
 
