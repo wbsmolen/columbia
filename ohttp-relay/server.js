@@ -37,7 +37,7 @@ const RATE_WINDOW_MS = parseInt(process.env.RATE_WINDOW_MS || '60000', 10); // w
 const MAX_INFLIGHT   = parseInt(process.env.MAX_INFLIGHT   || '256', 10);   // global concurrent relays
 const RATE_MAX_KEYS  = parseInt(process.env.RATE_MAX_KEYS  || '100000', 10);// bound limiter memory
 // TRUSTED_CLIENT_IP_HEADER: name of a header that a TRUSTED front proxy sets to
-// the real client IP (e.g. 'x-azure-clientip' behind Azure Front Door,
+// the real client IP (e.g. 'x-azure-socketip' behind Azure Front Door,
 // 'cf-connecting-ip' behind Cloudflare, 'true-client-ip' behind some CDNs).
 // REQUIRED whenever the request passes through MORE THAN ONE proxy before the
 // relay: with a multi-proxy chain (front proxy + platform ingress) the rightmost
