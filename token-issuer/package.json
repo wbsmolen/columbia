@@ -11,7 +11,7 @@
     "test": "node --test"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "dependencies": {
     "@cloudflare/blindrsa-ts": "0.4.6"
