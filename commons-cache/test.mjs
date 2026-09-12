@@ -23,6 +23,8 @@ const RSS_PAYLOAD = '<rss><channel><title>mock</title></channel></rss>';
 // --- mock upstream: records every hit + the Authorization it saw, routes by id ---
 let upstreamHits = 0;
 let lastAuth;
+let releaseSlowResponse;
+let slowRequestsReceived = 0;
 const mock = http.createServer((req, res) => {
   upstreamHits++;
   lastAuth = req.headers['authorization'];
@@ -35,9 +37,12 @@ const mock = http.createServer((req, res) => {
       res.end(JSON_PAYLOAD);
     }
   };
-  // 'slowsub' responds after a delay so concurrent requests overlap the in-flight
-  // fetch; exercises cold-miss single-flight (test f).
-  if (req.url.includes('slowsub')) setTimeout(respond, 100); else respond();
+  // Hold the cold response until all test callers have reached the cache. A
+  // fixed delay races connection scheduling on busy machines.
+  if (req.url.includes('slowsub')) {
+    releaseSlowResponse = respond;
+    if (slowRequestsReceived === 12) setImmediate(respond);
+  } else respond();
 });
 await new Promise((r) => mock.listen(0, '127.0.0.1', r));
 const mockPort = mock.address().port;
@@ -69,7 +74,13 @@ const imgurMock = http.createServer((req, res) => {
 await new Promise((r) => imgurMock.listen(0, '127.0.0.1', r));
 process.env.IMGUR_BASE = `http://127.0.0.1:${imgurMock.address().port}`;
 
-const { server } = (await import('./server.js')).default;
+const { server, readBoundedBody, safeLogFields, upstreamFailure } = (await import('./server.js')).default;
+server.prependListener('request', (req) => {
+  if (req.url === '/v1/commons?id=slowsub&sort=hot') {
+    slowRequestsReceived++;
+    if (slowRequestsReceived === 12 && releaseSlowResponse) setImmediate(releaseSlowResponse);
+  }
+});
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}`;
 
@@ -86,6 +97,24 @@ async function get(path, headers = {}) {
 
 let failed = false;
 try {
+  // Streaming limits stop allocation before an unbounded response completes,
+  // including when Content-Length is absent or dishonest.
+  let cancelled = false, chunksRead = 0;
+  const oversized = new Response(new ReadableStream({
+    pull(controller) { chunksRead++; controller.enqueue(new Uint8Array([1, 2])); },
+    cancel() { cancelled = true; },
+  }));
+  await assert.rejects(readBoundedBody(oversized, 3), error => error.code === 'BODY_TOO_LARGE');
+  assert.ok(cancelled, 'oversized upstream stream cancelled');
+  assert.ok(chunksRead <= 3, 'did not buffer an unlimited upstream');
+  assert.equal((await readBoundedBody(new Response('abc'), 3)).toString(), 'abc');
+  assert.deepEqual(safeLogFields({ route: '/private/person', method: 'SECRET', status: 404,
+    error: 'token', reason: 'network', body: 'private' }),
+    { route: 'other', method: 'other', status: 404, reason: 'network' });
+  assert.equal(upstreamFailure(429), 'upstream_429');
+  assert.equal(upstreamFailure(403), 'upstream_403');
+  assert.equal(upstreamFailure(0, { name: 'TimeoutError', message: 'private' }), 'timeout');
+
   // (a) MISS fetches upstream once and forwards Authorization
   let r = await get('/v1/commons?id=jsonsub&sort=hot', { Authorization: 'Bearer AAA' });
   assert.equal(r.status, 200, 'a: 200');
@@ -122,8 +151,15 @@ try {
   // (f) COLD-MISS SINGLE-FLIGHT: N concurrent requests for one cold key coalesce
   // to ONE upstream fetch: thundering-herd protection for the shared credential.
   const before = upstreamHits;
-  const results = await Promise.all(Array.from({ length: 12 }, () =>
-    get('/v1/commons?id=slowsub&sort=hot', { Authorization: 'Bearer AAA' })));
+  let barrierTimeout;
+  let results;
+  try {
+    results = await Promise.race([
+      Promise.all(Array.from({ length: 12 }, () =>
+        get('/v1/commons?id=slowsub&sort=hot', { Authorization: 'Bearer AAA' }))),
+      new Promise((_, reject) => { barrierTimeout = setTimeout(() => reject(new Error('cold callers did not reach the cache')), 5000); }),
+    ]);
+  } finally { clearTimeout(barrierTimeout); }
   assert.equal(upstreamHits - before, 1, 'f: 12 concurrent cold reads = ONE upstream fetch (single-flight)');
   assert.ok(results.every((x) => x.status === 200 && x.body === JSON_PAYLOAD), 'f: every coalesced request still gets the body');
   assert.equal(results.filter((x) => x.xcache === 'MISS').length, 1, 'f: exactly one MISS (the leader)');

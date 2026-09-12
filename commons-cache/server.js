@@ -101,9 +101,55 @@ const ALLOWED_CONTENT_TYPES = new Set([
 // In-memory cache: key -> { body, contentType, fetchedAt, revalidating }
 const cache = new Map();
 
+function safeLogFields(fields) {
+  const safe = {};
+  if (fields.route !== undefined) safe.route = ['/health', '/v1/commons', '/v1/imgur', '/v1/probe'].includes(fields.route) ? fields.route : 'other';
+  if (fields.method !== undefined) safe.method = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].includes(fields.method) ? fields.method : 'other';
+  if (Number.isInteger(fields.status) && fields.status >= 100 && fields.status <= 599) safe.status = fields.status;
+  if (Number.isFinite(fields.durationMs)) safe.durationMs = Math.max(0, Math.round(fields.durationMs));
+  if (['HIT', 'STALE', 'MISS', 'COALESCED', '-'].includes(fields.cache)) safe.cache = fields.cache;
+  if (fields.phase === 'revalidate') safe.phase = fields.phase;
+  if (['timeout', 'network', 'too_large', 'invalid_body', 'upstream_403', 'upstream_429', 'upstream_4xx', 'upstream_5xx', 'redirect', 'other'].includes(fields.reason)) safe.reason = fields.reason;
+  if (['fatal', 'listen'].includes(fields.event)) safe.event = fields.event;
+  if (fields.reason === 'upstream_base_invalid') safe.reason = fields.reason;
+  return safe;
+}
 function log(fields) {
-  // route is a TEMPLATE (bounded cardinality), never a raw path with IDs.
-  process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...fields }) + '\n');
+  process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...safeLogFields(fields) }) + '\n');
+}
+
+function upstreamFailure(status, error) {
+  if (error?.name === 'TimeoutError') return 'timeout';
+  if (error?.code === 'BODY_TOO_LARGE') return 'too_large';
+  if (error instanceof SyntaxError) return 'invalid_body';
+  if (status === 403) return 'upstream_403';
+  if (status === 429) return 'upstream_429';
+  if (status >= 500) return 'upstream_5xx';
+  if (status >= 400) return 'upstream_4xx';
+  if (status >= 300) return 'redirect';
+  return error ? 'network' : 'other';
+}
+
+// Enforce the memory limit while streaming, including decoded/compressed bodies.
+// Checking only after arrayBuffer()/json() allocates the whole upstream response.
+async function readBoundedBody(response, limit = MAX_BODY_BYTES) {
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) {
+        await reader.cancel().catch(() => {});
+        throw Object.assign(new Error('body limit'), { code: 'BODY_TOO_LARGE' });
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, size);
+  } finally { reader.releaseLock(); }
 }
 
 // Bounded cache write with LRU eviction of the oldest insertion. Re-inserting on
@@ -169,19 +215,14 @@ async function fetchUpstream(url, authHeader) {
       redirect: 'manual',                 // never follow - a 3xx could point at an internal host (SSRF)
       signal: AbortSignal.timeout(10000), // bound slow/hung upstreams
     });
-    // Treat any 3xx as an upstream error: we do not follow redirects.
-    if (res.status >= 300 && res.status < 400) {
-      return { status: res.status, body: Buffer.alloc(0), contentType: 'application/octet-stream', ms: Date.now() - started, error: true };
+    if (res.status !== 200) {
+      await res.body?.cancel().catch(() => {});
+      return { status: res.status, body: Buffer.alloc(0), contentType: 'application/octet-stream', ms: Date.now() - started, error: true, reason: upstreamFailure(res.status) };
     }
-    const body = Buffer.from(await res.arrayBuffer());
-    // Reject oversized bodies - do not cache or serve (memory DoS guard).
-    if (res.status === 200 && body.length > MAX_BODY_BYTES) {
-      return { status: res.status, body: Buffer.alloc(0), contentType: 'application/octet-stream', ms: Date.now() - started, error: true };
-    }
+    const body = await readBoundedBody(res);
     return { status: res.status, body, contentType: res.headers.get('content-type') || 'application/json', ms: Date.now() - started };
-  } catch {
-    // Never surface the exception text - fixed, empty error result only.
-    return { status: 0, body: Buffer.alloc(0), contentType: 'application/octet-stream', ms: Date.now() - started, error: true };
+  } catch (error) {
+    return { status: 0, body: Buffer.alloc(0), contentType: 'application/octet-stream', ms: Date.now() - started, error: true, reason: upstreamFailure(0, error) };
   }
 }
 
@@ -251,7 +292,7 @@ async function getCachedFeed(id, sort, authHeader) {
     return { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), upstreamStatus: up.status, cacheState: isLeader ? 'MISS' : 'COALESCED', upstreamMs: up.ms };
   }
   // Upstream failed - fixed error result, no upstream body/status leaked downstream.
-  return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true };
+  return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true, reason: up.reason };
 }
 
 // Imgur album: fetch the image list with the server-side public Client-ID and
@@ -269,16 +310,19 @@ async function fetchImgurAlbum(id) {
       redirect: 'manual',                 // never follow a 3xx (SSRF guard)
       signal: AbortSignal.timeout(10000),
     });
-    if (res.status !== 200) return { status: res.status, error: true, ms: Date.now() - started };
-    const j = await res.json();
+    if (res.status !== 200) {
+      await res.body?.cancel().catch(() => {});
+      return { status: res.status, error: true, ms: Date.now() - started, reason: upstreamFailure(res.status) };
+    }
+    const j = JSON.parse((await readBoundedBody(res)).toString('utf8'));
     const images = (Array.isArray(j.data) ? j.data : [])
       .map((i) => ({ url: i.link, type: i.type, w: i.width, h: i.height }))
       .filter((x) => typeof x.url === 'string' && x.url.startsWith('https://'));
     const body = Buffer.from(JSON.stringify({ images }));
-    if (body.length > MAX_BODY_BYTES) return { status: 200, error: true, ms: Date.now() - started };
+    if (body.length > MAX_BODY_BYTES) return { status: 200, error: true, ms: Date.now() - started, reason: 'too_large' };
     return { status: 200, body, contentType: 'application/json', ms: Date.now() - started };
-  } catch {
-    return { status: 0, error: true, ms: Date.now() - started };
+  } catch (error) {
+    return { status: 0, error: true, ms: Date.now() - started, reason: upstreamFailure(0, error) };
   }
 }
 
@@ -310,7 +354,7 @@ async function getCachedImgur(id) {
     if (isLeader) cacheSet(key, { body: up.body, contentType: 'application/json', fetchedAt: Date.now(), upstreamStatus: 200, revalidating: false });
     return { body: up.body, contentType: 'application/json', fetchedAt: Date.now(), upstreamStatus: 200, cacheState: isLeader ? 'MISS' : 'COALESCED', upstreamMs: up.ms };
   }
-  return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true };
+  return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true, reason: up.reason };
 }
 
 async function handleProbe() {
@@ -355,9 +399,10 @@ function fdidExempt(req, path) {
 
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
-  const u = new URL(req.url, `http://localhost`);
+  let u;
+  try { u = new URL(req.url, 'http://localhost'); } catch { res.writeHead(400); res.end(); return; }
   const route = u.pathname;
-  let status = 404, cacheState = '-';
+  let status = 404, cacheState = '-', failureReason;
 
   // Front door origin lock: when REQUIRE_FDID is set, every non-exempt request
   // must arrive through the front door (which injects X-Azure-FDID), else 403.
@@ -391,6 +436,7 @@ const server = http.createServer(async (req, res) => {
         const out = await getCachedFeed(id, sort, authHeader);
         cacheState = out.cacheState;
         if (out.upstreamError) {
+          failureReason = out.reason;
           // Fixed 502 - never leak upstream status, body, or error text.
           status = 502;
           res.writeHead(status, {
@@ -428,6 +474,7 @@ const server = http.createServer(async (req, res) => {
         const out = await getCachedImgur(id);
         cacheState = out.cacheState;
         if (out.upstreamError) {
+          failureReason = out.reason;
           status = 502; // fixed - never leak imgur status/body/error text
           res.writeHead(status, { 'Content-Type': 'application/json', 'X-Cache': cacheState, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' });
           res.end(JSON.stringify({ error: 'upstream unavailable' }));
@@ -461,7 +508,7 @@ const server = http.createServer(async (req, res) => {
   // Log Analytics ingestion drowning the real signal); LOG_HEALTH=1
   // re-enables for a debugging session. Non-200 health responses still log.
   if (route !== '/health' || status !== 200 || process.env.LOG_HEALTH === '1') {
-    log({ route, method: req.method, status, cache: cacheState, durationMs: Date.now() - started });
+    log({ route, method: req.method, status, cache: cacheState, reason: failureReason, durationMs: Date.now() - started });
   }
 });
 
@@ -474,4 +521,4 @@ if (require.main === module) {
   server.listen(PORT, () => log({ event: 'listen', port: PORT, ttlMs: TTL_MS, swrMs: SWR_MS }));
 }
 
-module.exports = { server, getCachedFeed, fetchUpstream, upstreamUrl, cache, validateUpstreamBase };
+module.exports = { safeLogFields, upstreamFailure, readBoundedBody, server, getCachedFeed, fetchUpstream, upstreamUrl, cache, validateUpstreamBase };

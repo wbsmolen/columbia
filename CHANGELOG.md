@@ -4,11 +4,23 @@ Notable changes to Columbia. Releases are git tags; the most recent tagged relea
 
 ## Unreleased
 
-### Documentation
+### Fixed
 
-- Caught the docs up to what v1.4.4 actually shipped. `ROADMAP.md` (h) "Retries and resilience" moves from ⬜ to 🟡: the relay→gateway keep-alive retry, the gateway's inner-`500` mapping that lets a client fail open, the bounded upstream timeout, and the relay's crash-safety all landed; the gateway's fetch to the target and the cache's fetch upstream are still single-attempt, the one retry has no backoff or jitter, and nothing circuit-breaks. (g) is unchanged and still fully open.
-- Corrected a claim that had drifted again: the vendored gateway's local modifications are no longer three env-gated additions. v1.4.4 patched the vendored Go source unconditionally in two places — the response-side `400`→`500` mapping in `handler.go` and the bounded `http.Client` timeout in `main.go` — plus a Columbia-added `handler_test.go`. `ohttp-gateway/VENDORED.md` now lists four deviations and describes both behavior fixes; `README.md` and `ROADMAP.md` no longer say the source carries only the three env-gated additions.
-- Documented the relay's failure `reason` vocabulary (`gw_error`, `gres_error`, `resp_too_large`, `gw_retry`) and its crash log in `ohttp-relay/README.md`, `ARCHITECTURE.md`, `README.md`, and `ROADMAP.md`'s observability bullet, all of which still described the relay log line as only `{ts, route, status, durationMs}`. Also noted the keep-alive pool and the one-shot retry in the relay README's forwarding section.
+- Relay ciphertext is never replayed automatically after an ambiguous connection reset: the gateway may already have committed an inner write. Read clients can make an informed retry decision.
+- Relay and public-config response paths now share bounded buffering, caller-disconnect cancellation and single terminal logging. In-flight slots remain occupied until buffered output finishes or the connection closes.
+- Commons stops oversized upstream bodies while reading, cancels rejected responses and bounds Imgur JSON before parsing. Fixed diagnostic categories distinguish timeouts, refusal/rate limiting, invalid bodies and network failures without recording browsing content.
+- Gateway Prometheus histograms register once and measure seconds, matching their default buckets. Invalid registration fails at startup.
+
+### Added
+
+- Gateway active-minute operational summaries separate outer, payload, upstream and pipeline outcomes. They include the actual window duration and bounded latency buckets; an outer 200 no longer hides an upstream refusal in the diagnostics.
+- Regression coverage for caller cancellation, partial gateway responses, ambiguous writes, memory bounds, collector registration, stage separation and exclusion of caller content from debug logs. The Commons concurrency test uses an arrival barrier instead of a timing-dependent mock delay.
+
+### Changed
+
+- Request diagnostics use fixed fields and categories. Relay exception messages/stacks and gateway caller-derived debug details are excluded from operational logs.
+- Node services track Node 24 LTS; the gateway builder tracks Go 1.27 and Docker's requested target architecture. Rebuild with fresh supported patch images; runtime image updates do not alter the wire protocol.
+- Updated source provenance and deployment documentation. These changes are proposed source changes until released and deployed; production v1.4.4 retains its historical behavior described below.
 
 ## v1.4.4 - 2026-08-02
 
@@ -21,7 +33,7 @@ Notable changes to Columbia. Releases are git tags; the most recent tagged relea
 ### Changed
 
 - `ohttp-gateway`: the upstream `http.Client` now has a 30s `Timeout` (was unbounded), so a stalled target can't pin a gateway worker forever.
-- `ohttp-relay`: the relay→gateway hop uses a keep-alive `https.Agent` (`maxSockets: 128`) instead of a fresh TLS handshake per request, and retries a gateway `POST` **exactly once** on a fresh socket when a kept-alive socket is reset by the peer (`ECONNRESET` on a reused socket, nothing sent to the client yet — safe because the request body is fully buffered). Retries are logged as `reason: 'gw_retry'`.
+- `ohttp-relay`: the relay→gateway hop uses a keep-alive `https.Agent` (`maxSockets: 128`) instead of a fresh TLS handshake per request, and retries a gateway `POST` **exactly once** on a fresh socket when a kept-alive socket is reset by the peer (`ECONNRESET` on a reused socket, nothing sent to the client yet). Retries are logged as `reason: 'gw_retry'`. This historical retry is removed in Unreleased: buffering does not establish that the gateway has not already processed an opaque request.
 - `ohttp-relay`: `MAX_RESP_BYTES` default raised from 1 MB to 5 MB — large comment threads legitimately exceeded the old cap. The env override is unchanged.
 
 ### Added

@@ -38,7 +38,9 @@ const (
 )
 
 func (s *gatewayResource) httpError(w http.ResponseWriter, status int, debugMessage string, metrics Metrics, metricsPrefix string) {
-	slog.Debug(debugMessage)
+	// Debug descriptions can contain caller-supplied headers or methods. Keep
+	// those out of operational logs even when an operator enables debug output.
+	slog.Debug("Gateway HTTP error", "status", status)
 	if s.debugResponse {
 		http.Error(w, debugMessage, status)
 	} else {
@@ -48,7 +50,7 @@ func (s *gatewayResource) httpError(w http.ResponseWriter, status int, debugMess
 }
 
 func (s *gatewayResource) gatewayHandler(w http.ResponseWriter, r *http.Request) {
-	slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path)
+	slog.Debug("Gateway request")
 
 	metrics := s.metricsFactory.Create(metricsEventGatewayRequest)
 
@@ -87,9 +89,8 @@ func (s *gatewayResource) gatewayHandler(w http.ResponseWriter, r *http.Request)
 
 	encapsulatedResp, err := encapHandler.Handle(r, encapsulatedReq, metrics)
 	if err != nil {
-		slog.Debug("encap handler", "error", err)
-
 		errorCode := encapsulationErrorToGatewayStatusCode(err)
+		slog.Debug("Encapsulation handler failed", "status", errorCode)
 		s.httpError(w, errorCode, http.StatusText(errorCode), metrics, r.Method)
 		return
 	}
@@ -103,7 +104,7 @@ func (s *gatewayResource) gatewayHandler(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *gatewayResource) legacyConfigHandler(w http.ResponseWriter, r *http.Request) {
-	slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path)
+	slog.Debug("Legacy config request")
 	metrics := s.metricsFactory.Create(metricsEventConfigsRequest)
 
 	config, err := s.gateway.Config(s.legacyKeyID)
@@ -125,7 +126,7 @@ func (s *gatewayResource) legacyConfigHandler(w http.ResponseWriter, r *http.Req
 }
 
 func (s *gatewayResource) configHandler(w http.ResponseWriter, r *http.Request) {
-	slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path)
+	slog.Debug("Config request")
 	metrics := s.metricsFactory.Create(metricsEventConfigsRequest)
 
 	// Make expiration time even/random throughout interval 12-36h

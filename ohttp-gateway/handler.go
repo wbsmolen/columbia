@@ -337,7 +337,7 @@ func (h FilteredHttpRequestHandler) Handle(req *http.Request, metrics Metrics) (
 		if !ok {
 			metrics.Fire(metricsResultTargetRequestForbidden)
 			// to allow clients to fix improper third party urls usage (e.g. to change URLs from our direct s3 refs to CDN)
-			slog.Debug("TargetForbiddenError", "host", req.Host, "URL", req.URL)
+			slog.Debug("TargetForbiddenError")
 			return nil, GatewayTargetForbiddenError
 		}
 	}
@@ -356,7 +356,7 @@ func (h FilteredHttpRequestHandler) Handle(req *http.Request, metrics Metrics) (
 	if !h.limiter.allow() {
 		metrics.Fire(metricsResultRateLimited)
 		retryAfter := strconv.Itoa(h.limiter.retryAfterSeconds())
-		slog.Debug("GatewayRateLimited", "host", req.Host, "retryAfter", retryAfter)
+		slog.Debug("GatewayRateLimited")
 		return &http.Response{
 			StatusCode: http.StatusTooManyRequests,
 			Status:     "429 Too Many Requests",
@@ -379,6 +379,9 @@ func (h FilteredHttpRequestHandler) Handle(req *http.Request, metrics Metrics) (
 		return nil, err
 	}
 
+	// The outer OHTTP response is often 200 even when the target refused the
+	// request. Count the inner target status without recording target or path.
+	metrics.ResponseStatus("upstream", resp.StatusCode)
 	metrics.Fire(metricsResultSuccess)
 	return resp, nil
 }
