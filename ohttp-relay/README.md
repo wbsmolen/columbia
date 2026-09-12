@@ -66,7 +66,7 @@ When it relays to the gateway, the service builds a fresh request and sends only
 
 It leaves out every client header and never adds `X-Forwarded-For`, so the gateway can't learn the client's IP. (See `server.js`. That omission is the security property, not an oversight.)
 
-That fresh request goes out over a keep-alive pool rather than a new TLS handshake per request, and is retried exactly once, on a new socket, if a pooled socket is reset by the gateway before anything has been sent back to the client. The body is fully buffered, so replaying it is safe; nothing else is retried.
+That fresh request goes out over a keep-alive pool rather than a new TLS handshake per request. The relay never automatically replays the ciphertext: a connection reset can follow a committed inner write, even when no response reached the client.
 
 ## Observability
 
@@ -78,16 +78,20 @@ RED metrics only, structured JSON to stdout:
 
 No IP, no content, no headers, no target. `route` is a fixed template.
 
-A failure adds a bounded `reason` and the underlying error `code`, so a 502 is attributable:
+Both `/relay` and `/ohttp-configs` cancel outbound work when the caller disconnects and log one terminal outcome. A failure adds a bounded `reason` and normalized transport `code`, so a 502 is attributable:
 
 | `reason` | Meaning |
 |---|---|
 | `gw_error` | the request to the gateway errored; also logs `reused` (whether the socket came from the keep-alive pool) |
 | `gres_error` | the gateway errored part-way through its response |
-| `resp_too_large` | the gateway response exceeded `MAX_RESP_BYTES`; also logs `bytes` |
-| `gw_retry` | a reused socket was reset, so the request was retried once on a fresh socket |
+| `resp_too_large` | the gateway response exceeded `MAX_RESP_BYTES` |
+| `client_disconnect` | the caller disconnected; outbound gateway work was cancelled (logged status 499) |
+| `rate_limit` / `capacity` | per-client budget exhausted / process concurrency cap reached |
+| `origin` / `client_auth` | front-door origin lock / client authorization rejected |
 
-An uncaught exception or unhandled rejection logs `{event, code, message, stack}` and exits non-zero, so a crash always leaves evidence. Every one of these describes the relay-to-gateway hop; none of it is derived from the client or the request.
+An uncaught exception or unhandled rejection logs a bounded `{event, code, errorType}` and exits non-zero. Free-form messages, stack text, unknown request paths and unknown error codes are excluded by the logging boundary.
+
+The relay never automatically replays ciphertext after a connection reset, even on a reused socket. The gateway may already have committed an inner write before its response was lost. The client, which knows the inner method, decides whether a retry is safe.
 
 ## Configuration
 
@@ -128,6 +132,13 @@ That offline, public verification is what keeps the token unlinkable. The issuer
 half lives in [`../token-issuer`](../token-issuer). The spend-once set is in-memory
 and single-process; the code marks where a shared store goes for a
 multi-replica deployment.
+
+## Local validation
+
+Run `node test.mjs`. The local HTTPS gateway exercises successful forwarding,
+ambiguous resets without replay, response size limits, response-stream resets,
+timeouts, aborted uploads, caller disconnects, slot recovery, and config caching.
+Every gateway failure and cancellation must produce exactly one outcome log.
 
 ## Run locally
 

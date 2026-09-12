@@ -103,8 +103,20 @@ const FDID_HEADER = (process.env.FDID_HEADER || 'x-azure-fdid').toLowerCase();
 // are MEANT to pin. Cached briefly so we don't hit the gateway per client.
 const CONFIG_TTL_MS = parseInt(process.env.CONFIG_TTL_MS || '120000', 10);
 
+function safeLogFields(fields) {
+  const safe = {};
+  if (fields.route !== undefined) safe.route = ['/relay', '/health', '/ohttp-configs'].includes(fields.route) ? fields.route : 'other';
+  if (Number.isInteger(fields.status) && fields.status >= 100 && fields.status <= 599) safe.status = fields.status;
+  if (Number.isFinite(fields.durationMs)) safe.durationMs = Math.max(0, Math.round(fields.durationMs));
+  if (typeof fields.reused === 'boolean') safe.reused = fields.reused;
+  if (['fatal', 'listen', 'uncaught_exception', 'unhandled_rejection'].includes(fields.event)) safe.event = fields.event;
+  if (fields.errorType !== undefined) safe.errorType = ['Error', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'URIError', 'AggregateError'].includes(fields.errorType) ? fields.errorType : 'other';
+  if (['gateway_url_invalid', 'gateway_not_https', 'resp_too_large', 'gres_error', 'gw_error', 'rate_limit', 'capacity', 'origin', 'client_auth', 'content_type', 'request_too_large', 'client_disconnect'].includes(fields.reason)) safe.reason = fields.reason;
+  if (fields.code !== undefined) safe.code = ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'ERR_STREAM_PREMATURE_CLOSE'].includes(fields.code) ? fields.code : 'other';
+  return safe;
+}
 function log(fields) {
-  process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...fields }) + '\n');
+  process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...safeLogFields(fields) }) + '\n');
 }
 
 // Validate GATEWAY_URL ONCE at startup. Parsing per-request both wasted work and
@@ -404,40 +416,11 @@ function serveConfig(res, start) {
     timeout: GW_TIMEOUT_MS,
     agent: gwAgent, // same host as the gateway POST, share the keep-alive pool
   };
-  const creq = https.request(opts, (cres) => {
-    const cc = [];
-    let clen = 0;
-    let cabort = false;
-    cres.on('data', (d) => {
-      if (cabort) return;
-      clen += d.length;
-      if (clen > MAX_RESP_BYTES) {
-        cabort = true;
-        cres.destroy();
-        if (!res.headersSent) { res.writeHead(502); res.end(); }
-        log({ route: '/ohttp-configs', status: 502, durationMs: Date.now() - start });
-        return;
-      }
-      cc.push(d);
-    });
-    cres.on('end', () => {
-      if (cabort) return;
-      const body = Buffer.concat(cc);
-      const contentType = cres.headers['content-type'] || 'application/octet-stream';
-      if ((cres.statusCode || 0) === 200) {
-        configCache = { body, contentType, fetchedAt: Date.now() };
-      }
-      res.writeHead(cres.statusCode || 502, { 'Content-Type': contentType });
-      res.end(body);
-      log({ route: '/ohttp-configs', status: cres.statusCode || 502, durationMs: Date.now() - start });
-    });
+  proxyGatewayRequest(opts, undefined, res, start, '/ohttp-configs', (status, headers, body) => {
+    const contentType = headers['content-type'] || 'application/octet-stream';
+    if (status === 200) configCache = { body, contentType, fetchedAt: Date.now() };
+    return { 'Content-Type': contentType };
   });
-  creq.on('timeout', () => { creq.destroy(new Error('gw timeout')); });
-  creq.on('error', () => {
-    if (!res.headersSent) { res.writeHead(502); res.end(); }
-    log({ route: '/ohttp-configs', status: 502, durationMs: Date.now() - start });
-  });
-  creq.end();
 }
 
 const server = http.createServer((req, res) => {
@@ -453,7 +436,7 @@ const server = http.createServer((req, res) => {
     const path = String(req.url || '').split('?')[0];
     if (!fdidExempt(req, path) && !frontDoorAllowed(req)) {
       res.writeHead(403); res.end();
-      log({ route: path, status: 403, durationMs: Date.now() - start });
+      log({ route: path, status: 403, reason: 'origin', durationMs: Date.now() - start });
       return;
     }
   }
@@ -490,7 +473,7 @@ const server = http.createServer((req, res) => {
   const ctype = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
   if (ctype !== 'message/ohttp-req') {
     res.writeHead(415); res.end();
-    log({ route: '/relay', status: 415, durationMs: Date.now() - start });
+    log({ route: '/relay', status: 415, reason: 'content_type', durationMs: Date.now() - start });
     return;
   }
 
@@ -498,7 +481,7 @@ const server = http.createServer((req, res) => {
   // never logged. See clientIpKey for why we read the trusted X-Forwarded-For.
   if (rateLimited(clientIpKey(req))) {
     res.writeHead(429); res.end();
-    log({ route: '/relay', status: 429, durationMs: Date.now() - start });
+    log({ route: '/relay', status: 429, reason: 'rate_limit', durationMs: Date.now() - start });
     return;
   }
 
@@ -506,7 +489,7 @@ const server = http.createServer((req, res) => {
   // credential header is never logged.
   if (!clientAuthorized(req)) {
     res.writeHead(401); res.end();
-    log({ route: '/relay', status: 401, durationMs: Date.now() - start });
+    log({ route: '/relay', status: 401, reason: 'client_auth', durationMs: Date.now() - start });
     return;
   }
 
@@ -514,18 +497,23 @@ const server = http.createServer((req, res) => {
   // terminal path (success, error, abort, oversize, client disconnect).
   if (inflight >= MAX_INFLIGHT) {
     res.writeHead(429); res.end();
-    log({ route: '/relay', status: 429, durationMs: Date.now() - start });
+    log({ route: '/relay', status: 429, reason: 'capacity', durationMs: Date.now() - start });
     return;
   }
   inflight += 1;
   let slotReleased = false;
   const releaseSlot = () => { if (!slotReleased) { slotReleased = true; inflight -= 1; } };
+  res.on('finish', releaseSlot); // retain capacity until buffered output is flushed
   res.on('close', releaseSlot);   // safety net for any teardown path
-  req.on('aborted', releaseSlot);
 
   const chunks = [];
   let received = 0;
   let aborted = false;
+  req.on('aborted', () => {
+    if (!aborted) log({ route: '/relay', status: 499, reason: 'client_disconnect', durationMs: Date.now() - start });
+    aborted = true;
+    releaseSlot();
+  });
   req.on('data', (c) => {
     if (aborted) return;
     received += c.length;
@@ -533,7 +521,7 @@ const server = http.createServer((req, res) => {
       // Request body too large: refuse, tear down, and stop buffering.
       aborted = true;
       res.writeHead(413); res.end();
-      log({ route: '/relay', status: 413, durationMs: Date.now() - start });
+      log({ route: '/relay', status: 413, reason: 'request_too_large', durationMs: Date.now() - start });
       releaseSlot();
       req.destroy();
       return;
@@ -541,23 +529,22 @@ const server = http.createServer((req, res) => {
     chunks.push(c);
   });
   req.on('end', () => {
-    if (aborted) return;
-    forwardToGateway(Buffer.concat(chunks), res, start, releaseSlot, false);
+    if (aborted || res.destroyed) return;
+    forwardToGateway(Buffer.concat(chunks), res, start);
   });
 });
 
-// Forward the (fully buffered) ciphertext to the gateway and stream the answer
+// Forward the (fully buffered) ciphertext to the gateway and buffer the answer
 // back to the client. Forward ONLY the opaque ciphertext + its content type.
 // Deliberately send a fresh request with NO client headers, NO X-Forwarded-For -
 // the gateway must not learn who the client is. The ONLY additional header is the
 // relay→gateway shared secret, which identifies the RELAY (not the client) so the
 // gateway can refuse traffic that didn't come through us.
 //
-// isRetry: because the body is a complete in-memory Buffer (never a stream), a
-// resend is always safe; we retry ONCE when a kept-alive socket was reset by the
-// gateway (the classic keep-alive race: the server closed the idle socket just as
-// we reused it).
-function forwardToGateway(body, res, start, releaseSlot, isRetry) {
+// Ciphertext may contain a write. A reset on a reused socket does not prove
+// the gateway failed to dispatch it; only the client knows whether replay is
+// safe. Return the ambiguous failure and let read clients choose to retry.
+function forwardToGateway(body, res, start) {
   const outHeaders = { 'Content-Type': 'message/ohttp-req', 'Content-Length': body.length };
   if (RELAY_GATEWAY_SECRET) outHeaders[RELAY_GATEWAY_HEADER] = RELAY_GATEWAY_SECRET;
   const opts = {
@@ -569,74 +556,86 @@ function forwardToGateway(body, res, start, releaseSlot, isRetry) {
     headers: outHeaders,
     agent: gwAgent,
   };
+  proxyGatewayRequest(opts, body, res, start, '/relay', () => ({ 'Content-Type': 'message/ohttp-res' }));
+}
+
+// Both gateway endpoints use the same size limit and terminal-state handling.
+// headersForResponse may cache successful public configs; it runs only after a
+// complete response. A caller disconnect cancels work before capacity is freed.
+function proxyGatewayRequest(opts, body, res, start, route, headersForResponse) {
+  let completed = false;
+  let gatewayResponse;
+  // Request and response errors can both fire for the same socket teardown.
+  // Complete once so RED logs count one relay outcome and cleanup is symmetric.
+  const finish = (status, reason, error, responseBody, responseHeaders = {}) => {
+    if (completed) return;
+    completed = true;
+    res.removeListener('close', clientClosed);
+    if (!res.destroyed && !res.headersSent) {
+      res.writeHead(status, responseHeaders);
+      res.end(responseBody);
+    }
+    log({ route, status, reason, code: error?.code,
+      reused: reason === 'gw_error' ? greq.reusedSocket : undefined, durationMs: Date.now() - start });
+  };
+  const clientClosed = () => {
+    if (res.writableEnded || completed) return;
+    // Releasing a slot without destroying its outbound work lets disconnecting
+    // callers bypass MAX_INFLIGHT and fill the Agent's pending-request queue.
+    finish(499, 'client_disconnect');
+    gatewayResponse?.destroy();
+    greq.destroy();
+  };
   const greq = https.request(opts, (gres) => {
+    gatewayResponse = gres;
+    if (completed) { gres.destroy(); return; }
     const rc = [];
     let rcLen = 0;
-    let respAborted = false;
     gres.on('data', (d) => {
-      if (respAborted) return;
+      if (completed) return;
       rcLen += d.length;
       if (rcLen > MAX_RESP_BYTES) {
-        // Gateway response too large: drop it and fail closed.
-        respAborted = true;
+        finish(502, 'resp_too_large');
         gres.destroy();
-        if (!res.headersSent) { res.writeHead(502); res.end(); }
-        log({ route: '/relay', status: 502, reason: 'resp_too_large', bytes: rcLen, durationMs: Date.now() - start });
-        releaseSlot();
+        greq.destroy();
         return;
       }
       rc.push(d);
     });
     gres.on('end', () => {
-      if (respAborted) return;
-      const rb = Buffer.concat(rc);
-      // Pin the response content-type - never echo the gateway's header back.
-      res.writeHead(gres.statusCode || 502, { 'Content-Type': 'message/ohttp-res' });
-      res.end(rb);
-      log({ route: '/relay', status: gres.statusCode || 502, durationMs: Date.now() - start });
-      releaseSlot();
+      if (completed) return;
+      const responseBody = Buffer.concat(rc, rcLen);
+      const status = gres.statusCode || 502;
+      finish(status, undefined, undefined, responseBody, headersForResponse(status, gres.headers, responseBody));
     });
-    // The gateway reset/errored MID-response. Without this handler that is an
-    // unhandled 'error' event, which kills the whole process.
     gres.on('error', (err) => {
-      if (respAborted) return;
-      respAborted = true;
+      finish(502, 'gres_error', err);
       greq.destroy();
-      if (!res.headersSent) { res.writeHead(502); res.end(); }
-      log({ route: '/relay', status: 502, reason: 'gres_error', code: err.code, durationMs: Date.now() - start });
-      releaseSlot();
     });
   });
+  res.prependListener('close', clientClosed); // cancel upstream before the slot-release listener
   greq.on('timeout', () => {
-    greq.destroy(new Error('gw timeout'));
+    greq.destroy(Object.assign(new Error('gw timeout'), { code: 'ETIMEDOUT' }));
   });
   greq.on('error', (err) => {
-    // Keep-alive race: the gateway closed the pooled socket just as we reused it.
-    // Nothing was delivered, the body is fully buffered - retry once, fresh socket.
-    if (!isRetry && err.code === 'ECONNRESET' && greq.reusedSocket && !res.headersSent) {
-      log({ route: '/relay', reason: 'gw_retry', code: err.code, durationMs: Date.now() - start });
-      forwardToGateway(body, res, start, releaseSlot, true);
-      return;
-    }
-    if (!res.headersSent) { res.writeHead(502); res.end(); }
-    log({ route: '/relay', status: 502, reason: 'gw_error', code: err.code, reused: greq.reusedSocket, durationMs: Date.now() - start });
-    releaseSlot();
+    finish(502, 'gw_error', err);
+    gatewayResponse?.destroy();
   });
-  greq.write(body);
-  greq.end();
+  if (res.destroyed) { clientClosed(); return; }
+  greq.end(body);
 }
 
 // Crash forensics: an uncaught throw or unhandled rejection used to kill the
-// process with NOTHING in the structured log stream. Log a trace first, then
+// process with NOTHING in the structured log stream. Log a bounded cause, then
 // exit non-zero so the platform restarts the replica. Nothing request-derived
-// is logged - just the error itself.
+// is logged: free-form messages and stack text are discarded at the log boundary.
 process.on('uncaughtException', (err) => {
-  log({ event: 'uncaught_exception', code: err && err.code, message: err && err.message, stack: err && err.stack });
+  log({ event: 'uncaught_exception', code: err && err.code, errorType: err && err.name });
   process.exit(1);
 });
 process.on('unhandledRejection', (reason) => {
   const e = reason instanceof Error ? reason : new Error(String(reason));
-  log({ event: 'unhandled_rejection', code: e.code, message: e.message, stack: e.stack });
+  log({ event: 'unhandled_rejection', code: e.code, errorType: e.name });
   process.exit(1);
 });
 
@@ -660,5 +659,6 @@ module.exports = {
   verifyAccessToken,
   tryRedeem,
   nullifierFor,
+  safeLogFields,
   setIssuerKeysForTest(map) { issuerKeys = map; issuerKeysFetchedAt = Date.now(); },
 };

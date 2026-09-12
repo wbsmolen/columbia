@@ -1,8 +1,8 @@
 # Columbia - OHTTP relay
-# pin by @sha256:<digest> in CI for full reproducibility
-FROM node:20.18.1-alpine
+# Track Node 24 LTS patch releases; rebuild with --pull. See SELFHOSTING.md.
+FROM node:24-alpine
 WORKDIR /app
-COPY server.js ./
+COPY --chmod=0444 server.js ./
 ENV PORT=8080
 EXPOSE 8080
 USER node

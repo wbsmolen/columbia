@@ -17,10 +17,11 @@ knowledge unusable: it only ever sees *blinded* token requests, blind-signs them
 signatures. It never sees the finished tokens, and never sees the content those
 tokens are later spent on.
 
-The relay, run by a different operator, checks the tokens and sees content and IP
-but never the device id, so no single party holds identity and content together.
-This extends the operator-blind property of the relay and gateway to proving a
-genuine, rate-limited client without a login.
+The relay checks spent tokens and sees the client IP and ciphertext, not the
+decrypted request content or App Attest key ID. Blind signatures separate token
+issuance from redemption; they do not eliminate timing or other network metadata.
+Separating identity from request content also depends on non-colluding relay and
+gateway operators, as described in [ARCHITECTURE.md](../ARCHITECTURE.md).
 
 ## How a token flows
 
@@ -293,12 +294,12 @@ npm install
 node --test
 ```
 
-Run them under the deploy runtime (`node:20.18.1-alpine`), not a newer local node,
+Run them under the deploy runtime (`node:24-alpine`), not a newer local node,
 since a node-version mismatch can change runtime behavior between local and deploy:
 
 ```sh
 # from the repo root (the Privacy Pass test imports the sibling relay)
-docker run --rm -v "$PWD":/repo -w /repo/token-issuer node:20.18.1-alpine \
+docker run --rm -v "$PWD":/repo -w /repo/token-issuer node:24-alpine \
   sh -c 'npm ci && npm test'
 ```
 

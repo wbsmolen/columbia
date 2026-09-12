@@ -1,10 +1,10 @@
 # Columbia - commons-cache origin
 # Dependency-free Node service (global fetch + built-in http). Tiny image.
-# pin by @sha256:<digest> in CI for full reproducibility
-FROM node:20.18.1-alpine
+# Track Node 24 LTS patch releases; rebuild with --pull. See SELFHOSTING.md.
+FROM node:24-alpine
 
 WORKDIR /app
-COPY server.js ./
+COPY --chmod=0444 server.js ./
 
 ENV PORT=8080
 EXPOSE 8080

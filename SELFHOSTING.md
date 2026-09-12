@@ -74,12 +74,12 @@ docker run -d --name gateway --network columbia -p 8080:8080 \
 | `SEED_SECRET_KEY` | yes | 32-byte hex HPKE seed (step 1); derives the keypair |
 | `ALLOWED_TARGET_ORIGINS` | yes | comma-separated allowlist of fetchable origins; everything else is 403 |
 | `LOG_SECRETS` | recommended `false` | keeps the seed from ever being printed |
-| `PORT` | `8080` | listen port (runs as non-root; below 1024 needs privilege) |
+| `PORT` | `8080` | listen port; when deploying with a non-root user, ports below 1024 require the appropriate bind capability |
 | `GATEWAY_MAX_QPM` | `0` (off) | optional global cap on total outbound fetches per minute across all clients; over-budget requests get a `429` + `Retry-After` instead of a call (see [Shared egress](#shared-egress-one-ip-one-credential-one-budget)) |
 | `RELAY_GATEWAY_SECRET` | (none) | when set, the gateway rejects `/gateway` requests that lack a matching `X-Columbia-Relay-Auth`; set the SAME value as the relay |
 | `ECHO_ENDPOINT` | `/gateway-echo` | set to `""` in production to unregister the reflective echo self-test endpoint |
 | `METADATA_ENDPOINT` | `/gateway-metadata` | set to `""` in production to unregister the reflective metadata self-test endpoint |
-| `LOG_LEVEL` | `info` | **never set to `debug` in production** — at `debug`, a couple of error paths log the target `Host` and `URL`, which breaks the "never a target" observability guarantee in [ARCHITECTURE.md](./ARCHITECTURE.md#observability) |
+| `LOG_LEVEL` | `info` | keep `info` in production; emits bounded minute-level gateway summaries in addition to optional StatsD/Prometheus. Debug modes are for local investigation; see [observability](./ARCHITECTURE.md#observability) |
 | `GATEWAY_DEBUG` | (none) | **never set in production** — includes internal debug detail in HTTP error responses instead of a generic status message |
 
 The `RELAY_GATEWAY_SECRET`, `ECHO_ENDPOINT`, and `METADATA_ENDPOINT` controls are described in detail in [`ohttp-gateway/VENDORED.md`](./ohttp-gateway/VENDORED.md). See [Abuse controls](#abuse-controls) below for how to set the shared secret without a window where the gateway 401s all relay traffic.
@@ -345,3 +345,21 @@ Plain Docker, as above, is the supported path. For a managed container host, the
 | `APP_NAME` | the name you want for the deployed app |
 
 The same env-var contracts apply on any host: the gateway needs `SEED_SECRET_KEY` and `ALLOWED_TARGET_ORIGINS` (inject the seed from the host's secret store, never from the repo), the relay needs `GATEWAY_URL`, the cache takes the optional `UPSTREAM_*` and `COMMONS_*` knobs, and the issuer (if you run `token` mode) needs `ISSUER_SIGNING_KEY` and the `APPLE_*` App Attest inputs, injected the same way. Run the relay and the gateway under separate operators for the non-collusion guarantee, and run the issuer under a third party that colludes with neither.
+
+
+## Runtime support and rebuilds
+
+As reviewed on September 10, 2026, the Node services use `node:24-alpine` and the
+gateway builds with `golang:1.27-bookworm`. These tags track patched releases
+within the selected supported line. Use `docker build --pull` when rebuilding,
+record the resolved image digest for a release, and test that image before
+promotion. Digest pinning should be paired with scheduled refreshes so it does
+not indefinitely retain an old runtime.
+
+[Node's release table](https://nodejs.org/en/about/previous-releases) lists Node 24
+as LTS and Node 20 as EOL. The issuer's locked blind-RSA dependency also requires
+Node 24 or newer. [Go's release policy](https://go.dev/doc/devel/release) supports
+a release until two newer major releases exist; Go 1.27 therefore replaces the
+unsupported 1.25 builder. The Dockerfile uses BuildKit's target architecture,
+so building on Apple Silicon cannot silently label an amd64-only executable as
+an arm64 image. Use `--platform linux/amd64` for an amd64 deployment.

@@ -1,4 +1,5 @@
-FROM golang:1.25-bookworm as build
+# Track a supported Go release; rebuild with --pull. See SELFHOSTING.md.
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS build
 
 WORKDIR /app
 
@@ -7,14 +8,16 @@ RUN go mod download
 
 COPY . ./
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
       -ldflags='-w -s -extldflags "-static"' -a \
       -o /privacy-gateway-server
 
 FROM gcr.io/distroless/static
 
 ARG GIT_REVISION=unknown
-LABEL revision ${GIT_REVISION}
+LABEL revision=${GIT_REVISION}
 COPY --from=build /privacy-gateway-server /privacy-gateway-server
 
 EXPOSE 8080

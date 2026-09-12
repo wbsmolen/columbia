@@ -47,15 +47,19 @@ func (p *PrometheusMetrics) ResponseStatus(method string, status int) {
 }
 
 func (p *PrometheusMetrics) observe(observer prometheus.Observer) {
-	elapsed := time.Now().Sub(p.startedAt)
-	observer.Observe(float64(elapsed.Milliseconds()))
+	// Prometheus's default histogram buckets are expressed in seconds.
+	observer.Observe(time.Since(p.startedAt).Seconds())
 }
 
 type PrometheusMetricsFactory struct {
-	metricName string
+	histogram *prometheus.HistogramVec
 }
 
 func NewPrometheusMetricsFactory(config PrometheusConfig) (MetricsFactory, error) {
+	factory, err := newPrometheusMetricsFactory(config.MetricName, prometheus.DefaultRegisterer)
+	if err != nil {
+		return nil, err
+	}
 	serveMux := http.NewServeMux()
 	serveMux.Handle(config.ScrapePath, promhttp.Handler())
 	server := http.Server{
@@ -69,28 +73,34 @@ func NewPrometheusMetricsFactory(config PrometheusConfig) (MetricsFactory, error
 		os.Exit(1)
 	}()
 
-	return &PrometheusMetricsFactory{metricName: config.MetricName}, nil
+	return factory, nil
+}
+
+// Register once at startup, not on every request. A private constructor lets
+// tests use an isolated registry without opening a scrape listener.
+func newPrometheusMetricsFactory(metricName string, registerer prometheus.Registerer) (*PrometheusMetricsFactory, error) {
+	histogram := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: metricName,
+		Help: "Elapsed request time in seconds at each gateway processing stage.",
+	}, []string{"eventName", "status", "method", "result"})
+
+	if err := registerer.Register(histogram); err != nil {
+		var registered prometheus.AlreadyRegisteredError
+		if !errors.As(err, &registered) {
+			return nil, err
+		}
+		var ok bool
+		histogram, ok = registered.ExistingCollector.(*prometheus.HistogramVec)
+		if !ok {
+			return nil, fmt.Errorf("metric %q already registered with an incompatible collector", metricName)
+		}
+	}
+	return &PrometheusMetricsFactory{histogram: histogram}, nil
 }
 
 func (p PrometheusMetricsFactory) Create(eventName string) Metrics {
-	histogram := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name: p.metricName,
-	}, []string{"eventName", "status", "method", "result"})
-
-	if err := prometheus.Register(histogram); err != nil {
-		are := &prometheus.AlreadyRegisteredError{}
-		if errors.As(err, are) {
-			// Use previously registered metric collector
-			histogram = are.ExistingCollector.(*prometheus.HistogramVec)
-		} else {
-			// There's no other reason prometheus.Register should fail and the interface won't let
-			// us return an error.
-			panic(err)
-		}
-	}
-
 	return &PrometheusMetrics{
 		startedAt: time.Now(),
-		histogram: histogram.MustCurryWith(prometheus.Labels{"eventName": eventName}),
+		histogram: p.histogram.MustCurryWith(prometheus.Labels{"eventName": eventName}),
 	}
 }

@@ -39,6 +39,21 @@ The behavior of the gateway is configurable via a number of environment variable
 - RELAY_GATEWAY_SECRET: Columbia-local addition, not upstream. When set, the gateway rejects `/gateway` requests whose `X-Columbia-Relay-Auth` header doesn't match. See `VENDORED.md`.
 - GATEWAY_MAX_QPM: Columbia-local addition, not upstream. Optional global cap on outbound requests per minute; over-budget requests get a 429. See `VENDORED.md`.
 
+### Operational metrics
+
+The gateway emits `operational_summary` at info level for each active collection
+window. `windowSeconds` records actual elapsed time, including a delayed flush;
+use it when calculating request rates. Stages and duration buckets are described
+in [the observability contract](../ARCHITECTURE.md#observability). One request
+produces several stages, so their counts must not be added together.
+
+The optional Prometheus exporter registers its histogram once at startup and
+observes durations in seconds, matching its default buckets. This corrects the
+previous millisecond observations; dashboards based on that old scale need to
+use seconds after updating. Stage timing is elapsed time from request start.
+Event names, status codes, methods, and outcome labels are normalized before
+reaching either optional exporter. See [Prometheus unit guidance](https://prometheus.io/docs/practices/naming/).
+
 ### Target URL rewrites
 
 The `TARGET_REWRITES` configuration option is useful to set up forwarding between the gateway and target when both are on a private network or if they share a loopback interface. For example, suppose that the target is exposed to the internet at `https://example.org`, but also reachable by the gateway at `http://localhost:8080` (note `http` and not `https`). It's more efficient to redirect traffic over `localhost` than back out over the internet, so you could set `TARGET_REWRITES` to:

@@ -127,7 +127,7 @@ func (s gatewayServer) indexHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s gatewayServer) healthCheckHandler(w http.ResponseWriter, r *http.Request) {
-	slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path)
+	slog.Debug("Health request")
 	fmt.Fprint(w, "ok")
 }
 
@@ -377,6 +377,14 @@ func main() {
 			client:      client,
 		}
 	}
+
+	// Always expose bounded operational totals, even when no external metrics
+	// exporter is configured. No per-request timing or content is logged.
+	summaryFactory := NewSummaryMetricsFactory(metricsFactory)
+	metricsFactory = summaryFactory
+	summaryStop := make(chan struct{})
+	defer close(summaryStop)
+	go summaryFactory.Run(summaryStop)
 
 	// Load endpoint configuration defaults
 	gatewayEndpoint := getStringEnv(gatewayEndpointEnvVariable, defaultGatewayEndpoint)
