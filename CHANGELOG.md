@@ -2,7 +2,7 @@
 
 Notable changes to Columbia. Releases are git tags; the most recent tagged release is `v1.5.0`.
 
-## Unreleased (v1.6.0)
+## v1.6.0 - 2026-09-16
 
 ### Added
 
