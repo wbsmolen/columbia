@@ -1,8 +1,15 @@
 # Changelog
 
-Notable changes to Columbia. Releases are git tags; the most recent tagged release is `v1.4.4`.
+Notable changes to Columbia. Releases are git tags; the most recent tagged release is `v1.5.0`.
 
-## Unreleased
+## Unreleased (v1.6.0)
+
+### Added
+
+- `commons-cache`: `GET /v1/imgur?image=<image-id>` resolves a single public imgur image — the extensionless `imgur.com/<id>` page a client otherwise has to guess an extension for — using the same server-held public Client-ID as the album route. Fetches `GET /3/image/{id}` and normalizes to `{ image: { url, type, w, h, animated } }`; an animated upload resolves to imgur's `mp4` (with `type: video/mp4`) when one is offered. Cached under `imgur-image/<id>` with the same TTL / stale-while-revalidate / single-flight semantics, id validation (`[A-Za-z0-9]{1,15}`), no-redirect SSRF guard, and fixed no-leak `502` as `?id=`. Exactly one of `?id=` / `?image=` is required; both or neither is a `400`. `?id=` album resolution is unchanged.
+- `commons-cache`: imgur `502`s log a `not_found` reason category for an upstream `404` (deleted or unknown id), alongside the existing `upstream_429` (rate limited) and `upstream_5xx` / `network` / `timeout` categories. Upstream bodies and ids are never logged.
+
+## v1.5.0 - 2026-09-12
 
 ### Fixed
 

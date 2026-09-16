@@ -49,14 +49,16 @@ const UPSTREAM_UA = process.env.UPSTREAM_UA ||
 const MAX_ENTRIES = parseInt(process.env.COMMONS_MAX_ENTRIES || '5000', 10);     // cache bound (LRU)
 const MAX_BODY_BYTES = parseInt(process.env.COMMONS_MAX_BODY_BYTES || '5000000', 10); // reject oversized bodies
 
-// Imgur album resolution (/v1/imgur?id=<albumId>). imgur killed keyless album
-// access, but its OWN web client uses a public embed Client-ID (not a registered
-// app, not a secret - it ships in imgur.com's JS). We hold it HERE, server-side,
-// so the app never carries an imgur key. The route fetches the album's image
-// list and returns it normalized; cached like everything else (public, shared).
+// Imgur resolution (/v1/imgur?id=<albumId> | ?image=<imageId>). imgur killed
+// keyless access, but its OWN web client uses a public embed Client-ID (not a
+// registered app, not a secret - it ships in imgur.com's JS). We hold it HERE,
+// server-side, so the app never carries an imgur key. The routes fetch an album's
+// image list or a single image's metadata (so an extensionless imgur.com/<id>
+// page resolves to its real media, mp4 for animated) and return it normalized;
+// cached like everything else (public, shared).
 const IMGUR_BASE = (process.env.IMGUR_BASE || 'https://api.imgur.com').replace(/\/+$/, '');
 const IMGUR_CLIENT_ID = process.env.IMGUR_CLIENT_ID || '546c25a59c58ad7';
-const IMGUR_ID_RE = /^[A-Za-z0-9]{1,15}$/; // imgur album ids are short alphanumerics
+const IMGUR_ID_RE = /^[A-Za-z0-9]{1,15}$/; // imgur album/image ids are short alphanumerics
 
 // When true, on a cache MISS (or background revalidation) forward the INCOMING
 // request's Authorization header to the upstream fetch, so this cache can front
@@ -109,7 +111,7 @@ function safeLogFields(fields) {
   if (Number.isFinite(fields.durationMs)) safe.durationMs = Math.max(0, Math.round(fields.durationMs));
   if (['HIT', 'STALE', 'MISS', 'COALESCED', '-'].includes(fields.cache)) safe.cache = fields.cache;
   if (fields.phase === 'revalidate') safe.phase = fields.phase;
-  if (['timeout', 'network', 'too_large', 'invalid_body', 'upstream_403', 'upstream_429', 'upstream_4xx', 'upstream_5xx', 'redirect', 'other'].includes(fields.reason)) safe.reason = fields.reason;
+  if (['timeout', 'network', 'too_large', 'invalid_body', 'upstream_403', 'upstream_429', 'not_found', 'upstream_4xx', 'upstream_5xx', 'redirect', 'other'].includes(fields.reason)) safe.reason = fields.reason;
   if (['fatal', 'listen'].includes(fields.event)) safe.event = fields.event;
   if (fields.reason === 'upstream_base_invalid') safe.reason = fields.reason;
   return safe;
@@ -124,6 +126,7 @@ function upstreamFailure(status, error) {
   if (error instanceof SyntaxError) return 'invalid_body';
   if (status === 403) return 'upstream_403';
   if (status === 429) return 'upstream_429';
+  if (status === 404) return 'not_found';
   if (status >= 500) return 'upstream_5xx';
   if (status >= 400) return 'upstream_4xx';
   if (status >= 300) return 'redirect';
@@ -295,13 +298,13 @@ async function getCachedFeed(id, sort, authHeader) {
   return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true, reason: up.reason };
 }
 
-// Imgur album: fetch the image list with the server-side public Client-ID and
-// normalize to { images: [{ url, type, w, h }] }. Never surfaces imgur error text.
-async function fetchImgurAlbum(id) {
-  const url = `${IMGUR_BASE}/3/album/${encodeURIComponent(id)}/images`;
+// Imgur: fetch one API path with the server-side public Client-ID and normalize
+// the parsed JSON with `shape`. Never surfaces imgur error text; a `shape` that
+// returns null (unusable body) is an upstream failure too.
+async function fetchImgurJson(path, shape) {
   const started = Date.now();
   try {
-    const res = await fetch(url, {
+    const res = await fetch(`${IMGUR_BASE}${path}`, {
       headers: {
         'User-Agent': UPSTREAM_UA,
         'Accept': 'application/json',
@@ -314,11 +317,9 @@ async function fetchImgurAlbum(id) {
       await res.body?.cancel().catch(() => {});
       return { status: res.status, error: true, ms: Date.now() - started, reason: upstreamFailure(res.status) };
     }
-    const j = JSON.parse((await readBoundedBody(res)).toString('utf8'));
-    const images = (Array.isArray(j.data) ? j.data : [])
-      .map((i) => ({ url: i.link, type: i.type, w: i.width, h: i.height }))
-      .filter((x) => typeof x.url === 'string' && x.url.startsWith('https://'));
-    const body = Buffer.from(JSON.stringify({ images }));
+    const out = shape(JSON.parse((await readBoundedBody(res)).toString('utf8')));
+    if (!out) return { status: 200, error: true, ms: Date.now() - started, reason: 'invalid_body' };
+    const body = Buffer.from(JSON.stringify(out));
     if (body.length > MAX_BODY_BYTES) return { status: 200, error: true, ms: Date.now() - started, reason: 'too_large' };
     return { status: 200, body, contentType: 'application/json', ms: Date.now() - started };
   } catch (error) {
@@ -326,10 +327,32 @@ async function fetchImgurAlbum(id) {
   }
 }
 
-// Cached imgur album - same TTL / stale-while-revalidate / single-flight semantics
-// as getCachedFeed (public, shared bytes; keyed imgur/<id>, never per-caller).
-async function getCachedImgur(id) {
-  const key = `imgur/${id}`;
+const httpsUrl = (u) => typeof u === 'string' && u.startsWith('https://');
+
+// Album -> { images: [{ url, type, w, h }] } (https-only, in order).
+const fetchImgurAlbum = (id) => fetchImgurJson(`/3/album/${encodeURIComponent(id)}/images`, (j) => ({
+  images: (Array.isArray(j.data) ? j.data : [])
+    .map((i) => ({ url: i.link, type: i.type, w: i.width, h: i.height }))
+    .filter((x) => httpsUrl(x.url)),
+}));
+
+// Single image -> { image: { url, type, w, h, animated } }. An animated upload
+// (GIF/GIFV) resolves to its mp4 when imgur offers one, so the client never has
+// to guess an extension for an imgur.com/<id> page.
+const fetchImgurImage = (id) => fetchImgurJson(`/3/image/${encodeURIComponent(id)}`, (j) => {
+  const d = j.data;
+  if (!d || typeof d !== 'object') return null;
+  const animated = d.animated === true;
+  const mp4 = animated && httpsUrl(d.mp4) ? d.mp4 : null;
+  const url = mp4 || d.link;
+  if (!httpsUrl(url)) return null;
+  return { image: { url, type: mp4 ? 'video/mp4' : d.type, w: d.width, h: d.height, animated } };
+});
+
+// Cached imgur lookup - same TTL / stale-while-revalidate / single-flight semantics
+// as getCachedFeed (public, shared bytes; keyed imgur/<id> or imgur-image/<id>,
+// never per-caller). `fetcher` is the upstream call to make on a MISS/revalidate.
+async function getCachedImgur(key, fetcher) {
   const now = Date.now();
   const entry = cache.get(key);
   if (entry) {
@@ -338,7 +361,7 @@ async function getCachedImgur(id) {
     if (age < TTL_MS + SWR_MS) {
       if (!entry.revalidating) {
         entry.revalidating = true;
-        fetchImgurAlbum(id)
+        fetcher()
           .then((up) => { if (up.status === 200 && !up.error) cacheSet(key, { body: up.body, contentType: 'application/json', fetchedAt: Date.now(), upstreamStatus: 200, revalidating: false }); })
           .catch(() => {})
           .finally(() => { entry.revalidating = false; });
@@ -348,7 +371,7 @@ async function getCachedImgur(id) {
   }
   let promise = inflight.get(key);
   const isLeader = !promise;
-  if (isLeader) { promise = fetchImgurAlbum(id).finally(() => inflight.delete(key)); inflight.set(key, promise); }
+  if (isLeader) { promise = fetcher().finally(() => inflight.delete(key)); inflight.set(key, promise); }
   const up = await promise;
   if (up.status === 200 && !up.error) {
     if (isLeader) cacheSet(key, { body: up.body, contentType: 'application/json', fetchedAt: Date.now(), upstreamStatus: 200, revalidating: false });
@@ -466,12 +489,17 @@ const server = http.createServer(async (req, res) => {
       }
     } else if (route === '/v1/imgur') {
       const id = (u.searchParams.get('id') || '').trim();
-      if (!IMGUR_ID_RE.test(id)) {
+      const image = (u.searchParams.get('image') || '').trim();
+      // Exactly one of ?id= (album) / ?image= (single image), each a short alphanumeric.
+      const valid = (id && !image && IMGUR_ID_RE.test(id)) || (image && !id && IMGUR_ID_RE.test(image));
+      if (!valid) {
         status = 400;
         res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'require ?id=<imgur album id>' }));
+        res.end(JSON.stringify({ error: 'require ?id=<imgur album id> or ?image=<imgur image id>' }));
       } else {
-        const out = await getCachedImgur(id);
+        const out = id
+          ? await getCachedImgur(`imgur/${id}`, () => fetchImgurAlbum(id))
+          : await getCachedImgur(`imgur-image/${image}`, () => fetchImgurImage(image));
         cacheState = out.cacheState;
         if (out.upstreamError) {
           failureReason = out.reason;
@@ -494,7 +522,7 @@ const server = http.createServer(async (req, res) => {
       }
     } else {
       res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort=', '/v1/imgur?id='] }));
+      res.end(JSON.stringify({ error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort=', '/v1/imgur?id=', '/v1/imgur?image='] }));
     }
   } catch {
     // Fixed 500 - never place exception text into the response body.

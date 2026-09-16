@@ -13,6 +13,8 @@
 //   (f) cold single-flight: concurrent misses coalesce onto one upstream fetch
 //   (g-j) /v1/imgur: album normalization (https-only, imgur {data:[…]} -> {images:[…]}),
 //         cache HIT with no re-fetch, id-validation/SSRF 400, and upstream-failure 502 with no leak
+//   (k-o) /v1/imgur?image=: single-image normalization, animated -> mp4 preference, id/param
+//         validation 400, upstream 429 -> 502 logged as upstream_429, cold single-flight
 
 import http from 'node:http';
 import assert from 'node:assert/strict';
@@ -62,6 +64,19 @@ const imgurMock = http.createServer((req, res) => {
   if (req.url.includes('/3/album/failalbum/images')) {
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: false, status: 500, data: { error: 'imgur boom' } }));
+    return;
+  }
+  if (req.url.startsWith('/3/image/')) {
+    const id = req.url.slice('/3/image/'.length);
+    if (id === 'ratelimited') {
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, status: 429, data: { error: 'imgur throttled you' } }));
+      return;
+    }
+    const still = { id, link: `https://i.imgur.com/${id}.jpeg`, type: 'image/jpeg', width: 640, height: 480, animated: false };
+    const anim = { id, link: `https://i.imgur.com/${id}.gif`, type: 'image/gif', width: 320, height: 240, animated: true, mp4: `https://i.imgur.com/${id}.mp4` };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, status: 200, data: id === 'animimg' ? anim : still }));
     return;
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -194,7 +209,53 @@ try {
   assert.equal(r.status, 502, 'j: upstream non-200 -> 502');
   assert.ok(!/imgur boom/.test(r.body), 'j: imgur error text never leaks downstream');
 
-  console.log('PASS: all commons-cache self-tests passed (a-j)');
+  // (k) imgur single image MISS: fetch /3/image/{id} once, normalize {data:{link,...}}
+  //     -> {image:{url,type,w,h,animated}}.
+  let before2 = imgurHits;
+  r = await get('/v1/imgur?image=stillimg');
+  assert.equal(r.status, 200, 'k: 200');
+  assert.equal(r.xcache, 'MISS', 'k: X-Cache MISS');
+  assert.equal(imgurHits - before2, 1, 'k: MISS hits imgur exactly once');
+  assert.deepEqual(JSON.parse(r.body), { image: { url: 'https://i.imgur.com/stillimg.jpeg', type: 'image/jpeg', w: 640, h: 480, animated: false } }, 'k: image normalized');
+
+  // (l) animated image prefers imgur's mp4 over the gif link.
+  r = await get('/v1/imgur?image=animimg');
+  assert.equal(r.status, 200, 'l: 200');
+  assert.deepEqual(JSON.parse(r.body), { image: { url: 'https://i.imgur.com/animimg.mp4', type: 'video/mp4', w: 320, h: 240, animated: true } }, 'l: animated -> mp4');
+
+  // (m) image id validation / param shape: bad id, both params, neither -> 400 before any fetch.
+  before2 = imgurHits;
+  for (const q of ['?image=bad!id', '?id=goodalbum&image=stillimg', '']) {
+    r = await get('/v1/imgur' + q);
+    assert.equal(r.status, 400, `m: ${q || '(none)'} -> 400`);
+    assert.ok(JSON.parse(r.body).error, 'm: 400 keeps the { error } shape');
+  }
+  assert.equal(imgurHits, before2, 'm: rejected requests never touch imgur');
+
+  // (n) upstream 429 -> fixed 502, no leak, logged with reason upstream_429 only.
+  const lines = [];
+  const realWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { lines.push(String(chunk)); return realWrite(chunk, ...rest); };
+  try { r = await get('/v1/imgur?image=ratelimited'); } finally { process.stdout.write = realWrite; }
+  assert.equal(r.status, 502, 'n: upstream 429 -> 502');
+  assert.ok(!/throttled/.test(r.body), 'n: imgur error text never leaks downstream');
+  const logged = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).find((l) => l && l.route === '/v1/imgur' && l.status === 502);
+  assert.ok(logged, 'n: 502 was logged');
+  assert.equal(logged.reason, 'upstream_429', 'n: reason is the fixed category');
+  assert.ok(!lines.some((l) => /throttled|ratelimited/.test(l)), 'n: neither imgur body nor the id reaches the log');
+  assert.equal(upstreamFailure(404), 'not_found');
+
+  // (o) image cold single-flight: concurrent cold reads of one image = one imgur fetch;
+  //     a follow-up read is a HIT.
+  before2 = imgurHits;
+  const imgs = await Promise.all(Array.from({ length: 12 }, () => get('/v1/imgur?image=coldimg')));
+  assert.ok(imgs.every((x) => x.status === 200), 'o: every concurrent reader gets a 200');
+  assert.equal(imgurHits - before2, 1, 'o: 12 concurrent cold reads = ONE imgur fetch');
+  r = await get('/v1/imgur?image=coldimg');
+  assert.equal(r.xcache, 'HIT', 'o: subsequent read is a HIT');
+  assert.equal(imgurHits - before2, 1, 'o: HIT does NOT re-fetch imgur');
+
+  console.log('PASS: all commons-cache self-tests passed (a-o)');
 } catch (err) {
   failed = true;
   console.error('FAIL:', err.message);
