@@ -12,7 +12,7 @@ This guide runs the request-path components (relay, gateway, and optionally the 
 
 ## 1. Generate the gateway HPKE seed
 
-The gateway derives its HPKE keypair from a 32-byte seed, `SEED_SECRET_KEY`, given as hex. This is the one real secret in the system, so keep it out of version control and out of logs.
+The gateway derives its HPKE keypair from a 32-byte seed, `SEED_SECRET_KEY`, given as hex. Keep it out of version control and logs, along with relay credentials, issuer signing keys and optional storage credentials/salts. Each operator should hold only the secrets required by its own service.
 
 ```sh
 openssl rand -hex 32
@@ -209,12 +209,14 @@ docker run -d --name issuer --network columbia -p 8083:8080 \
 | `APPLE_APP_ATTEST_ROOT_CA_PEM_B64` | to enforce | Apple's App Attest Root CA, PEM, base64; without it (and the two below) App Attest fails closed |
 | `APPLE_TEAM_ID` | to enforce | your Apple Team ID, the first half of the appID the attestation must match |
 | `APPLE_BUNDLE_ID` | to enforce | your app's bundle id, the second half of the appID |
-| `APPLE_APP_ATTEST_AAGUID` | `appattest` | `appattest` for production, `appattestdevelop` for dev or TestFlight builds |
+| `APPLE_APP_ATTEST_AAGUID` | `appattest` | Match the actual App Attest environment; TestFlight and App Store builds use production (`appattest`). Development validation remains a separate configuration/physical-device check. |
 | `APP_ATTEST_CLOCK_SKEW_MS` | `300000` | tolerance when checking the attestation cert validity windows, for clock drift |
 | `REQUIRE_FDID` | (none) | when set, reject any request that did not arrive through the edge front door (see [Edge front door](#edge-front-door-cdn--waf)); `GET /health` and `GET /issuer-keys` stay reachable |
 | `FDID_HEADER` | `x-azure-fdid` | name of the header the edge front door injects for the `REQUIRE_FDID` lock above; override for a non-Azure CDN or WAF that injects a differently named header |
 
 > Generate a local test signing key with `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -outform DER | base64 | tr -d '\n'`. In production the key comes from your secret store at runtime, never from the repo, exactly like the gateway's `SEED_SECRET_KEY`.
+
+Apple documents that [TestFlight and App Store distributions always use the production App Attest environment](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.devicecheck.appattest-environment), regardless of a development entitlement.
 
 Before enabling token mode, configure the separate durable stores and reviewed
 current/previous key manifest described in [issuer configuration](token-issuer/README.md#configuration)

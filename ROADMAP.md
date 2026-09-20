@@ -15,6 +15,8 @@ Legend: ✅ done, 🟡 partial, ⬜ not started, 💲 has a recurring cost, 🔗
 - ✅ RED-only observability. Every service logs `{ts, route(template), status, durationMs[, cache]}`, and the relay's failure paths add a bounded `reason` plus the underlying error code, so a 502 is attributable to a cause. No IP, no content, no bodies, and `LOG_SECRETS=false` on the gateway.
 - ✅ Key-config pinning. Clients can pin the gateway's HPKE key-config SHA-256 fingerprint to catch a swapped key.
 - ✅ Token issuer (Privacy Pass). Issues per-device, per-epoch tokens gated on real Apple App Attest validation; the relay verifies and spends a token before forwarding a request.
+- ✅ Optional shared state adapters. The issuer stores registrations, monotonic assertion counters and epoch quotas atomically; the relay uses a separate create-only anonymous redemption store. Azure storage errors and ambiguous writes fail closed unless readback proves the exact operation. Memory adapters remain available for one-process development.
+- ✅ Bounded token lifecycle handling. Epoch publication validates actual key material; relay key refresh has a deadline, response-size bound and single-flight behavior. Graceful termination tracks HTTP and asynchronous work with a fixed drain deadline.
 - ✅ Relay abuse controls. Per-client rate limiting and a configurable trusted client-IP header, for deployments that sit behind another proxy.
 - ✅ Gateway outbound rate limit. Optional global cap on outbound requests (`GATEWAY_MAX_QPM`), so a burst of client traffic can't turn into a burst of upstream traffic.
 - ✅ Configurable front-door origin lock. `FDID_HEADER` sets which request header the origin lock checks, so it isn't tied to any one CDN or WAF.
@@ -24,7 +26,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started, 💲 has a recurring cost, 🔗
 ## Remaining work
 
 ### (a) Relay as a maintained edge worker, for global POPs ⬜🔗
-The two-operator split (see Working today) already gets identity and content into separate trust domains. What's still missing is a relay implementation built for an edge-worker platform (Cloudflare Workers, Fastly Compute, etc.) — the relay is about 75 lines of stateless forwarding, a good fit for that model, and it would give a maintained, third-party-operated relay with points of presence close to clients everywhere, rather than a self-hoster's own single-region container.
+The two-operator split (see Working today) already gets identity and content into separate trust domains. What's still missing is a maintained relay for an edge-worker platform (Cloudflare Workers, Fastly Compute, etc.), operated independently with points of presence close to clients. Such a port must preserve bounded buffering, cancellation, authentication admission and atomic shared spend decisions; copying only the forwarding handler is insufficient.
 
 ### (b) Confidential-compute gateway on SEV-SNP ⬜🔗💲
 Run the gateway in an AMD SEV-SNP confidential VM so the host and operator cannot read gateway memory. That closes the gap where the operator could otherwise read decrypted content or the HPKE key out of the process. Confidential SKUs cost more and usually do not scale to zero, so budget the always-on floor accordingly.
@@ -41,8 +43,12 @@ Stop per-user key targeting, where a gateway hands one client a unique key to de
 ### (f) CDN in front of the cache tier ⬜💲
 The commons cache already emits CDN-ready headers. Put a CDN in front so public content is edge-cached globally and the cache tier only sees origin-shield traffic. It serves identical public content, so there's no per-user signal to leak.
 
-### (g) Shared cache and shared redemption store ⬜💲
-Each cache replica has its own in-memory store, so hit-rate drops as replicas fan out. A shared store (Redis, for instance) makes hit-rate replica-independent; keep single-flight across replicas with a distributed lock. Largely moot once (f) is in place. The relay's spend-once (nullifier) set has the same per-replica limitation, for a different reason: it should move to a shared, epoch-TTL'd store (e.g. Redis `SET NX`, keyed by nullifier, with a TTL past the token's epoch) so a token can't be double-spent across replicas and redemption state expires with the epoch instead of only on restart or a size cap.
+### (g) Shared cache and token-state operations 🟡💲
+Each cache replica still has its own in-memory content store. A shared cache and distributed single-flight could improve hit-rate as replicas fan out; (f) may reduce that need.
+
+Shared issuer and relay state are implemented as separate optional Azure Table adapters. Real-service acceptance covers atomic conflicts, replay prevention and ambiguous acknowledgments. Production provisioning, migration, older-client compatibility and real-device App Attest/registration-loss recovery remain separate rollout requirements. Keep an existing deployment's enforcement policy until those requirements are met.
+
+Spend rows deliberately have no automatic TTL or capacity eviction. Safe cleanup requires a permanent retirement fence for the actual signing-key material: aging an epoch number alone must not permit a reused key to revive a spent token. Operational retention, storage growth and safe retirement remain open work.
 
 ### (h) Retries and resilience 🟡
 The relay pools its gateway connections and bounds response memory, cancels outbound work when a caller disconnects, and returns one terminal outcome. It does **not** automatically replay ciphertext after a reset: a lost response may follow a committed inner write, and buffering the ciphertext does not make replay safe. The caller knows the inner method and owns any retry decision. This supersedes the v1.4.4 one-shot reused-socket retry.

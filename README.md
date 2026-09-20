@@ -4,7 +4,7 @@
 
 Columbia is named after Apollo 11's Command and Service Module, which stayed in orbit without visibility into the lunar surface operations below.
 
-The toolkit has almost no dependencies. HTTP content is fetched through a split-trust path built on OHTTP ([RFC 9458](https://www.rfc-editor.org/rfc/rfc9458)). Three services carry the request path (relay, gateway, commons cache), and a fourth optional service (the token issuer) gates who may use the relay without identifying them. Each runs as a self-hosted service on Docker, on any host.
+HTTP content is fetched through a split-trust path built on OHTTP ([RFC 9458](https://www.rfc-editor.org/rfc/rfc9458)). Three services carry the request path (relay, gateway, commons cache), and a fourth optional service (the token issuer) gates who may use the relay without identifying them. Each runs as a self-hosted service on Docker, on any host. The issuer and relay include locked dependencies for cryptography or optional shared storage; a managed cloud is not required for local development.
 
 No single operator ever holds both client identity and request content at the same time. The relay sees the client IP but only opaque ciphertext. The gateway decrypts and fetches but never sees the client IP. Run the two as separate operators and neither can link a client to the content it fetched.
 
@@ -91,12 +91,14 @@ The gateway publishes its HPKE key material at two endpoints. `GET /ohttp-config
 
 The relay is the only service that has to be public. The gateway and the commons cache run on internal ingress, reachable only from inside the environment, and the issuer is its own public service alongside the relay. Because the gateway is internal, clients cannot fetch its key config directly, so the relay proxies that one read at `GET /ohttp-configs` and returns the gateway's public key-config bytes verbatim. That is public material clients are meant to pin, so the passthrough leaks nothing.
 
-The relay carries the abuse controls, none of which weaken the operator-blind property because all of their state is in memory, keyed to nothing that ties back to content, and never logged:
+The relay's rate and concurrency controls use transient memory. Optional shared redemption storage retains only anonymous spend claims, public-key fingerprints and signature hashes, without request content or client IP. Issuer registration/counter/quota state uses a separate store and operator credential; it must never be shared with the relay. These stores do not remove timing-correlation or operator-collusion risks.
 
 - Per-IP rate limiting keyed on the address the trusted ingress appended, plus a global concurrency cap.
 - A strict request shape: only `POST /relay` with `Content-Type: message/ohttp-req` is served.
 - A relay-to-gateway shared secret (`X-Columbia-Relay-Auth`) so the gateway rejects traffic that did not come through the relay.
 - A pluggable client-auth hook with modes `off`, `secret`, and `token`. In `token` mode the relay verifies an anonymous issuer-signed token offline and enforces spend-once.
+
+The optional Azure Table adapters preserve issuer counters/quotas and relay spend decisions across replicas and restarts. Memory mode is limited to one process. Enabling token enforcement requires a separate compatible rollout, durable state, reviewed epoch keys and real-device App Attest acceptance; installing a newer image does not complete those steps. See the [issuer deployment requirements](token-issuer/README.md#what-is-production-ready-vs-what-still-needs-work), [relay token mode](ohttp-relay/README.md#token-mode-privacy-pass) and [roadmap](ROADMAP.md).
 
 A CDN or WAF (for example a managed front door) can sit in front of the public relay and issuer to absorb DDoS and rate-limit at the edge. When the relay and issuer are configured to require it, they reject any request that did not arrive through that front door, so the origins cannot be reached directly. See [SELFHOSTING.md](./SELFHOSTING.md).
 

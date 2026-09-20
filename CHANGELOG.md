@@ -1,6 +1,27 @@
 # Changelog
 
-Notable changes to Columbia. Releases are git tags; the most recent tagged release is `v1.5.0`.
+Notable changes to Columbia. Published releases and their exact tags are listed on [GitHub Releases](https://github.com/wbsmolen/columbia/releases).
+
+## Unreleased
+
+### Added
+
+- Optional Azure Table state for issuer registrations, assertion counters and epoch quotas, with atomic conflict handling and bounded readback of ambiguous writes. Re-attestation preserves existing counters and quotas.
+- A separate optional shared relay redemption store with create-only spend claims, preventing duplicate redemption across replicas and restarts. Storage credentials and state remain separate from the issuer.
+- Validated epoch-key manifests and bounded, single-flight relay key refresh. Invalid, expired or unavailable key/state results fail closed with typed status and retry guidance.
+- Graceful issuer and relay shutdown that drains owned HTTP and asynchronous work within a fixed deadline, plus focused lifecycle and real-storage regression coverage.
+
+### Fixed
+
+- Relay admission retains its in-flight slot while token authentication is pending, including after a caller disconnects.
+- Issuer diagnostics use a closed set of fields and reason categories instead of caller-controlled paths or exception text.
+- The client lifecycle contract now documents interrupted enrollment, registration-loss recovery, payload binding and compatibility with earlier unversioned key responses.
+
+### Upgrade notes
+
+- An image rollout does not enable token authentication, rotate signing keys or configure shared storage. When explicitly configured, the adapters initialize their dedicated tables using the supplied operator credentials. Preserve existing enforcement and key identity during rollout; qualify durable storage, real-device App Attest and older clients before enabling token mode.
+- Memory state is for a single process. Durable spend rows have no automatic expiry: safe cleanup requires permanent retirement of the actual signing-key material, not merely an old epoch number.
+- README, self-hosting guidance and roadmap now distinguish implemented adapters from remaining deployment, retention and hardware acceptance work.
 
 ## v1.6.0 - 2026-09-16
 
