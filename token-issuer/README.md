@@ -150,12 +150,14 @@ below before running multiple replicas.
 | `APPLE_APP_ATTEST_ROOT_CA_PEM_B64` | unset | Apple's App Attest Root CA, PEM, base64. Required to ENFORCE App Attest |
 | `APPLE_TEAM_ID` | unset | your Apple Team ID. Required to enforce App Attest |
 | `APPLE_BUNDLE_ID` | unset | the iOS client's bundle id. Required to enforce App Attest |
-| `APPLE_APP_ATTEST_AAGUID` | `appattest` | `appattest` for production, `appattestdevelop` for dev/TestFlight builds |
+| `APPLE_APP_ATTEST_AAGUID` | `appattest` | `appattest` for production, including TestFlight; `appattestdevelop` only for development App Attest |
 | `APP_ATTEST_CLOCK_SKEW_MS` | `300000` | tolerance (ms) when checking the x5c certs' validity windows, for issuer/Apple clock drift |
 | `REQUIRE_CLIENT_DATA_BINDING` | `1` (on) | require the App Attest `clientDataHash` to commit to the exact `blinded[]` batch + epoch (see below). Set to `0` only during client bring-up, before the iOS client computes the matching hash |
 | `REQUIRE_FDID` | unset | when set, reject any request whose `X-Azure-FDID` header does not match, so the issuer only accepts traffic that arrived through your front door (a CDN or WAF, for example Azure Front Door). `/health` and `/issuer-keys` are exempt. Empty/unset disables the check |
 | `FDID_HEADER` | `x-azure-fdid` | name of the header the edge front door injects for the `REQUIRE_FDID` lock above; override for a non-Azure CDN or WAF that injects a differently named header |
 | `LOG_HEALTH` | unset | successful `GET /health` probe hits are not logged (at platform probe cadence they are almost all log volume, drowning the RED signal); set `1` to log them again for a debugging session. Failing probes are unaffected |
+
+[TestFlight always uses the production App Attest environment](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.devicecheck.appattest-environment), regardless of a development entitlement. Development and production validation remain separate physical-device checks.
 
 The signing key is injected exactly like the gateway's `SEED_SECRET_KEY`: from your
 host's secret store at runtime, never written to disk in this repo.

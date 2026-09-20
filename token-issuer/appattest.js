@@ -41,10 +41,10 @@ const APPLE_ROOT_CA_PEM_B64 = process.env.APPLE_APP_ATTEST_ROOT_CA_PEM_B64 || ''
 const APPLE_TEAM_ID = process.env.APPLE_TEAM_ID || '';
 const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || '';
 
-// Apple's production App Attest environment uses the aaguid "appattest" (dev uses
-// "appattestdevelop"). Operators on a development/TestFlight provisioning profile
-// set this to the dev value. Both are 16-byte aaguids: the ASCII bytes of the
-// label, zero-padded to 16 bytes.
+// Apple's production App Attest environment uses the aaguid "appattest",
+// including TestFlight regardless of the entitlement setting. Development App
+// Attest uses "appattestdevelop". Both are 16-byte aaguids: the ASCII bytes of
+// the label, zero-padded to 16 bytes.
 const EXPECTED_AAGUID_LABEL = process.env.APPLE_APP_ATTEST_AAGUID || 'appattest';
 
 // Apple's App Attest leaf certs are short-lived but the attestation is validated
