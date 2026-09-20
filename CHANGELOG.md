@@ -48,7 +48,7 @@ Notable changes to Columbia. Published releases and their exact tags are listed 
 
 - Request diagnostics use fixed fields and categories. Relay exception messages/stacks and gateway caller-derived debug details are excluded from operational logs.
 - Node services track Node 24 LTS; the gateway builder tracks Go 1.27 and Docker's requested target architecture. Rebuild with fresh supported patch images; runtime image updates do not alter the wire protocol.
-- Updated source provenance and deployment documentation. These changes are proposed source changes until released and deployed; production v1.4.4 retains its historical behavior described below.
+- Updated source provenance and deployment documentation.
 
 ## v1.4.4 - 2026-08-02
 

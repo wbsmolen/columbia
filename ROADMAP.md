@@ -10,7 +10,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started, 💲 has a recurring cost, 🔗
 
 - ✅ OHTTP data path, end to end. Client HPKE-seal -> relay -> gateway (HPKE-decrypt) -> target -> back. Standard RFC 9458 / 9292 / 9180.
 - ✅ OHTTP relay. Strips the client IP and all headers, forwards only the opaque `message/ohttp-req` ciphertext to the gateway.
-- ✅ Vendored gateway. Cloudflare `privacy-gateway-server-go`, pinned commit, BSD-3 license preserved. Three small, documented Columbia-local additions on top (relay-auth check, endpoint guard, outbound rate limiter) and two unconditional response-path fixes (inner `500` on a response-side failure, bounded upstream timeout) — see `ohttp-gateway/VENDORED.md` for the full list.
+- ✅ Vendored gateway. Cloudflare `privacy-gateway-server-go`, pinned commit, BSD-3 license preserved. Documented Columbia-local changes include relay authentication, endpoint registration guards, outbound rate limiting, response-side error mapping and upstream timeouts, bounded operational diagnostics, corrected Prometheus accounting, and sanitized request logs — see `ohttp-gateway/VENDORED.md` for the full list.
 - ✅ Commons cache. Optional public-content cache origin: TTL, stale-while-revalidate, single-flight, `X-Cache: HIT|MISS|STALE`, CDN-ready `Cache-Control` and `Age` headers.
 - ✅ RED-only observability. Every service logs `{ts, route(template), status, durationMs[, cache]}`, and the relay's failure paths add a bounded `reason` plus the underlying error code, so a 502 is attributable to a cause. No IP, no content, no bodies, and `LOG_SECRETS=false` on the gateway.
 - ✅ Key-config pinning. Clients can pin the gateway's HPKE key-config SHA-256 fingerprint to catch a swapped key.
