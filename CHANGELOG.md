@@ -13,7 +13,6 @@ Notable changes to Columbia. Published releases and their exact tags are listed 
 
 ### Fixed
 
-- The relay no longer automatically replays opaque requests after a connection reset. A lost response can follow a completed inner write; the client owns any method-aware retry.
 - Relay admission retains its in-flight slot while token authentication is pending, including after a caller disconnects.
 - Issuer diagnostics use a closed set of fields and reason categories instead of caller-controlled paths or exception text.
 - The client lifecycle contract now documents interrupted enrollment, registration-loss recovery, payload binding and compatibility with earlier unversioned key responses.
@@ -62,7 +61,7 @@ Notable changes to Columbia. Published releases and their exact tags are listed 
 ### Changed
 
 - `ohttp-gateway`: the upstream `http.Client` now has a 30s `Timeout` (was unbounded), so a stalled target can't pin a gateway worker forever.
-- `ohttp-relay`: the relay→gateway hop uses a keep-alive `https.Agent` (`maxSockets: 128`) instead of a fresh TLS handshake per request, and retries a gateway `POST` **exactly once** on a fresh socket when a kept-alive socket is reset by the peer (`ECONNRESET` on a reused socket, nothing sent to the client yet). Retries are logged as `reason: 'gw_retry'`. This historical retry is removed in Unreleased: buffering does not establish that the gateway has not already processed an opaque request.
+- `ohttp-relay`: the relay→gateway hop uses a keep-alive `https.Agent` (`maxSockets: 128`) instead of a fresh TLS handshake per request, and retries a gateway `POST` **exactly once** on a fresh socket when a kept-alive socket is reset by the peer (`ECONNRESET` on a reused socket, nothing sent to the client yet). Retries are logged as `reason: 'gw_retry'`. This historical retry was removed in v1.5.0: buffering does not establish that the gateway has not already processed an opaque request.
 - `ohttp-relay`: `MAX_RESP_BYTES` default raised from 1 MB to 5 MB — large comment threads legitimately exceeded the old cap. The env override is unchanged.
 
 ### Added
