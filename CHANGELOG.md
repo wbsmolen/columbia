@@ -13,6 +13,7 @@ Notable changes to Columbia. Published releases and their exact tags are listed 
 
 ### Fixed
 
+- The relay no longer automatically replays opaque requests after a connection reset. A lost response can follow a completed inner write; the client owns any method-aware retry.
 - Relay admission retains its in-flight slot while token authentication is pending, including after a caller disconnects.
 - Issuer diagnostics use a closed set of fields and reason categories instead of caller-controlled paths or exception text.
 - The client lifecycle contract now documents interrupted enrollment, registration-loss recovery, payload binding and compatibility with earlier unversioned key responses.
