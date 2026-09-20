@@ -37,9 +37,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
-# Most services are dependency-free and ship no lockfile. The token-issuer is the
-# issuer and relay have npm dependencies and track lockfiles through their
-# directory-level negations for reproducible Docker builds.
+# The issuer and relay have npm dependencies and track lockfiles through
+# directory-level negations for reproducible Docker builds. Other services
+# remain dependency-free and ship no lockfile.
 package-lock.json
 
 # ── Go build artifacts (vendored gateway) ──
