@@ -110,7 +110,7 @@ test('(b) a valid token passes the relay verifyAccessToken', async () => {
   loadRelayKey(epoch);
   const m = await mintToken(epoch, crypto.randomBytes(32));
 
-  assert.strictEqual(relay.verifyAccessToken(m.headerValue), true,
+  assert.strictEqual(await relay.verifyAccessToken(m.headerValue), true,
     'a freshly minted, well-formed token must be accepted by the relay');
 });
 
@@ -121,8 +121,8 @@ test('(c) spending the same token twice is rejected (spend-once)', async () => {
   loadRelayKey(epoch);
   const m = await mintToken(epoch, crypto.randomBytes(32));
 
-  assert.strictEqual(relay.verifyAccessToken(m.headerValue), true, 'first spend accepted');
-  assert.strictEqual(relay.verifyAccessToken(m.headerValue), false, 'second spend rejected');
+  assert.strictEqual(await relay.verifyAccessToken(m.headerValue), true, 'first spend accepted');
+  assert.strictEqual(await relay.verifyAccessToken(m.headerValue), false, 'second spend rejected');
 });
 
 // --- (d) tampered / forged tokens are rejected ------------------------------
@@ -142,7 +142,7 @@ test('(d) a tampered or forged token is rejected', async () => {
     signature: badSig.toString('base64'),
   };
   const tamperedSigHeader = 'PrivateToken ' + Buffer.from(JSON.stringify(tamperedSig)).toString('base64url');
-  assert.strictEqual(relay.verifyAccessToken(tamperedSigHeader), false, 'tampered signature rejected');
+  assert.strictEqual(await relay.verifyAccessToken(tamperedSigHeader), false, 'tampered signature rejected');
 
   // (d2) Tamper the token input (claim the signature covers a different message).
   const badInput = Buffer.from(m.prepared);
@@ -153,20 +153,20 @@ test('(d) a tampered or forged token is rejected', async () => {
     signature: m.tokenObj.signature,
   };
   const tamperedInputHeader = 'PrivateToken ' + Buffer.from(JSON.stringify(tamperedInput)).toString('base64url');
-  assert.strictEqual(relay.verifyAccessToken(tamperedInputHeader), false, 'tampered token input rejected');
+  assert.strictEqual(await relay.verifyAccessToken(tamperedInputHeader), false, 'tampered token input rejected');
 
   // (d3) Forge a signature with an ATTACKER key the issuer never authorized. Must
   // be rejected because the relay only holds the genuine epoch public key.
   const attacker = await makeEpochKey(); // different keypair, NOT loaded into relay
   const forged = await mintToken({ ...attacker, keyId: epoch.keyId }, crypto.randomBytes(32));
   // Present it under the genuine epoch's keyId so the relay looks up the real key.
-  assert.strictEqual(relay.verifyAccessToken(forged.headerValue), false,
+  assert.strictEqual(await relay.verifyAccessToken(forged.headerValue), false,
     'a signature from an unauthorized key must not verify under the genuine public key');
 
   // (d4) Garbage / unparseable header is rejected, not crashed.
-  assert.strictEqual(relay.verifyAccessToken('PrivateToken not-base64-$$$'), false);
-  assert.strictEqual(relay.verifyAccessToken(''), false);
-  assert.strictEqual(relay.verifyAccessToken(undefined), false);
+  assert.strictEqual(await relay.verifyAccessToken('PrivateToken not-base64-$$$'), false);
+  assert.strictEqual(await relay.verifyAccessToken(''), false);
+  assert.strictEqual(await relay.verifyAccessToken(undefined), false);
 });
 
 // --- (e) unlinkability sanity check -----------------------------------------
@@ -208,27 +208,6 @@ test('(e) the issuer view cannot be matched to the finished token', async () => 
     Buffer.from(m.signature).toString('hex'),
     Buffer.from(m.blindSig).toString('hex'),
   );
-});
-
-// --- bonus: quota accounting (per-device per-epoch) -------------------------
-
-test('(f) per-device per-epoch issuance quota reserves and then refuses', () => {
-  // reserveQuota is exported from the issuer. Default quota is large, so use a
-  // distinct device id and drive it past a small simulated budget by reserving in
-  // chunks. We can't change the env-configured quota here, so this asserts the
-  // monotonic reserve behavior: repeated reserves accumulate, and a single
-  // oversized reserve for a fresh device is refused.
-  const epoch = issuer.currentEpoch();
-  const device = 'test-device-' + crypto.randomBytes(8).toString('hex');
-
-  // A reservation that fits should succeed.
-  assert.strictEqual(issuer.reserveQuota(epoch, device, 1), true);
-
-  // A reservation that would exceed the per-epoch quota in one shot is refused.
-  const huge = 10_000_000;
-  const fresh = 'test-device-' + crypto.randomBytes(8).toString('hex');
-  assert.strictEqual(issuer.reserveQuota(epoch, fresh, huge), false,
-    'an over-quota batch must be refused for a fresh device');
 });
 
 // --- (g) signing-key format tolerance + real server boot --------------------
@@ -361,23 +340,4 @@ test('(h2) expectedClientDataHash matches the pinned cross-check vector (mirrore
     'binding hash for the fixed vector must equal the value the Swift test also pins');
 });
 
-// --- (i) re-attestation must not roll the assertion counter backwards --------
-//
-// A fresh attestation reports signCount 0. If a device re-attests an existing
-// keyId, the store must KEEP the higher counter so the assertion-replay window is
-// not re-opened (security review F2).
-test('(i) ATTEST_STORE preserves the higher sign counter on re-attestation', () => {
-  const { ATTEST_STORE } = issuer;
-  const keyId = 'test-keyid-' + crypto.randomBytes(8).toString('hex');
-  const pem = '-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----\n';
-
-  // Register, then advance the counter via assertions.
-  ATTEST_STORE.setAttestedKey(keyId, pem, 0);
-  ATTEST_STORE.setSignCount(keyId, 42);
-  assert.strictEqual(ATTEST_STORE.getAttestedKey(keyId).signCount, 42);
-
-  // Re-attestation reports 0; the store must keep 42, not roll back.
-  ATTEST_STORE.setAttestedKey(keyId, pem, 0);
-  assert.strictEqual(ATTEST_STORE.getAttestedKey(keyId).signCount, 42,
-    're-attestation must not reset the counter to 0');
-});
+// Atomic quota/counter and re-registration regressions live in state-store.test.js.

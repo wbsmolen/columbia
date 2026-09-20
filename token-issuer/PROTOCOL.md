@@ -88,6 +88,7 @@ Response `200`, `application/json`:
 
 ```json
 {
+  "schemaVersion": 1,
   "suite": "RSABSSA-SHA384-PSS-Deterministic",
   "epoch": 2871,
   "epochSeconds": 604800,
@@ -106,6 +107,13 @@ Response `200`, `application/json`:
   base64.
 - On a missing or unreadable signing key the issuer returns `503` (fail closed),
   not an empty key list.
+
+Clients select the key whose `epoch` equals the top-level `epoch`, not the
+first array item or nonexistent `current`/`previous` properties. `schemaVersion`
+is additive; earlier unversioned responses use this same version-1 shape. Reject
+unknown versions/suites and malformed or ambiguous epoch lists. Cache public keys
+for a bounded period no longer than the next epoch boundary; a failed bootstrap
+must back off instead of issuing a key request for every content read.
 
 ### POST /issue
 
@@ -278,12 +286,43 @@ client drives it.
    requires a strictly increasing sign counter (replay/rollback protection). Then
    binding + quota + blind-sign as above.
 
-4. **Re-attest on rejection.** If the issuer has forgotten the device (process
-   restart on a single-replica deployment) it answers an assertion with
-   `unknown_device_key`. App Attest only allows ONE `attestKey` per key, so the client
-   cannot re-attest the same key; on a persistent rejection it must mint a fresh
-   key and attest that. The client should clear its "registered" marker and retry with
-   a fresh attestation.
+4. **Recover only an explicitly invalid registration.** A well-formed
+   `401 {"error":"unknown_device_key"}` response to an assertion can mean the
+   issuer lost its registration. The client may retire only that request's
+   current issuer/key binding, then enroll a fresh hardware key on a later
+   refill. The same policy applies to Apple's typed `DCError.invalidKey`;
+   arbitrary HTTP401/403, issuer503, transport failure and malformed/error bodies
+   must not reset device identity. Automatic replacement is limited to one per
+   issuer per24hours, persisted through relaunch, success and token-bank clear.
+   This is a conservative client policy, not an Apple service requirement.
+
+5. **Record Apple's one-shot success before sending `/issue`.** Successful
+   `attestKey` changes the protected lifecycle to assertion-ready before any
+   issuer POST. A lost HTTP acknowledgment then leads to an assertion on a later
+   refill; the client never replays the ambiguous attestation-bearing batch.
+   The issuer either retained registration or answers with the typed rejection
+   above. A successful Apple operation cannot be repeated merely because a
+   server response or local finalization was lost.
+
+6. **Retry Apple unavailability with identical inputs.** Apple's typed
+   `serverUnavailable` preserves the exact key, binding hash and blinded batch.
+   A bounded public enrollment envelope and retry deadline live in protected
+   storage, scoped to the issuer/key/attempt. Every retry consumes its safe-retry
+   permission durably before calling Apple. After an interrupted ambiguous Apple
+   call, a fresh assertion probes that same hardware key; it does not repeat
+   one-shot attestation. An expired ambiguous batch does not itself expire the
+   hardware key. An expired known-unattested enrollment uses the bounded
+   replacement policy instead of relabeling the old binding.
+
+The public swift-crypto API does not serialize blinding inverses. A same-process
+Apple retry retains its worker and finalizes normally. A known-safe enrollment
+resumed after process loss can register with its exact saved public envelope,
+but must discard that one batch's unfinalizable blind signatures and obtain
+usable tokens with a later assertion. This may consume one16-token issuance
+batch. There is no refund, quota reset, ambiguous POST replay or exposed bearer.
+Protected-state failures stop before proof/HTTP admission or replacement; they
+are never interpreted as a fresh installation. Legacy registered markers are
+migrated against their original keys before any successor is created.
 
 There is no separate challenge round trip. The binding hash IS the challenge, and
 because it is derived from the batch + epoch it is fresh by construction.
@@ -345,9 +384,12 @@ Notes the relay deployment depends on:
 
 - Salt length is 48 bytes (`TOKEN_PSS_SALT_LEN`), matching SHA-384, matching the
   suite. Do not change one without the others.
-- The spend-once set is in-process on a single replica. A multi-replica relay needs
-  a shared atomic store (e.g. Redis `SET NX` keyed by the nullifier with a TTL past
-  the epoch). Same applies to the issuer's attested-key store and quota counter.
+- Configure separate issuer and relay Azure Table credentials for shared state.
+  Issuer counter/quota reservation uses one ETag-protected row; relay redemption
+  uses one create-only row per full public-key fingerprint/signature hash.
+  The memory fallbacks do not support multiple replicas or durable restart state.
+  No spend eviction/TTL occurs; actual-key retirement fencing is required before
+  deleting old spends. Unavailable state returns503 with `Retry-After: 2`.
 - Logs are RED-only on both services: never the token, never the device id, never
   the IP, never content. Only aggregate counters and coarse status.
 
@@ -371,3 +413,29 @@ issuer to exercise end to end:
 - Re-attestation after an issuer restart.
 
 Those are device-only.
+
+## Client lifecycle and compatible rollout
+
+A client banks tokens in device-only secure storage, scoped to the issuer and
+locally expired after the following epoch. One refill runs at a time; spending
+removes a bearer durably before returning it, without waiting for network or RSA
+work. Refill completion merges into the current bank so concurrent readers cannot
+resurrect spent tokens. Clear/configuration changes invalidate old completions.
+Device registration belongs to the hardware key and issuer, not a Reddit account.
+
+At an epoch boundary `/issue` signs with the current or previous key that matched
+the request's binding hash, and returns that signing epoch and key ID. Quota is
+still charged in the server's current epoch. A quota 429 includes `Retry-After`
+seconds until the quota epoch ends; clients should respect a bounded retry delay.
+No client should replay an ambiguous content mutation to repair token transport.
+
+The canonical token header remains `x-columbia-token`; this change does not alter
+`CLIENT_AUTH_MODE` or add a HMAC authentication mode. App-side header emission does
+not establish server enforcement. Keep rollout compatibility with older clients
+separate from the schema/lifecycle repair. Local shared state and optional
+`ISSUER_EPOCH_KEYS_JSON` current/previous distinct-key selection are implemented.
+The unchanged legacy `ISSUER_SIGNING_KEY` mode still reuses material across epochs;
+key ID alone cannot establish expiry. Production provisioning, coordinated manifest
+rotation, retained spend-state capacity and physical App Attest/older-client
+acceptance remain enforcement gates. No backend implementation changes the
+currently deployed `CLIENT_AUTH_MODE=off` policy.

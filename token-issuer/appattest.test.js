@@ -81,7 +81,7 @@ test('(a1) a well-formed attestation is ACCEPTED and returns the device key + ke
   assert.match(res.publicKeyPem, /BEGIN PUBLIC KEY/, 'returns the attested public key as PEM');
 });
 
-test('(a2) an assertion from the attested key verifies and advances the counter', async () => {
+test('(a2) an assertion returns a verified counter candidate without mutating registration', async () => {
   const reg = await validateAppAttest({
     keyId: base.keyIdB64, attestation: base.attestationB64, clientDataHash: base.clientDataHashB64,
   });
@@ -95,7 +95,9 @@ test('(a2) an assertion from the attested key verifies and advances the counter'
   assert.strictEqual(res.ok, true, `assertion must verify: ${res.reason} ${res.detail || ''}`);
   assert.strictEqual(res.mode, 'assertion');
   assert.strictEqual(res.signCount, 7);
-  assert.strictEqual(store.getAttestedKey(base.keyIdB64).signCount, 7, 'counter persisted');
+  assert.strictEqual(res.keyId, base.keyIdB64);
+  assert.strictEqual(res.publicKeyPem, reg.publicKeyPem);
+  assert.strictEqual(store.getAttestedKey(base.keyIdB64).signCount, 0, 'verification must not separately consume the counter');
 });
 
 test('(a3) two assertions with strictly increasing counters both pass', async () => {
@@ -106,11 +108,13 @@ test('(a3) two assertions with strictly increasing counters both pass', async ()
   const a1 = makeAssertion({ appId: APP_ID, credPrivateKey: base.credKey.privateKey, signCount: 3, challenge: crypto.randomBytes(32) });
   const r1 = await validateAppAttest({ keyId: base.keyIdB64, assertion: a1.assertionB64, clientDataHash: a1.clientDataHashB64, store });
   assert.strictEqual(r1.ok, true);
+  store.setSignCount(r1.keyId, r1.signCount); // simulate the caller's committed reservation
 
   const a2 = makeAssertion({ appId: APP_ID, credPrivateKey: base.credKey.privateKey, signCount: 4, challenge: crypto.randomBytes(32) });
   const r2 = await validateAppAttest({ keyId: base.keyIdB64, assertion: a2.assertionB64, clientDataHash: a2.clientDataHashB64, store });
   assert.strictEqual(r2.ok, true);
-  assert.strictEqual(store.getAttestedKey(base.keyIdB64).signCount, 4);
+  assert.strictEqual(r2.signCount, 4);
+  assert.strictEqual(store.getAttestedKey(base.keyIdB64).signCount, 3);
 });
 
 // ===========================================================================
