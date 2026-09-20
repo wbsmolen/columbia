@@ -1,0 +1,9 @@
+{
+  "name": "columbia-ohttp-relay",
+  "version": "1.0.0",
+  "private": true,
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "engines": { "node": ">=24" },
+  "scripts": { "start": "node server.js", "test": "node test.mjs && node --test *.test.js" },
+  "dependencies": { "@azure/data-tables": "13.3.2" }
+}

@@ -41,10 +41,10 @@ const APPLE_ROOT_CA_PEM_B64 = process.env.APPLE_APP_ATTEST_ROOT_CA_PEM_B64 || ''
 const APPLE_TEAM_ID = process.env.APPLE_TEAM_ID || '';
 const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || '';
 
-// Apple's production App Attest environment uses the aaguid "appattest" (dev uses
-// "appattestdevelop"). Operators on a development/TestFlight provisioning profile
-// set this to the dev value. Both are 16-byte aaguids: the ASCII bytes of the
-// label, zero-padded to 16 bytes.
+// Apple's production App Attest environment uses the aaguid "appattest",
+// including TestFlight regardless of the entitlement setting. Development App
+// Attest uses "appattestdevelop". Both are 16-byte aaguids: the ASCII bytes of
+// the label, zero-padded to 16 bytes.
 const EXPECTED_AAGUID_LABEL = process.env.APPLE_APP_ATTEST_AAGUID || 'appattest';
 
 // Apple's App Attest leaf certs are short-lived but the attestation is validated
@@ -520,8 +520,9 @@ function decodeAttestation(attestationBuf) {
 //   by keyId for future assertions.
 //
 // ASSERTION (per issuance): pass { keyId, assertion, clientDataHash } and a
-//   `store` with getAttestedKey(keyId) / setSignCount(keyId, n). On success
-//   returns { ok: true, mode: 'assertion', signCount }.
+//   `store` with async getAttestedKey(keyId). On success returns a verified
+//   { keyId, publicKeyPem, signCount } candidate. The caller atomically reserves
+//   counter and quota after payload validation; verification never mutates state.
 //
 // Returns { ok: false, reason } on any failure. While the module is unconfigured
 // (operator inputs absent) this ALWAYS returns { ok: false } - fail closed.
@@ -581,15 +582,14 @@ async function validateAppAttest({ keyId, attestation, assertion, clientDataHash
 
     // Subsequent calls: lightweight assertion against the stored key.
     if (assertion) {
-      if (!store || typeof store.getAttestedKey !== 'function' ||
-          typeof store.setSignCount !== 'function') {
+      if (!store || typeof store.getAttestedKey !== 'function') {
         return { ok: false, reason: 'no_attested_key_store' };
       }
       // Normalize the keyId the SAME way the attestation path stored it (canonical
       // base64), so a base64 vs base64url spelling difference between the
       // registration and a later assertion can't cause a spurious store miss.
       const storeKeyId = decodeKeyId(keyId).toString('base64');
-      const record = store.getAttestedKey(storeKeyId);
+      const record = await store.getAttestedKey(storeKeyId);
       if (!record || !record.publicKeyPem) {
         return { ok: false, reason: 'unknown_device_key' };
       }
@@ -601,12 +601,13 @@ async function validateAppAttest({ keyId, attestation, assertion, clientDataHash
         pub,
         record.signCount || 0,
       );
-      store.setSignCount(storeKeyId, newCount);
-      return { ok: true, mode: 'assertion', signCount: newCount };
+      return { ok: true, mode: 'assertion', keyId: storeKeyId,
+        publicKeyPem: record.publicKeyPem, signCount: newCount };
     }
 
     return { ok: false, reason: 'no_attestation_or_assertion' };
   } catch (err) {
+    if (err?.code === 'state_unavailable') return { ok: false, reason: 'state_unavailable' };
     // Any thrown check fails the whole validation closed. We deliberately surface
     // only a coarse reason string, never the attestation/assertion bytes.
     return { ok: false, reason: 'verification_failed', detail: err && err.message };

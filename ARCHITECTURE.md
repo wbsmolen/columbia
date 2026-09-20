@@ -36,7 +36,7 @@ The transport is [OHTTP (RFC 9458)](https://www.rfc-editor.org/rfc/rfc9458). The
 
 ### Abuse controls
 
-The relay is the public surface, so it carries the abuse controls. The design constraint is that none of them may weaken the operator-blind property, so all of their state is in memory, keyed to nothing that ties back to content, and never logged. It is dropped on restart.
+The relay is the public surface, so it carries the abuse controls. Rate-limit and concurrency state is transient memory and is dropped on restart. Optional shared redemption state contains anonymous spend claims, public-key fingerprints and signature hashes, never request content or client IP. The issuer's device registration, assertion counters and quotas belong to a separate store and operator credential. Neither store eliminates timing-correlation or collusion risks.
 
 - A per-IP fixed-window rate limit plus a global in-flight concurrency cap, both env-tunable. The per-IP key is the address the trusted ingress terminates: behind a single managed ingress the TCP peer is the ingress, so the relay reads the rightmost `X-Forwarded-For` entry. When the request crosses more than one proxy (a CDN or Front Door in front of the platform ingress) that rightmost entry is the nearest proxy rather than the client, which would collapse every client into one bucket; set `TRUSTED_CLIENT_IP_HEADER` to the front proxy's trusted client-IP header (`x-azure-socketip`, `cf-connecting-ip`) to key per real client. That IP is the same one the relay already terminates and is allowed to see; using it as a transient counter key reveals nothing the relay did not already hold, and it is never written to a log or forwarded to the gateway. Over-limit requests get a 429. A bounded key table keeps a spoofed-source flood from growing memory.
 - A strict request shape: only `POST /relay` with `Content-Type: message/ohttp-req` is served (wrong type returns 415, any other path or method returns 404), so there is no general proxy surface to probe.
@@ -61,7 +61,11 @@ A CDN or WAF can sit in front of the public relay and issuer to absorb DDoS and 
 - A per-device per-epoch quota bounds issuance, so even a genuine device is rate limited.
 - The device finalizes each token locally, then spends one per relay request in the outer OHTTP header. The relay verifies the signature offline against the issuer's published epoch public key and enforces spend-once. It fetches that public key periodically (not per request) and caches it, so the issuer never learns which token was spent.
 
-The blind signature severs the device identity the issuer saw at issuance from the token the relay sees at spend time. The unblinding factor never leaves the device, so even if one operator ran both the issuer and the relay, it could not match a token back to the device that requested it from a single request. Keep them under separate non-colluding operators anyway: with enough traffic shaping, an operator that holds both views could begin to correlate issuance and spend timing across many requests. The keypair rotates per epoch (one week by default), so everyone issued in the same epoch is one anonymity set. The issuer's per-device quota counter is scoped to the epoch and self-expires when it rolls. The relay's spend-once (nullifier) set is not epoch-aware today — it's an in-memory store bounded by size, with oldest-inserted eviction, cleared only on restart; see ROADMAP.md (g) for moving it to a shared, epoch-TTL'd store.
+The blind signature separates the finished token from the blinded issuance request; the unblinding factor stays on the device. Keep issuer and relay under separate non-colluding operators: an operator holding both views can still correlate timing and traffic shape.
+
+Epochs default to one week, but an epoch number does not rotate key material. An explicit manifest supplies distinct current/previous RSA keys to all issuer replicas. The legacy single-key configuration reuses a key across epochs and does not cryptographically expire signatures. The issuer atomically retains the greatest assertion counter and current/previous quota for each registered key; re-attestation preserves them.
+
+The optional Azure adapters persist issuer state and separate relay spend claims across replicas and restarts. Relay spends are keyed by actual public-key material and signature hash, with no automatic eviction or expiry. A memory adapter is limited to one process and fails closed at capacity. Durable cleanup requires a permanent key-retirement fence rather than an epoch-only TTL; see [the roadmap](ROADMAP.md) and service configuration. Synthetic acceptance does not establish real-device App Attest compatibility or authorize production token enforcement.
 
 The exact wire format, the App Attest binding, and the epoch model are in [`token-issuer/PROTOCOL.md`](./token-issuer/PROTOCOL.md).
 
@@ -125,7 +129,7 @@ The rule is RED metrics only (rate, errors, duration). Never an IP, a user id, a
 
 ## Scalability
 
-- The per-request path is stateless. The relay and gateway hold no per-user state, and HPKE is per-request, so they scale out horizontally with no coordination.
+- HPKE is per request, so gateway cryptographic exchanges do not require shared session state. Token-enforcing relay replicas do require shared atomic redemption decisions, and issuer replicas require shared registrations, counters and quotas. Per-IP rate limits remain replica-local; size or coordinate edge limits deliberately.
 - The cache is what multiplies throughput. Public reads are identical for everyone, so the commons cache turns N clients times M reads into M upstream fetches (TTL, stale-while-revalidate, single-flight). Upstream-facing volume stays flat as usage grows.
 - It's CDN-frontable. The cache emits `Cache-Control` and `Age` headers, so a CDN out front edge-caches public content and the cache tier only sees origin-shield traffic. Identical public content means there's no per-user signal to leak.
 - Confidential gateways (SEV-SNP CVM plus attestation) are the one tier that usually cannot scale to zero. Size that capacity accordingly.

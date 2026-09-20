@@ -2,7 +2,9 @@
 # Track Node 24 LTS patch releases; rebuild with --pull. See SELFHOSTING.md.
 FROM node:24-alpine
 WORKDIR /app
-COPY --chmod=0444 server.js ./
+COPY --chmod=0444 package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts
+COPY --chmod=0444 server.js redemption-store.js issuer-key-cache.js ./
 ENV PORT=8080
 EXPOSE 8080
 USER node

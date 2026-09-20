@@ -17,6 +17,8 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const { URL } = require('url');
+const { CLIENT_OPTIONS, memoryRedemptionStore, azureRedemptionStore } = require('./redemption-store');
+const { createIssuerKeyCache } = require('./issuer-key-cache');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const GATEWAY = process.env.GATEWAY_URL; // e.g. https://<gateway-host>/gateway
@@ -111,7 +113,7 @@ function safeLogFields(fields) {
   if (typeof fields.reused === 'boolean') safe.reused = fields.reused;
   if (['fatal', 'listen', 'uncaught_exception', 'unhandled_rejection'].includes(fields.event)) safe.event = fields.event;
   if (fields.errorType !== undefined) safe.errorType = ['Error', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'URIError', 'AggregateError'].includes(fields.errorType) ? fields.errorType : 'other';
-  if (['gateway_url_invalid', 'gateway_not_https', 'resp_too_large', 'gres_error', 'gw_error', 'rate_limit', 'capacity', 'origin', 'client_auth', 'content_type', 'request_too_large', 'client_disconnect'].includes(fields.reason)) safe.reason = fields.reason;
+  if (['gateway_url_invalid', 'gateway_not_https', 'resp_too_large', 'gres_error', 'gw_error', 'rate_limit', 'capacity', 'origin', 'client_auth', 'content_type', 'request_too_large', 'client_disconnect', 'state_unavailable'].includes(fields.reason)) safe.reason = fields.reason;
   if (fields.code !== undefined) safe.code = ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'ERR_STREAM_PREMATURE_CLOSE'].includes(fields.code) ? fields.code : 'other';
   return safe;
 }
@@ -152,6 +154,16 @@ try { cfgGw = new URL(GATEWAY_CONFIGS_URL); } catch { cfgGw = null; }
 // the table unbounded.
 const rateBuckets = new Map();
 let inflight = 0;
+let draining = false, httpClosed = false, shutdownTimer;
+function finishDrain() {
+  if (draining && httpClosed && inflight === 0) { clearTimeout(shutdownTimer); process.exit(0); }
+}
+function beginShutdown() {
+  if (draining) return;
+  draining = true;
+  shutdownTimer = setTimeout(() => { server.closeAllConnections(); process.exit(1); }, 25000);
+  server.close(() => { httpClosed = true; finishDrain(); });
+}
 
 // Rate-limit key: the client IP as seen by the TRUSTED ingress. Behind a managed
 // container platform, the TCP peer (socket.remoteAddress) is the ingress proxy, not
@@ -199,7 +211,7 @@ function rateLimited(ipBucket) {
 // header via verifyAccessToken (offline RSA-PSS verify against the issuer epoch
 // public key + spend-once). Both modes read CLIENT_AUTH_HEADER. The credential is
 // NEVER logged. See ../token-issuer/PROTOCOL.md for the token wire format.
-function clientAuthorized(req) {
+async function clientAuthorized(req) {
   if (CLIENT_AUTH_MODE === 'off') return true;
   if (CLIENT_AUTH_MODE === 'secret') {
     if (!CLIENT_SECRET) return false; // misconfig => fail closed
@@ -211,90 +223,15 @@ function clientAuthorized(req) {
   return false; // unknown mode => fail closed
 }
 
-// --- Issuer epoch public-key cache ------------------------------------------
-// Map<keyId, KeyObject>. Populated from the issuer's GET /issuer-keys (PUBLIC
-// material). Refreshed lazily once per ISSUER_KEYS_TTL_MS. A failed refresh keeps
-// the last good keys rather than dropping them, so a transient issuer outage does
-// not take token verification down, but if we have NO keys we fail closed.
-let issuerKeys = new Map();
-let issuerKeysFetchedAt = 0;
-let issuerKeysRefreshing = false;
-
-// Kick off a refresh of the issuer public keys if the cache is stale. Non-blocking:
-// verification uses whatever keys are currently cached. The fetched material is
-// PUBLIC (epoch public keys + key ids), so caching it leaks nothing.
-function maybeRefreshIssuerKeys() {
-  if (!ISSUER_KEYS_URL) return;
-  const now = Date.now();
-  if (issuerKeys.size > 0 && now - issuerKeysFetchedAt < ISSUER_KEYS_TTL_MS) return;
-  if (issuerKeysRefreshing) return;
-  issuerKeysRefreshing = true;
-
-  let u;
-  try { u = new URL(ISSUER_KEYS_URL); } catch { issuerKeysRefreshing = false; return; }
-  const opts = {
-    hostname: u.hostname,
-    port: u.port || 443,
-    path: u.pathname + u.search,
-    method: 'GET',
-    timeout: GW_TIMEOUT_MS,
-  };
-  const ireq = https.request(opts, (ires) => {
-    const cc = [];
-    let clen = 0;
-    let bad = false;
-    ires.on('data', (d) => {
-      if (bad) return;
-      clen += d.length;
-      if (clen > MAX_RESP_BYTES) { bad = true; ires.destroy(); }
-      else cc.push(d);
-    });
-    ires.on('end', () => {
-      issuerKeysRefreshing = false;
-      if (bad || (ires.statusCode || 0) !== 200) return; // keep last good keys
-      try {
-        const doc = JSON.parse(Buffer.concat(cc).toString('utf8'));
-        const next = new Map();
-        for (const k of (doc.keys || [])) {
-          if (!k || typeof k.keyId !== 'string' || typeof k.publicKeySpki !== 'string') continue;
-          const der = Buffer.from(k.publicKeySpki, 'base64');
-          const pub = crypto.createPublicKey({ key: der, format: 'der', type: 'spki' });
-          next.set(k.keyId, pub);
-        }
-        if (next.size > 0) { issuerKeys = next; issuerKeysFetchedAt = Date.now(); }
-      } catch { /* malformed doc: keep last good keys */ }
-    });
-  });
-  ireq.on('timeout', () => { ireq.destroy(new Error('issuer timeout')); });
-  ireq.on('error', () => { issuerKeysRefreshing = false; });
-  ireq.end();
-}
-
-// --- Spend-once redemption set ----------------------------------------------
-// REDEMPTION STORE (production): this Set lives in one process and resets on
-// restart, so with multiple relay replicas a token could be spent once per
-// replica, and a restart forgets all prior spends. For a real deployment, move
-// this to a shared atomic store (e.g. Redis SET with NX, keyed by the nullifier,
-// with a TTL past the token's epoch so it self-expires). The nullifier is derived
-// from the token signature only, no device id, nothing user-identifying.
-const redeemed = new Set();
-
-function nullifierFor(sigBytes) {
-  return crypto.createHash('sha256').update(sigBytes).digest('hex');
-}
-
-// Mark a token spent. Returns false if it was ALREADY spent (double-spend),
-// true if this is the first spend (and records it). Single-process atomic.
-function tryRedeem(nullifier) {
-  if (redeemed.has(nullifier)) return false;
-  redeemed.add(nullifier);
-  if (redeemed.size > REDEMPTION_MAX_KEYS) {
-    // Bound memory: drop the oldest-inserted nullifier. A shared store with epoch
-    // TTLs is the correct fix; this cap just keeps a single replica from OOMing.
-    redeemed.delete(redeemed.values().next().value);
-  }
-  return true;
-}
+// Shared redemption state contains anonymous signature hashes only. It has no
+// issuer device-state credentials. Never evict live spends or reset them on a
+// replica restart; Azure rows remain until an explicit retired-key cleanup plan.
+const REDEMPTION_CONNECTION = process.env.REDEMPTION_CONNECTION_STRING || '';
+let redemption = REDEMPTION_CONNECTION ? azureRedemptionStore(require('@azure/data-tables').TableClient.fromConnectionString(
+  REDEMPTION_CONNECTION, process.env.REDEMPTION_TABLE || 'columbiaredemptions', CLIENT_OPTIONS))
+  : memoryRedemptionStore({ maxKeys: REDEMPTION_MAX_KEYS });
+const issuerKeyCache = createIssuerKeyCache({ url: ISSUER_KEYS_URL, ttlMs: ISSUER_KEYS_TTL_MS });
+function nullifierFor(sigBytes) { return crypto.createHash('sha256').update(sigBytes).digest('hex'); }
 
 // Token mode verification. The client presents, in the CLIENT_AUTH_HEADER (default
 // 'x-columbia-token'), a compact token:
@@ -308,15 +245,11 @@ function tryRedeem(nullifier) {
 // We (1) parse it, (2) look up the issuer epoch public key by keyId, (3) verify the
 // RSA-PSS signature over tokenInput offline, (4) enforce spend-once via a nullifier
 // = SHA-256(signature). All four must pass. The token is NEVER logged.
-function verifyAccessToken(presented) {
+async function verifyAccessToken(presented) {
   if (typeof presented !== 'string' || presented.length === 0) return false;
 
   // Allow an optional "PrivateToken " / "Bearer " prefix on the header value.
   const raw = presented.replace(/^(PrivateToken|Bearer)\s+/i, '').trim();
-
-  // Refresh the issuer public keys if stale (non-blocking).
-  maybeRefreshIssuerKeys();
-  if (issuerKeys.size === 0) return false; // no keys => cannot verify => fail closed
 
   let tok;
   try {
@@ -329,8 +262,9 @@ function verifyAccessToken(presented) {
     return false;
   }
 
-  const pub = issuerKeys.get(keyId);
-  if (!pub) return false; // unknown / expired epoch key => reject
+  const entry = await issuerKeyCache.get(keyId);
+  if (!entry) return false; // an unknown key in a valid cached epoch is rejected
+  const pub = entry.publicKey;
 
   const inputBuf = Buffer.from(tokenInput, 'base64');
   const sigBuf = Buffer.from(signature, 'base64');
@@ -353,7 +287,7 @@ function verifyAccessToken(presented) {
   // (4) Spend-once. A valid signature that has already been redeemed is rejected,
   // so a token can be spent exactly once. The nullifier is derived from the
   // signature only and carries no identity.
-  if (!tryRedeem(nullifierFor(sigBuf))) return false;
+  if (!(await redemption.redeem(entry.fingerprint, nullifierFor(sigBuf)))) return false;
 
   return true;
 }
@@ -423,7 +357,8 @@ function serveConfig(res, start) {
   });
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
+  if (draining) { res.writeHead(503, { 'Retry-After': '2' }); res.end(); return; }
   const start = Date.now();
 
   // Front door origin lock. When REQUIRE_FDID is set, every non-exempt request
@@ -485,14 +420,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Client credential check (pluggable: shared-secret today, token later). The
-  // credential header is never logged.
-  if (!clientAuthorized(req)) {
-    res.writeHead(401); res.end();
-    log({ route: '/relay', status: 401, reason: 'client_auth', durationMs: Date.now() - start });
-    return;
-  }
-
   // Global in-flight concurrency cap. Reserve a slot; release it on every
   // terminal path (success, error, abort, oversize, client disconnect).
   if (inflight >= MAX_INFLIGHT) {
@@ -501,10 +428,31 @@ const server = http.createServer((req, res) => {
     return;
   }
   inflight += 1;
-  let slotReleased = false;
-  const releaseSlot = () => { if (!slotReleased) { slotReleased = true; inflight -= 1; } };
+  let slotReleased = false, authPending = true, releaseRequested = false;
+  const releaseSlot = () => {
+    if (authPending) { releaseRequested = true; return; }
+    if (!slotReleased) { slotReleased = true; inflight -= 1; finishDrain(); }
+  };
   res.on('finish', releaseSlot); // retain capacity until buffered output is flushed
   res.on('close', releaseSlot);   // safety net for any teardown path
+
+  // Reserve capacity before asynchronous shared-state admission. Request bodies
+  // remain paused until authorization completes; disconnects release the slot.
+  try {
+    if (!(await clientAuthorized(req))) {
+      if (!res.destroyed) { res.writeHead(401); res.end(); }
+      log({ route: '/relay', status: 401, reason: 'client_auth', durationMs: Date.now() - start });
+      return;
+    }
+  } catch {
+    if (!res.destroyed) { res.writeHead(503, { 'Retry-After': '2' }); res.end(); }
+    log({ route: '/relay', status: 503, reason: 'state_unavailable', durationMs: Date.now() - start });
+    return;
+  } finally {
+    authPending = false;
+    if (releaseRequested || req.destroyed || res.destroyed) releaseSlot();
+  }
+  if (req.destroyed || res.destroyed) { releaseSlot(); return; }
 
   const chunks = [];
   let received = 0;
@@ -649,6 +597,8 @@ server.keepAliveTimeout = 5000;
 // must NOT start listening. Production behavior when run via `node server.js` is
 // unchanged.
 if (require.main === module) {
+  process.on('SIGTERM', beginShutdown);
+  process.on('SIGINT', beginShutdown);
   server.listen(PORT, () => log({ event: 'listen', port: PORT, role: 'ohttp-relay' }));
 }
 
@@ -657,8 +607,9 @@ if (require.main === module) {
 module.exports = {
   server,
   verifyAccessToken,
-  tryRedeem,
   nullifierFor,
   safeLogFields,
-  setIssuerKeysForTest(map) { issuerKeys = map; issuerKeysFetchedAt = Date.now(); },
+  beginShutdown,
+  setIssuerKeysForTest(map, expiresAt) { issuerKeyCache.setForTest(map, expiresAt); },
+  setRedemptionStoreForTest(store) { redemption = store; },
 };

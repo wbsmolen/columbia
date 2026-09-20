@@ -119,25 +119,30 @@ epoch boundary still verify. This is public material; serving it leaks nothing.
 
 ## The epoch model
 
-The issuer keypair rotates per epoch. An epoch is just
-`floor(unixSeconds / EPOCH_SECONDS)`, computed independently by issuer and relay,
-default one week. Tokens carry no timestamp, only the epoch's key id, so spend time
-leaks nothing finer than "this token was issued in epoch E". A coarse epoch keeps
-the anonymity set large: everyone issued in the same epoch is indistinguishable at
-spend time.
+An epoch is `floor(unixSeconds / EPOCH_SECONDS)`, default one week.
+An explicit `ISSUER_EPOCH_KEYS_JSON` manifest supplies distinct current/previous
+2048-bit RSA keys shared by all replicas. Lookups recheck the live epoch after
+asynchronous import, reject expired keys, and never fall back from a missing or
+invalid manifest entry. An unset manifest preserves `ISSUER_SIGNING_KEY` legacy
+behavior: one key reused across epochs, which does **not** cryptographically
+expire signatures. Merely changing the epoch number is not key rotation.
 
-The issuer's per-device quota is scoped to the epoch and self-expires when it
-rolls. The relay's in-memory spend-once set is not epoch-scoped — it's bounded
-by `REDEMPTION_MAX_KEYS` with oldest-inserted eviction, cleared on restart. A
-production, multi-replica deployment should move it to a shared, epoch-TTL'd
-store (see PROTOCOL.md).
+The issuer atomically records its greatest-seen counter plus current/previous
+quota. Relay spends are keyed by the full public-key fingerprint and signature
+hash, and are never automatically evicted or deleted. This deliberately prevents
+key reuse or restarts from resurrecting spent tokens. See the state configuration
+below before running multiple replicas.
 
 ## Configuration
 
 | Env var | Default | Purpose |
 |---|---|---|
 | `PORT` | `8080` | listen port (non-root can't bind below 1024) |
-| `ISSUER_SIGNING_KEY` | required | the epoch RSA private key (2048-bit). Either a PEM string or base64 of DER; PKCS#1 or PKCS#8 are both accepted. Injected at runtime, NEVER committed. Missing or unparseable => fails closed |
+| `ISSUER_SIGNING_KEY` | required unless manifest configured | the epoch RSA private key (2048-bit). Either a PEM string or base64 of DER; PKCS#1 or PKCS#8 are both accepted. Injected at runtime, NEVER committed. Missing or unparseable => fails closed |
+| `ISSUER_EPOCH_KEYS_JSON` | unset | Optional secret JSON `{ "version": 1, "keys": [{ "epoch": 123, "privateKey": "<PEM or base64 DER>" }, ...] }`; at most current/previous, distinct actual RSA material, no future-key staging or implicit fallback. Publish both entries to serve `/issuer-keys` |
+| `ISSUER_STATE_CONNECTION_STRING` | unset | Azure Table credential owned by the issuer operator; configured means shared durable state, unset means single-process memory only |
+| `ISSUER_STATE_TABLE` | `columbiaissuerstate` | Dedicated issuer state table; never the relay redemption or analytics event table |
+| `ISSUER_STATE_SALT` | required with Azure | Stable secret, base64 at least 32 bytes; persisted salt fingerprint rejects accidental salt changes instead of silently resetting identities |
 | `EPOCH_SECONDS` | `604800` | epoch length in seconds (default one week) |
 | `ISSUANCE_QUOTA_PER_EPOCH` | `256` | max tokens a single device may obtain per epoch. `0` disables the quota |
 | `MAX_TOKENS_PER_REQUEST` | `64` | max blinded messages per `/issue` call |
@@ -145,12 +150,14 @@ store (see PROTOCOL.md).
 | `APPLE_APP_ATTEST_ROOT_CA_PEM_B64` | unset | Apple's App Attest Root CA, PEM, base64. Required to ENFORCE App Attest |
 | `APPLE_TEAM_ID` | unset | your Apple Team ID. Required to enforce App Attest |
 | `APPLE_BUNDLE_ID` | unset | the iOS client's bundle id. Required to enforce App Attest |
-| `APPLE_APP_ATTEST_AAGUID` | `appattest` | `appattest` for production, `appattestdevelop` for dev/TestFlight builds |
+| `APPLE_APP_ATTEST_AAGUID` | `appattest` | `appattest` for production, including TestFlight; `appattestdevelop` only for development App Attest |
 | `APP_ATTEST_CLOCK_SKEW_MS` | `300000` | tolerance (ms) when checking the x5c certs' validity windows, for issuer/Apple clock drift |
 | `REQUIRE_CLIENT_DATA_BINDING` | `1` (on) | require the App Attest `clientDataHash` to commit to the exact `blinded[]` batch + epoch (see below). Set to `0` only during client bring-up, before the iOS client computes the matching hash |
 | `REQUIRE_FDID` | unset | when set, reject any request whose `X-Azure-FDID` header does not match, so the issuer only accepts traffic that arrived through your front door (a CDN or WAF, for example Azure Front Door). `/health` and `/issuer-keys` are exempt. Empty/unset disables the check |
 | `FDID_HEADER` | `x-azure-fdid` | name of the header the edge front door injects for the `REQUIRE_FDID` lock above; override for a non-Azure CDN or WAF that injects a differently named header |
 | `LOG_HEALTH` | unset | successful `GET /health` probe hits are not logged (at platform probe cadence they are almost all log volume, drowning the RED signal); set `1` to log them again for a debugging session. Failing probes are unaffected |
+
+[TestFlight always uses the production App Attest environment](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.devicecheck.appattest-environment), regardless of a development entitlement. Development and production validation remain separate physical-device checks.
 
 The signing key is injected exactly like the gateway's `SEED_SECRET_KEY`: from your
 host's secret store at runtime, never written to disk in this repo.
@@ -224,24 +231,34 @@ The security of the whole pattern rests on these pieces.
   against Apple's real Root CA, to confirm byte-compatibility with Apple's actual
   encoder. See the capture procedure below.
 
-**Stubbed, and clearly marked as such:**
+**Shared state implemented; deployment and physical-device acceptance remain separate:**
 
-- **Persistent quota, redemption, and attested-key state.** The issuer's per-device
-  per-epoch quota, the relay's spend-once set, and the App Attest attested-key store
-  (device public key + last sign counter per keyId) are all in-memory and
-  single-process. That is fine for a first cut and for a single replica, but it has
-  gaps for a real multi-replica deployment: a device could get its full quota from
-  each replica, a restart forgets prior spends, and a device registered on one
-  replica is unknown to another (its assertions are rejected as `unknown_device_key`
-  until it re-attests; the iOS client handles this by re-attesting on rejection).
-  The code marks exactly where a shared atomic store goes (Redis `INCR`/`EXPIRE` for
-  the quota keyed by a salted device hash, Redis `SET NX` with an epoch TTL for the
-  redemption nullifiers, and a Redis hash per keyId for the attested key with a
-  compare-and-set on the sign counter so concurrent assertions cannot both pass with
-  the same counter). The nullifier is derived from the token signature only and
-  carries no identity; the attested key is device-PUBLIC material, and the store is
-  keyed by a salted hash of the keyId, so the store never holds anything
-  user-linking.
+`state-store.js` provides memory and Azure adapters behind one registration/counter/
+quota seam. One salted canonical hardware-key row owns the public key, monotonic
+counter and two epoch quotas under an ETag. Verification is pure; only the single
+reservation mutates state. Re-attestation preserves counters/quotas. Replayed
+assertions or mismatched keys reject; capacity and corrupt state fail closed.
+
+Azure waits are bounded by an8-second whole-operation deadline. Transparent SDK
+write retries are disabled: an ambiguous committed write cannot be disguised as
+a later conflict and charged twice. An own commit-ID readback may acknowledge its
+reservation; otherwise an unknown write fails503 `state_unavailable` with
+`Retry-After: 2`. A failed or lost response never rolls a reservation back. There
+is no automatic blind-batch replay or separate response cache. The memory adapter
+never evicts a registration, but remains unsuitable for multiple replicas/restarts.
+
+The relay's separate Azure store uses immutable create-only anonymous spend rows.
+Never give the relay issuer-state credentials. Storage-backed device metadata is
+pseudonymous, not inherently unlinkable to an operator with the salt; the trust
+separation and absence of token/request linkage remain essential.
+
+Before enforcing token mode, provision durable production stores and a consistent
+manifest, prove real-device attestation/assertion/registration-loss recovery, and
+stage compatibility for older clients. Keep the deployed `CLIENT_AUTH_MODE=off`
+until those gates are complete. No local test or synthetic Azure fixture establishes
+physical Apple App Attest compatibility.
+
+**Remaining architecture work:**
 
 - **Attester / Issuer split.** One service plays both Privacy Pass roles. RFC 9576
   allows splitting the Attester (which sees the device) from the Issuer (which
@@ -341,10 +358,51 @@ a synthetic chain, pending one real-device confirmation."
 
 ## Dependencies
 
-Unlike the dependency-free relay and commons cache, this service uses npm packages,
+This service and the optional relay state adapter use locked npm packages,
 because hand-rolling blind RSA is exactly the kind of custom cryptography to avoid:
 
 - `@cloudflare/blindrsa-ts` (RFC 9474 blind RSA, the Apple PAT construction). Its
   only transitive dependency is `sjcl` (the Stanford JS Crypto Library) for the
   big-integer math. Two packages total, no known vulnerabilities at the pinned
   version. The lockfile is committed so the image build is reproducible.
+
+### Client contract and diagnostics
+
+`GET /issuer-keys` now includes additive `schemaVersion: 1`; existing `suite`,
+`epoch`, `epochSeconds`, and `keys` fields are unchanged. Clients should select by
+epoch and retain compatibility with earlier unversioned version-1 responses.
+Issuance at rollover uses the epoch key matched by the client binding. Quota 429s
+include `Retry-After`. See [the protocol](PROTOCOL.md#client-lifecycle-and-compatible-rollout)
+for the client bank/refill lifecycle and deployment-policy limits.
+
+The issuer's log boundary normalizes unknown paths to `other` and discards
+unrecognized reason fields and free-form input. It never records request bodies,
+device key IDs, attestation objects or challenges. These operational changes do
+not enable relay client authentication or deploy a shared token/attestation store.
+
+### Process termination
+
+SIGTERM/SIGINT stop new admission and drain existing HTTP plus owned asynchronous
+work for at most 25 seconds. Client socket closure does not make pending
+authentication or an issuer reservation disappear. Clean drain exits 0; the hard
+deadline exits 1 and does not imply rollback of a write whose ACK was lost. Allow
+a platform termination grace greater than this bound.
+
+
+### Client enrollment recovery qualification
+
+The current local client correction persists Apple assertion-readiness before
+`/issue`, retries typed Apple `serverUnavailable` with the same protected public
+batch/hash, and assertion-probes interrupted one-shot operations. Typed unknown
+device/invalid-key recovery is bound to the current issuer/key and one persisted
+automatic replacement per24hours. Generic401/503 never erase identity. The
+protected journal distinguishes missing data from locked/corrupt storage; see
+[the exact lifecycle contract](PROTOCOL.md#app-attest-flow-and-ordering).
+
+A process-lost blinding inverse cannot be reconstructed through private crypto
+APIs. One resumed enrollment may consume16tokens of issuance quota whose blind
+signatures are discarded; a later assertion obtains usable tokens. This does
+not restore lost server counter/quota history. The runtime issuer/relay policy
+is unchanged. Real hardware, correct App Attest environment, receipt/risk policy,
+older-client compatibility and staged production rollout remain separate gates.
+Local source/tests are not a physical success claim.

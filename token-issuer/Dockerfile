@@ -1,5 +1,5 @@
 # Columbia - token issuer (Privacy Pass Attester + Issuer)
-# Unlike the relay/commons this service has npm dependencies (blind-RSA), so we do
+# This service has npm dependencies (blind-RSA and Azure state), so we do
 # a real npm ci against the committed lockfile. Still a small node:alpine image,
 # non-root, with a HEALTHCHECK, matching the other services.
 # Track Node 24 LTS patch releases; rebuild with --pull. See SELFHOSTING.md.
@@ -12,7 +12,7 @@ WORKDIR /app
 COPY --chmod=0444 package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-COPY --chmod=0444 server.js appattest.js ./
+COPY --chmod=0444 server.js appattest.js state-store.js epoch-keys.js ./
 
 ENV PORT=8080
 EXPOSE 8080

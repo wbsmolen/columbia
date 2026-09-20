@@ -34,11 +34,14 @@
 // would crash-loop the container even though it happens to work on newer node.
 
 import http from 'node:http';
-import crypto, { webcrypto } from 'node:crypto';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { RSABSSA } from '@cloudflare/blindrsa-ts';
+import { TableClient } from '@azure/data-tables';
+import { createIssuerState, memoryDeviceBackend, azureDeviceBackend, ISSUER_STATE_CLIENT_OPTIONS } from './state-store.js';
 
 import { validateAppAttest, APP_ATTEST_READY } from './appattest.js';
+import { createEpochKeyProvider, derivePublicKey, keyIdFromSpki } from './epoch-keys.js';
 
 // --- Config -----------------------------------------------------------------
 
@@ -52,8 +55,8 @@ const EPOCH_SECONDS = parseInt(process.env.EPOCH_SECONDS || String(7 * 24 * 3600
 
 // Per-device per-epoch issuance quota. A device may obtain at most this many
 // tokens per epoch. This is the abuse bound: even our own users are rate limited.
-// Held in memory only (see QUOTA STORE note below). Default 256 tokens/epoch.
-const ISSUANCE_QUOTA_PER_EPOCH = parseInt(process.env.ISSUANCE_QUOTA_PER_EPOCH || '256', 10);
+// Shared with registration/counter state when configured. Default 256 tokens/epoch.
+const ISSUANCE_QUOTA_PER_EPOCH = Number(process.env.ISSUANCE_QUOTA_PER_EPOCH || '256');
 
 // Max blinded token requests accepted in a single /issue call, so one request
 // can't ask us to do unbounded RSA work. The client batches up to this many.
@@ -68,13 +71,11 @@ const MAX_BODY = parseInt(process.env.MAX_BODY_BYTES || '262144', 10);
 // bring-up, before the iOS client computes clientDataHash over the batch.
 const REQUIRE_CLIENT_DATA_BINDING = process.env.REQUIRE_CLIENT_DATA_BINDING !== '0';
 
-// The issuer signing key (PKCS#8, base64-encoded) is injected at runtime via env,
-// exactly like the gateway's SEED_SECRET_KEY. It is NEVER committed. If unset, the
-// issuer fails closed at startup. To rotate per epoch in production you supply the
-// epoch's key (or a seed a KMS expands); the in-process fallback below derives a
-// fresh ephemeral epoch key when only a single base key is provided, which is fine
-// for a single replica but NOT for multi-replica (see KEY STORE note).
+// Legacy single-key configurations keep their wire contract. Explicit manifests
+// supply distinct current/previous keys consistently across replicas; missing or
+// malformed configured manifests fail closed, with no fallback to the old key.
 const ISSUER_SIGNING_KEY_B64 = process.env.ISSUER_SIGNING_KEY || '';
+const ISSUER_EPOCH_KEYS_JSON = process.env.ISSUER_EPOCH_KEYS_JSON;
 
 // --- Front door origin lock -------------------------------------------------
 // When set, the issuer accepts a request only if it arrived through a front door
@@ -101,8 +102,27 @@ const suite = RSABSSA.SHA384.PSS.Deterministic();
 
 // --- Logging (RED-only) -----------------------------------------------------
 
+function safeLogFields(fields) {
+  const safe = {};
+  if (fields.route !== undefined) safe.route = ['/health', '/issuer-keys', '/issue'].includes(fields.route) ? fields.route : 'other';
+  if (Number.isInteger(fields.status) && fields.status >= 100 && fields.status <= 599) safe.status = fields.status;
+  if (Number.isFinite(fields.durationMs)) safe.durationMs = Math.max(0, Math.round(fields.durationMs));
+  if (['bad_json', 'missing_keyid', 'bad_batch_size', 'attest_failed', 'client_data_binding_failed', 'quota_exceeded', 'bad_blinded_type', 'bad_blinded_len', 'no_signing_key', 'blind_sign_error', 'state_unavailable', 'unhandled'].includes(fields.reason)) safe.reason = fields.reason;
+  for (const key of ['issued', 'count']) {
+    if (Number.isInteger(fields[key]) && fields[key] >= 0 && fields[key] <= MAX_TOKENS_PER_REQUEST) safe[key] = fields[key];
+  }
+  if (Number.isSafeInteger(fields.epoch) && fields.epoch >= 0) safe.epoch = fields.epoch;
+  if (fields.event === 'listen') {
+    safe.event = 'listen';
+    safe.role = 'token-issuer';
+    safe.appAttest = fields.appAttest === 'enforced' ? 'enforced' : 'stub-fail-closed';
+    safe.signingKey = fields.signingKey === 'present' ? 'present' : 'missing-fail-closed';
+  }
+  return safe;
+}
+
 function log(fields) {
-  process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...fields }) + '\n');
+  process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...safeLogFields(fields) }) + '\n');
 }
 
 // --- Epoch math -------------------------------------------------------------
@@ -131,198 +151,40 @@ function expectedClientDataHash(epochId, blinded) {
   return h.digest();
 }
 
+// The signing key must belong to the epoch the client actually blinded for.
+// Matching a previous-epoch binding but signing with a new epoch key breaks
+// finalization as soon as an operator rotates distinct keys.
+function boundEpoch(clientDataHash, blinded, epochId) {
+  if (typeof clientDataHash !== 'string') return null;
+  let got;
+  try { got = Buffer.from(clientDataHash, 'base64'); } catch { return null; }
+  if (got.length !== 32) return null;
+  for (const candidate of [epochId, epochId - 1]) {
+    if (crypto.timingSafeEqual(got, expectedClientDataHash(candidate, blinded))) return candidate;
+  }
+  return null;
+}
+
 // --- Epoch key management ---------------------------------------------------
-//
-// KEY STORE (production): a multi-replica issuer needs every replica to agree on
-// the epoch keypair, and the relay must be able to fetch the matching public key.
-// In production, derive each epoch's RSA key deterministically inside a KMS/HSM
-// from a root seed + epoch id (so no replica ever holds the raw key, mirroring the
-// gateway's HSM key-release goal), or store the per-epoch keypair in a shared
-// secret store. The in-memory map below is correct for a SINGLE replica only.
+// Only the operator's current/previous manifest keys are eligible. The provider
+// checks live epoch ownership even after asynchronous import. Legacy mode cannot
+// provide cryptographic expiry while its one public key remains published.
+const epochKeyProvider = createEpochKeyProvider({ legacySigningKeyB64: ISSUER_SIGNING_KEY_B64,
+  manifestJSON: ISSUER_EPOCH_KEYS_JSON, currentEpoch });
+const keysForEpoch = epoch => epochKeyProvider.keysForEpoch(epoch);
 
-const epochKeys = new Map(); // epochId -> { priv, pub, spkiB64, keyId }
-
-// Import the operator-supplied RSA private key for RSA-PSS signing and derive its
-// public key. Throws if the env key is missing/invalid so the service fails closed
-// rather than issuing under a key nobody controls.
-//
-// Format-tolerant on purpose. An operator generates the key with whatever tool is
-// at hand, and those tools disagree on the encoding. `openssl genpkey -algorithm
-// RSA -outform DER` emits a bare PKCS#1 RSAPrivateKey; `openssl pkcs8 -topk8`
-// emits PKCS#8; a pasted PEM is text. WebCrypto's pkcs8 import is also strict about
-// the AlgorithmIdentifier OID (a generic rsaEncryption key is rejected when you ask
-// for RSA-PSS). So instead of importing straight into WebCrypto, we parse with
-// node's createPrivateKey (which auto-detects PEM vs DER and PKCS#1 vs PKCS#8),
-// then bridge into a WebCrypto RSA-PSS key via JWK, where the source OID no longer
-// matters. ISSUER_SIGNING_KEY may be a PEM string or base64 of DER.
-async function importBaseKey() {
-  if (!ISSUER_SIGNING_KEY_B64) {
-    throw new Error('ISSUER_SIGNING_KEY not set');
-  }
-  const algo = { name: 'RSA-PSS', hash: PSS_HASH };
-  const nodeKey = parsePrivateKeyEnv(ISSUER_SIGNING_KEY_B64);
-  const kt = nodeKey.asymmetricKeyType;
-  if (kt !== 'rsa' && kt !== 'rsa-pss') {
-    throw new Error('signing key is not RSA');
-  }
-  const jwk = nodeKey.export({ format: 'jwk' });
-  const priv = await webcrypto.subtle.importKey('jwk', jwk, algo, true, ['sign']);
-  const pubJwk = { kty: jwk.kty, n: jwk.n, e: jwk.e, alg: jwk.alg, ext: true };
-  const pub = await webcrypto.subtle.importKey('jwk', pubJwk, algo, true, ['verify']);
-  return { priv, pub };
-}
-
-// Parse the env signing key into a node KeyObject, tolerating PEM or base64-of-DER,
-// and PKCS#8 or PKCS#1. Throws on anything unparseable, so the caller fails closed.
-function parsePrivateKeyEnv(envValue) {
-  const s = String(envValue).trim();
-  if (s.includes('-----BEGIN')) {
-    // PEM: createPrivateKey auto-detects PKCS#1 vs PKCS#8 from the header.
-    return crypto.createPrivateKey({ key: s, format: 'pem' });
-  }
-  const der = Buffer.from(s, 'base64');
-  try {
-    return crypto.createPrivateKey({ key: der, format: 'der', type: 'pkcs8' });
-  } catch {
-    // Fall back to a bare PKCS#1 RSAPrivateKey (what some openssl builds emit).
-    return crypto.createPrivateKey({ key: der, format: 'der', type: 'pkcs1' });
-  }
-}
-
-// Derive the public key from a private key by exporting its JWK and stripping the
-// private components. WebCrypto has no direct private->public, so we go via JWK.
-async function derivePublicKey(priv, algo) {
-  const jwk = await webcrypto.subtle.exportKey('jwk', priv);
-  const pubJwk = { kty: jwk.kty, n: jwk.n, e: jwk.e, alg: jwk.alg, ext: true };
-  return webcrypto.subtle.importKey('jwk', pubJwk, algo, true, ['verify']);
-}
-
-// A stable key id for an epoch's public key: the SHA-256 of the SPKI bytes,
-// truncated, hex. The relay uses this to pick the right public key when verifying.
-// It is derived from PUBLIC material only, so publishing it leaks nothing.
-function keyIdFromSpki(spkiBytes) {
-  return crypto.createHash('sha256').update(spkiBytes).digest('hex').slice(0, 32);
-}
-
-// Resolve (and cache) the keypair for an epoch. With a single injected base key we
-// reuse it across epochs (the epoch id still scopes quota + the relay's redemption
-// set). A production KMS would instead derive a distinct key per epoch from the
-// root seed; the call site is the same, only this body changes.
-let baseKeyPromise = null;
-async function keysForEpoch(epochId) {
-  const cached = epochKeys.get(epochId);
-  if (cached) return cached;
-  if (!baseKeyPromise) baseKeyPromise = importBaseKey();
-  const { priv, pub } = await baseKeyPromise;
-  const spki = new Uint8Array(await webcrypto.subtle.exportKey('spki', pub));
-  const spkiB64 = Buffer.from(spki).toString('base64');
-  const keyId = keyIdFromSpki(spki);
-  const entry = { priv, pub, spkiB64, keyId };
-  epochKeys.set(epochId, entry);
-  // Drop epoch keys older than the previous epoch so the map can't grow forever.
-  for (const id of epochKeys.keys()) {
-    if (id < epochId - 1) epochKeys.delete(id);
-  }
-  return entry;
-}
-
-// --- Per-device per-epoch issuance quota ------------------------------------
-//
-// QUOTA STORE (production): this Map lives in one process and resets on restart,
-// so with multiple replicas a device could get its full quota from each replica.
-// For a real multi-replica deployment, move this counter to a shared atomic store
-// (e.g. Redis INCR with an EXPIRE at the epoch boundary, keyed by a SALTED hash of
-// the device id so the store itself never holds a raw device identifier). The key
-// is scoped to the epoch so it self-expires when the epoch rolls.
-
-const issuanceCounts = new Map(); // `${epochId}:${deviceHash}` -> count
-
-// Hash the device id before it touches the quota table, so even this transient
-// structure never holds the raw identifier. The salt is per-process and ephemeral.
-const QUOTA_SALT = crypto.randomBytes(32);
-function deviceQuotaKey(epochId, deviceId) {
-  const h = crypto.createHmac('sha256', QUOTA_SALT).update(String(deviceId)).digest('hex');
-  return `${epochId}:${h}`;
-}
-
-// Reserve `n` issuances for a device in this epoch. Returns true if the whole
-// batch fits under the quota (and reserves it), false if it would exceed. Atomic
-// within this single process.
-function reserveQuota(epochId, deviceId, n) {
-  if (ISSUANCE_QUOTA_PER_EPOCH <= 0) return true; // 0 disables the quota
-  const key = deviceQuotaKey(epochId, deviceId);
-  const used = issuanceCounts.get(key) || 0;
-  if (used + n > ISSUANCE_QUOTA_PER_EPOCH) return false;
-  issuanceCounts.set(key, used + n);
-  // Sweep counters from epochs we no longer issue for.
-  if (issuanceCounts.size > 200000) {
-    for (const k of issuanceCounts.keys()) {
-      const e = parseInt(k.split(':')[0], 10);
-      if (e < epochId - 1) issuanceCounts.delete(k);
-    }
-  }
-  return true;
-}
-
-// --- Attested-key store (App Attest device registration) --------------------
-//
-// App Attest is two-phase: a one-time ATTESTATION registers a hardware key, and
-// every later request carries an ASSERTION signed by that key. To check an
-// assertion we must remember the device's public key and its last sign counter,
-// keyed by the App Attest keyId.
-//
-// ATTESTED-KEY STORE (production): this Map is in-process and resets on restart,
-// which has the same two multi-replica gaps the quota store has: a device
-// registered on replica A is unknown to replica B, and a restart forgets every
-// registration (forcing devices to re-attest, which the iOS client handles by
-// falling back to a fresh attestation when an assertion is rejected as unknown).
-// For a real multi-replica deployment, move this to the SAME shared store as the
-// quota/redemption state (e.g. Redis: a hash per keyId holding the SPKI PEM + last
-// counter, with the counter updated via a compare-and-set so two concurrent
-// assertions cannot both pass with the same counter). The stored public key is
-// device-PUBLIC material, not a secret, but the keyId is a device identifier, so
-// key the store by a SALTED hash of the keyId exactly like the quota table rather
-// than the raw keyId. The counter update MUST be atomic to preserve the
-// strictly-increasing guarantee under concurrency.
-//
-// NOTE on identity: the keyId is the one device identifier this service handles.
-// It is used transiently to look up the attested key and is NEVER logged (see the
-// RED-only logging note at the top of this file).
-
-const attestedKeys = new Map(); // keyId -> { publicKeyPem, signCount }
-
-const ATTEST_STORE = {
-  getAttestedKey(keyId) {
-    return attestedKeys.get(keyId) || null;
-  },
-  setAttestedKey(keyId, publicKeyPem, signCount) {
-    // Re-attestation of an EXISTING keyId must not roll the assertion counter
-    // backwards: a fresh attestation reports signCount 0, but if this device has
-    // already advanced its counter via assertions, resetting to 0 would re-open the
-    // assertion-replay window for that key. Producing a fresh attestation needs
-    // genuine hardware re-attesting its own key (a valid chain-to-Apple + a
-    // challenge-bound nonce), so this is not a forgery vector, but we still keep the
-    // higher counter as defense-in-depth. The public key is identical across
-    // attestations of the same hardware key, so refreshing the PEM is harmless.
-    const existing = attestedKeys.get(keyId);
-    const keptCount = Math.max(signCount || 0, existing ? (existing.signCount || 0) : 0);
-    attestedKeys.set(keyId, { publicKeyPem, signCount: keptCount });
-    // Bound the map so a flood of one-time attestations cannot grow it forever.
-    // This is a coarse cap; the production shared store would use a TTL instead.
-    if (attestedKeys.size > 500000) {
-      // Drop the oldest ~10% by insertion order (Map preserves it).
-      let toDrop = Math.floor(attestedKeys.size * 0.1);
-      for (const k of attestedKeys.keys()) {
-        if (toDrop-- <= 0) break;
-        attestedKeys.delete(k);
-      }
-    }
-  },
-  setSignCount(keyId, n) {
-    const rec = attestedKeys.get(keyId);
-    if (rec) rec.signCount = n;
-  },
-};
+// One atomic registration/counter/quota row per salted canonical hardware key.
+// Memory is a bounded single-process option. Azure requires a stable secret salt;
+// salt mismatch against persisted configuration fails closed instead of resetting
+// every device's identity and quota. Issuer credentials never belong to the relay.
+const STATE_CONNECTION = process.env.ISSUER_STATE_CONNECTION_STRING || '';
+const STATE_TABLE = process.env.ISSUER_STATE_TABLE || 'columbiaissuerstate';
+const STATE_SALT = STATE_CONNECTION ? Buffer.from(process.env.ISSUER_STATE_SALT || '', 'base64') : crypto.randomBytes(32);
+const ISSUER_STATE = createIssuerState({
+  backend: STATE_CONNECTION ? azureDeviceBackend(TableClient.fromConnectionString(STATE_CONNECTION, STATE_TABLE,
+    ISSUER_STATE_CLIENT_OPTIONS), { salt: STATE_SALT }) : memoryDeviceBackend(),
+  salt: STATE_SALT, quota: ISSUANCE_QUOTA_PER_EPOCH,
+});
 
 // --- /issue -----------------------------------------------------------------
 //
@@ -369,79 +231,6 @@ async function handleIssue(req, res, start, body) {
     return;
   }
 
-  // (a) Validate App Attest. This proves the request comes from a genuine,
-  // unmodified iOS client install on real Apple hardware. FAILS CLOSED: if App Attest
-  // is unconfigured (Apple root cert / team+bundle id not supplied), the validator
-  // returns { ok: false } and we reject. We never log the assertion/attestation,
-  // and we never log the coarse failure reason at a level that could fingerprint a
-  // device (it is an aggregate counter only).
-  //
-  // We pass the in-process attested-key store so an ASSERTION can be checked
-  // against the device public key recorded at ATTESTATION time, and so the sign
-  // counter advances. On a successful attestation we persist the returned public
-  // key keyed by keyId.
-  let attest;
-  try {
-    attest = await validateAppAttest({ keyId, attestation, assertion, clientDataHash, store: ATTEST_STORE });
-  } catch {
-    attest = { ok: false, reason: 'verification_exception' };
-  }
-  if (!attest || !attest.ok) {
-    res.writeHead(401); res.end();
-    log({ route: '/issue', status: 401, reason: 'attest_failed', durationMs: Date.now() - start });
-    return;
-  }
-  // Register the device's attested public key on the one-time attestation, so its
-  // later assertions can be verified. (validateAppAttest does the assertion-side
-  // counter update through the store itself.)
-  if (attest.mode === 'attestation') {
-    ATTEST_STORE.setAttestedKey(attest.keyId, attest.publicKeyPem, attest.signCount);
-  }
-
-  // (a2) REQUEST-PAYLOAD BINDING. App Attest proves "a genuine device signed THIS
-  // clientDataHash"; on its own it does NOT prove the device authorized THESE
-  // blinded messages, because clientDataHash is an opaque 32 bytes from the client.
-  // Without binding, a captured valid {keyId, assertion, clientDataHash} could be
-  // replayed against a different `blinded[]` batch (still rate-limited by the
-  // per-device quota, but not request-integrity-checked).
-  //
-  // To close that, the client MUST set its App Attest challenge so that
-  //   clientDataHash == SHA-256( utf8("<epoch>") || 0x00 || each base64(blinded) joined by 0x00 )
-  // i.e. clientDataHash commits to the exact batch being requested in this epoch.
-  // We recompute that here and require equality. This is gated behind an env flag
-  // (default ON in production once the client ships the matching hash; an operator
-  // may set REQUIRE_CLIENT_DATA_BINDING=0 during client bring-up, accepting that
-  // App Attest then only bounds abuse per-device and does not bind the payload).
-  const epochId = currentEpoch();
-
-  if (REQUIRE_CLIENT_DATA_BINDING) {
-    let got;
-    try { got = Buffer.from(clientDataHash, 'base64'); } catch { got = Buffer.alloc(0); }
-    // Accept the current OR previous epoch's binding: the client computes the hash
-    // against the epoch it last saw, which can be one behind the issuer if the
-    // request crosses an epoch boundary (the issuer already publishes both epochs'
-    // keys for the same reason). Both candidate hashes are constant-time compared.
-    let bound = false;
-    if (got.length === 32) {
-      for (const e of [epochId, epochId - 1]) {
-        if (crypto.timingSafeEqual(got, expectedClientDataHash(e, blinded))) { bound = true; break; }
-      }
-    }
-    if (!bound) {
-      res.writeHead(401); res.end();
-      log({ route: '/issue', status: 401, reason: 'client_data_binding_failed', durationMs: Date.now() - start });
-      return;
-    }
-  }
-
-  // (b) Enforce the per-device per-epoch issuance quota. The keyId is the device
-  // identifier; it is hashed before it touches the quota table and never logged.
-  if (!reserveQuota(epochId, keyId, blinded.length)) {
-    res.writeHead(429); res.end();
-    log({ route: '/issue', status: 429, reason: 'quota_exceeded', count: blinded.length, durationMs: Date.now() - start });
-    return;
-  }
-
   // Decode the blinded messages. Each must be exactly the RSA modulus size
   // (256 bytes for RSA-2048); reject anything malformed before signing.
   const expectedLen = RSA_MODULUS_BITS / 8;
@@ -461,14 +250,83 @@ async function handleIssue(req, res, start, body) {
     blindedBufs.push(new Uint8Array(buf));
   }
 
-  // (c) Blind-sign each blinded_msg with the current epoch RSA private key.
+  // (a2) REQUEST-PAYLOAD BINDING. App Attest proves "a genuine device signed THIS
+  // clientDataHash"; on its own it does NOT prove the device authorized THESE
+  // blinded messages, because clientDataHash is an opaque 32 bytes from the client.
+  // Without binding, a captured valid {keyId, assertion, clientDataHash} could be
+  // replayed against a different `blinded[]` batch (still rate-limited by the
+  // per-device quota, but not request-integrity-checked).
+  //
+  // To close that, the client MUST set its App Attest challenge so that
+  //   clientDataHash == SHA-256( utf8("<epoch>") || 0x00 || each base64(blinded) joined by 0x00 )
+  // i.e. clientDataHash commits to the exact batch being requested in this epoch.
+  // We recompute that here and require equality. This is gated behind an env flag
+  // (default ON in production once the client ships the matching hash; an operator
+  // may set REQUIRE_CLIENT_DATA_BINDING=0 during client bring-up, accepting that
+  // App Attest then only bounds abuse per-device and does not bind the payload).
+  const epochId = currentEpoch();
+
+  let signingEpochId = epochId;
+  if (REQUIRE_CLIENT_DATA_BINDING) {
+    signingEpochId = boundEpoch(clientDataHash, blinded, epochId);
+    if (signingEpochId === null) {
+      res.writeHead(401); res.end();
+      log({ route: '/issue', status: 401, reason: 'client_data_binding_failed', durationMs: Date.now() - start });
+      return;
+    }
+  }
+
+  // (c) Sign with the epoch key matched by the binding, including at rollover.
   let keys;
   try {
-    keys = await keysForEpoch(epochId);
+    keys = await keysForEpoch(signingEpochId);
   } catch (e) {
     // Missing/invalid signing key => fail closed.
     res.writeHead(503); res.end();
     log({ route: '/issue', status: 503, reason: 'no_signing_key', durationMs: Date.now() - start });
+    return;
+  }
+
+  // (a) Validate App Attest. This proves the request comes from a genuine,
+  // unmodified iOS client install on real Apple hardware. FAILS CLOSED: if App Attest
+  // is unconfigured (Apple root cert / team+bundle id not supplied), the validator
+  // returns { ok: false } and we reject. We never log the assertion/attestation,
+  // and we never log the coarse failure reason at a level that could fingerprint a
+  // device (it is an aggregate counter only).
+  //
+  // Verification returns a candidate. The atomic reservation below owns all
+  // registration, counter and quota mutation, including competing replicas.
+  let attest;
+  try {
+    attest = await validateAppAttest({ keyId, attestation, assertion, clientDataHash, store: ISSUER_STATE });
+  } catch {
+    attest = { ok: false, reason: 'verification_exception' };
+  }
+  if (!attest || !attest.ok) {
+    const unavailable = attest?.reason === 'state_unavailable';
+    const status = unavailable ? 503 : 401;
+    res.writeHead(status, { 'Content-Type': 'application/json', ...(unavailable ? { 'Retry-After': '2' } : {}) });
+    res.end(JSON.stringify({ error: unavailable ? 'state_unavailable' : attest?.reason === 'unknown_device_key' ? 'unknown_device_key' : 'attest_failed' }));
+    log({ route: '/issue', status, reason: unavailable ? 'state_unavailable' : 'attest_failed', durationMs: Date.now() - start });
+    return;
+  }
+  let reservation;
+  try {
+    reservation = await ISSUER_STATE.reserve({ keyId: attest.keyId, mode: attest.mode,
+      publicKeyPem: attest.publicKeyPem, signCount: attest.signCount,
+      epoch: epochId, count: blinded.length });
+  } catch {
+    res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '2' });
+    res.end(JSON.stringify({ error: 'state_unavailable' }));
+    log({ route: '/issue', status: 503, reason: 'state_unavailable', durationMs: Date.now() - start });
+    return;
+  }
+  if (!reservation.ok) {
+    const limited = reservation.reason === 'quota_exceeded';
+    const retryAfter = Math.max(1, Math.ceil((epochId + 1) * EPOCH_SECONDS - Date.now() / 1000));
+    res.writeHead(limited ? 429 : 401, { 'Content-Type': 'application/json', ...(limited ? { 'Retry-After': String(retryAfter) } : {}) });
+    res.end(JSON.stringify({ error: limited ? 'quota_exceeded' : reservation.reason === 'unknown_device_key' ? 'unknown_device_key' : 'attest_failed' }));
+    log({ route: '/issue', status: limited ? 429 : 401, reason: limited ? 'quota_exceeded' : 'attest_failed', count: blinded.length, durationMs: Date.now() - start });
     return;
   }
 
@@ -485,7 +343,7 @@ async function handleIssue(req, res, start, body) {
   }
 
   // (d) Return the blind signatures. Same order as the request's blinded array.
-  const out = JSON.stringify({ epoch: epochId, keyId: keys.keyId, blindSigs });
+  const out = JSON.stringify({ epoch: signingEpochId, keyId: keys.keyId, blindSigs });
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(out);
   // Aggregate count only - never which device, never the signatures.
@@ -520,6 +378,7 @@ async function handleIssuerKeys(res, start) {
     return;
   }
   const out = JSON.stringify({
+    schemaVersion: 1,
     suite: 'RSABSSA-SHA384-PSS-Deterministic',
     epoch: epochId,
     epochSeconds: EPOCH_SECONDS,
@@ -569,7 +428,22 @@ function fdidExempt(req, path) {
 
 // --- HTTP server ------------------------------------------------------------
 
+let draining = false, httpClosed = false, activeWork = 0, shutdownTimer;
+function finishDrain() {
+  if (draining && httpClosed && activeWork === 0) { clearTimeout(shutdownTimer); process.exit(0); }
+}
+function beginShutdown() {
+  if (draining) return;
+  draining = true;
+  shutdownTimer = setTimeout(() => { server.closeAllConnections(); process.exit(1); }, 25000);
+  server.close(() => { httpClosed = true; finishDrain(); });
+}
+function trackWork(promise) {
+  activeWork++;
+  return promise.finally(() => { activeWork--; finishDrain(); });
+}
 const server = http.createServer((req, res) => {
+  if (draining) { res.writeHead(503, { 'Retry-After': '2' }); res.end(); return; }
   const start = Date.now();
 
   // Front door origin lock. When REQUIRE_FDID is set, every non-exempt request
@@ -600,7 +474,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === 'GET' && req.url === '/issuer-keys') {
-    handleIssuerKeys(res, start);
+    trackWork(handleIssuerKeys(res, start));
     return;
   }
 
@@ -628,7 +502,8 @@ const server = http.createServer((req, res) => {
     });
     req.on('end', () => {
       if (aborted) return;
-      handleIssue(req, res, start, Buffer.concat(chunks)).catch(() => {
+      if (draining) { res.writeHead(503, { 'Retry-After': '2' }); res.end(); return; }
+      trackWork(handleIssue(req, res, start, Buffer.concat(chunks))).catch(() => {
         if (!res.headersSent) { res.writeHead(500); res.end(); }
         log({ route: '/issue', status: 500, reason: 'unhandled', durationMs: Date.now() - start });
       });
@@ -655,13 +530,15 @@ const isEntrypoint = process.argv[1] && fileURLToPath(import.meta.url) === proce
 // stub, and whether a signing key is present. This is the one place an operator
 // learns the service is running in stub mode - it is NOT silent.
 if (isEntrypoint) {
+  process.on('SIGTERM', beginShutdown);
+  process.on('SIGINT', beginShutdown);
   server.listen(PORT, () => {
     log({
       event: 'listen',
       port: PORT,
       role: 'token-issuer',
       appAttest: APP_ATTEST_READY ? 'enforced' : 'stub-fail-closed',
-      signingKey: ISSUER_SIGNING_KEY_B64 ? 'present' : 'missing-fail-closed',
+      signingKey: ISSUER_SIGNING_KEY_B64 || ISSUER_EPOCH_KEYS_JSON !== undefined ? 'present' : 'missing-fail-closed',
       epochSeconds: EPOCH_SECONDS,
     });
   });
@@ -673,11 +550,13 @@ export {
   suite,
   currentEpoch,
   keysForEpoch,
-  reserveQuota,
   keyIdFromSpki,
   derivePublicKey,
   expectedClientDataHash,
-  ATTEST_STORE,
+  boundEpoch,
+  safeLogFields,
+  ISSUER_STATE,
+  beginShutdown,
   EPOCH_SECONDS,
   RSA_MODULUS_BITS,
   PSS_HASH,

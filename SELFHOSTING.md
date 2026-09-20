@@ -12,7 +12,7 @@ This guide runs the request-path components (relay, gateway, and optionally the 
 
 ## 1. Generate the gateway HPKE seed
 
-The gateway derives its HPKE keypair from a 32-byte seed, `SEED_SECRET_KEY`, given as hex. This is the one real secret in the system, so keep it out of version control and out of logs.
+The gateway derives its HPKE keypair from a 32-byte seed, `SEED_SECRET_KEY`, given as hex. Keep it out of version control and logs, along with relay credentials, issuer signing keys and optional storage credentials/salts. Each operator should hold only the secrets required by its own service.
 
 ```sh
 openssl rand -hex 32
@@ -131,7 +131,7 @@ docker run -d --name relay --network columbia -p 8081:8080 \
 | `ISSUER_KEYS_URL` | (none) | in `token` mode, the issuer's `GET /issuer-keys`, e.g. `https://<issuer-host>/issuer-keys` |
 | `ISSUER_KEYS_TTL_MS` | `300000` | how often the relay refreshes the cached issuer epoch public keys |
 | `TOKEN_PSS_SALT_LEN` | `48` | RSA-PSS salt length for token verification (matches SHA-384 and the issuer suite) |
-| `REDEMPTION_MAX_KEYS` | `5000000` | spend-once set memory bound (single replica; a shared store is the real fix) |
+| `REDEMPTION_MAX_KEYS` | `5000000` | single-process spend capacity; full fails503 without evicting existing spends |
 | `RELAY_GATEWAY_SECRET` | (none) | shared secret sent to the gateway as `X-Columbia-Relay-Auth`; set the SAME value on the gateway |
 | `GATEWAY_CONFIGS_URL` | gateway host + `/ohttp-configs` | where the relay fetches the key config to pass through |
 | `CONFIG_TTL_MS` | `120000` | how long the relay caches the passed-through key config |
@@ -201,7 +201,7 @@ docker run -d --name issuer --network columbia -p 8083:8080 \
 |---|---|---|
 | `ISSUER_SIGNING_KEY` | yes | the epoch RSA private key (2048-bit), a PEM string or base64 of DER, PKCS#1 or PKCS#8; injected at runtime, never committed; missing or unparseable fails closed |
 | `PORT` | `8080` | listen port |
-| `EPOCH_SECONDS` | `604800` | epoch length; the keypair rotates per epoch (default one week) |
+| `EPOCH_SECONDS` | `604800` | epoch length (default one week); actual key rotation requires the explicit current/previous manifest |
 | `ISSUANCE_QUOTA_PER_EPOCH` | `256` | max tokens a single device may obtain per epoch; `0` disables the quota |
 | `MAX_TOKENS_PER_REQUEST` | `64` | max blinded messages accepted per `/issue` call |
 | `MAX_BODY_BYTES` | `262144` | request body cap |
@@ -209,12 +209,22 @@ docker run -d --name issuer --network columbia -p 8083:8080 \
 | `APPLE_APP_ATTEST_ROOT_CA_PEM_B64` | to enforce | Apple's App Attest Root CA, PEM, base64; without it (and the two below) App Attest fails closed |
 | `APPLE_TEAM_ID` | to enforce | your Apple Team ID, the first half of the appID the attestation must match |
 | `APPLE_BUNDLE_ID` | to enforce | your app's bundle id, the second half of the appID |
-| `APPLE_APP_ATTEST_AAGUID` | `appattest` | `appattest` for production, `appattestdevelop` for dev or TestFlight builds |
+| `APPLE_APP_ATTEST_AAGUID` | `appattest` | Match the actual App Attest environment; TestFlight and App Store builds use production (`appattest`). Development validation remains a separate configuration/physical-device check. |
 | `APP_ATTEST_CLOCK_SKEW_MS` | `300000` | tolerance when checking the attestation cert validity windows, for clock drift |
 | `REQUIRE_FDID` | (none) | when set, reject any request that did not arrive through the edge front door (see [Edge front door](#edge-front-door-cdn--waf)); `GET /health` and `GET /issuer-keys` stay reachable |
 | `FDID_HEADER` | `x-azure-fdid` | name of the header the edge front door injects for the `REQUIRE_FDID` lock above; override for a non-Azure CDN or WAF that injects a differently named header |
 
 > Generate a local test signing key with `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -outform DER | base64 | tr -d '\n'`. In production the key comes from your secret store at runtime, never from the repo, exactly like the gateway's `SEED_SECRET_KEY`.
+
+Apple documents that [TestFlight and App Store distributions always use the production App Attest environment](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.devicecheck.appattest-environment), regardless of a development entitlement.
+
+Before enabling token mode, configure the separate durable stores and reviewed
+current/previous key manifest described in [issuer configuration](token-issuer/README.md#configuration)
+and [relay configuration](ohttp-relay/README.md). The memory fallback is not
+restart-safe. Never share issuer-state credentials with the relay, never delete
+spends while their actual key material might return, and complete physical-device
+and older-client compatibility acceptance first. No deployment script flips this
+policy automatically.
 
 Point the relay at the issuer by setting `CLIENT_AUTH_MODE=token` and `ISSUER_KEYS_URL=https://<issuer-host>/issuer-keys` on the relay. The relay fetches the issuer's epoch public keys once, caches them, and verifies every spent token offline, so there is no per-request call to the issuer.
 
@@ -275,7 +285,7 @@ When the budget is momentarily spent the gateway refuses with `429` + `Retry-Aft
 
 ## Abuse controls
 
-The relay is the one public surface, so it carries the abuse controls. All of them keep state in memory only, key nothing to request content, and are never logged, so they do not weaken the operator-blind property. They are off or permissive by default; turn them on for a public deployment.
+The relay is the one public surface, so it carries the abuse controls. Rate/IP controls remain transient memory only. Optional durable token spends contain public-key/signature hashes, never request content or IP. Issuer device state belongs to a separate operator and credential; see the token issuer README. They are off or permissive by default; turn them on for a public deployment.
 
 - **Per-IP rate limiting and a concurrency cap.** `RATE_LIMIT_RPM` (default 120) bounds requests per minute per client IP over a `RATE_WINDOW_MS` window (default 60000); set `RATE_LIMIT_RPM=0` to disable it. `MAX_INFLIGHT` (default 256) caps concurrent relays across the whole process. Anything over either limit gets a 429. `RATE_MAX_KEYS` (default 100000) bounds the limiter's memory so a spoofed-source flood can't grow the table. Behind a single managed ingress the per-IP key is read from the rightmost `X-Forwarded-For` entry, because the TCP peer is the ingress, not the client. **If the request crosses more than one proxy** (e.g. a CDN or Front Door in front of the platform ingress), the rightmost `X-Forwarded-For` entry is the nearest proxy, not the client, so every client collapses into one bucket and gets 429'd in aggregate. Set `TRUSTED_CLIENT_IP_HEADER` to the front proxy's trusted client-IP header (`x-azure-socketip` for Azure Front Door, `cf-connecting-ip` for Cloudflare) to key per real client. **Do NOT use `x-azure-clientip`:** Azure Front Door derives that header from the caller's OWN `X-Forwarded-For`, so a client can set it to anything and choose its own rate-limit bucket — measured against a live AFD profile 2026-08-02. `x-azure-socketip` is the TCP peer AFD actually observed and cannot be spoofed by the caller. That IP is used only as a transient counter key; it is never logged or forwarded to the gateway.
 - **Strict request shape.** The relay answers only `POST /relay` with `Content-Type: message/ohttp-req`. A wrong content type returns 415; any other path or method returns 404. There is no general proxy surface to probe.

@@ -14,6 +14,10 @@
     "node": ">=24"
   },
   "dependencies": {
+    "@azure/data-tables": "13.3.2",
     "@cloudflare/blindrsa-ts": "0.4.6"
+  },
+  "devDependencies": {
+    "@azure/core-rest-pipeline": "1.25.0"
   }
 }

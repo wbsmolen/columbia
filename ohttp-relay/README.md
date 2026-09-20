@@ -2,7 +2,7 @@
 
 The relay half of the OHTTP ([RFC 9458](https://www.rfc-editor.org/rfc/rfc9458)) split-trust pair. It's the only component that ever sees a client's IP address, and it can do nothing with it, because everything it forwards is an opaque HPKE ciphertext it can't decrypt.
 
-Dependency-free Node (built-in `http` and `https` only).
+Node 24 HTTP relay with an optional Azure Table redemption adapter. The locked Azure dependency is loaded only when its connection is configured.
 
 ## Why it exists
 
@@ -105,7 +105,9 @@ The relay never automatically replays ciphertext after a connection reset, even 
 | `ISSUER_KEYS_URL` | unset | in `token` mode, the issuer's `GET /issuer-keys`, e.g. `https://<issuer-host>/issuer-keys` |
 | `ISSUER_KEYS_TTL_MS` | `300000` | how often the relay refreshes the cached issuer public keys |
 | `TOKEN_PSS_SALT_LEN` | `48` | RSA-PSS salt length for token verification (SHA-384 digest length) |
-| `REDEMPTION_MAX_KEYS` | `5000000` | spend-once set memory bound (single replica; a shared store is the real fix) |
+| `REDEMPTION_MAX_KEYS` | `5000000` | single-process memory capacity; full capacity fails503, never evicts a live spend |
+| `REDEMPTION_CONNECTION_STRING` | unset | Relay-operator Azure Table credential; enables shared durable redemption; never issuer-state credentials |
+| `REDEMPTION_TABLE` | `columbiaredemptions` | Dedicated relay spend table |
 | `RATE_LIMIT_RPM` | `120` | per-IP requests per minute; `0` disables per-IP limiting |
 | `RATE_WINDOW_MS` | `60000` | the window `RATE_LIMIT_RPM` is measured over |
 | `RATE_MAX_KEYS` | `100000` | per-IP rate-limit bucket memory bound |
@@ -129,13 +131,31 @@ auth header and verifies it offline against the issuer's epoch public key
 is no per-request call to the issuer: the relay fetches the public key once from
 `ISSUER_KEYS_URL` and caches it, so the issuer never learns which token was spent.
 That offline, public verification is what keeps the token unlinkable. The issuer
-half lives in [`../token-issuer`](../token-issuer). The spend-once set is in-memory
-and single-process; the code marks where a shared store goes for a
-multi-replica deployment.
+half lives in [`../token-issuer`](../token-issuer). The optional Azure adapter makes create-only
+spend decisions across replicas and restarts. Each row stores only a random claim
+ID, full public-key fingerprint partition and signature hash. A409 is already
+spent; a lost ACK is accepted only if readback proves this exact claim; other
+unconfirmed storage results return503/Retry-After 2. SDK retries are disabled and
+all storage waits share a 5-second deadline. The memory fallback fails closed at
+capacity and never evicts spends, but is still single-process.
+
+Key metadata is fetched with a 5-second total deadline,64KiB response bound,
+single-flight and 5-second retry/negative backoff. Public-key IDs are checked
+against actual material. Cached keys never survive their declared epoch horizon
+even when refresh fails. Unknown keys in a valid cache reject401; no valid keys
+or unavailable spend state return503. The global in-flight cap includes pending
+authentication even after the client disconnects.
+
+Spend rows have no automatic TTL or cap eviction. Storage cost therefore grows
+with accepted tokens. Cleanup requires a separately reviewed permanent retirement
+fence for actual key material; deleting rows solely because an epoch number aged
+would allow reused keys to revive spent tokens. The current implementation favors
+retention over unsafe implicit expiration. Production token enforcement remains a
+separate staged rollout with older-client and physical-device acceptance.
 
 ## Local validation
 
-Run `node test.mjs`. The local HTTPS gateway exercises successful forwarding,
+Run `npm ci && npm test` (Node 24). The local HTTPS gateway exercises successful forwarding,
 ambiguous resets without replay, response size limits, response-stream resets,
 timeouts, aborted uploads, caller disconnects, slot recovery, and config caching.
 Every gateway failure and cancellation must produce exactly one outcome log.
@@ -158,3 +178,11 @@ docker run --rm -p 8080:8080 \
 ```
 
 Runs as the non-root `node` user on port 8080. For the real operator-blind guarantee, deploy this on a different operator than the gateway. See [`../SELFHOSTING.md`](../SELFHOSTING.md).
+
+### Process termination
+
+SIGTERM/SIGINT stop new admission and drain existing HTTP plus owned asynchronous
+work for at most 25 seconds. Client socket closure does not make pending
+authentication or an issuer reservation disappear. Clean drain exits 0; the hard
+deadline exits 1 and does not imply rollback of a write whose ACK was lost. Allow
+a platform termination grace greater than this bound.
