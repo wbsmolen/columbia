@@ -4,6 +4,10 @@ Notable changes to Columbia. Published releases and their exact tags are listed 
 
 ## Unreleased
 
+### Fixed
+
+- Genuine App Attest assertions can carry the AT flag without attested credential data. The issuer now parses their common authenticator prefix separately from attestation credentials, preserving signature verification over the complete signed bytes, app identity checks and strictly increasing counters. Regression fixtures include AT-set assertions and signed extension suffixes.
+
 ### Observability
 
 - Commons keeps redirect responses as fixed `502` errors and never follows their `Location` URL. Bounded logs now include the upstream HTTP status and, for redirects, only a fixed target class (`same_origin`, `other_origin_https`, `unsafe_scheme`, `missing`, or `invalid`). Failed background refreshes are reported separately without a client HTTP status. No target URL, host, query, credential, or upstream body is logged or returned to clients. Socket-free regression tests cover fetch, HTTP response, and background refresh paths.

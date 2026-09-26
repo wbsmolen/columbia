@@ -294,7 +294,7 @@ function parseAppleNonce(extnValueDer) {
 //      credentialPubKey:  COSE_Key (CBOR map) - the attested EC P-256 key
 // ---------------------------------------------------------------------------
 
-function parseAuthenticatorData(authData) {
+function parseAuthenticatorData(authData, { attestedCredentialData = true } = {}) {
   if (!Buffer.isBuffer(authData) || authData.length < 37) {
     throw new Error('authData: too short');
   }
@@ -304,7 +304,7 @@ function parseAuthenticatorData(authData) {
   const out = { rpIdHash: Buffer.from(rpIdHash), flags, signCount };
 
   const atPresent = (flags & 0x40) !== 0; // bit 6
-  if (atPresent) {
+  if (attestedCredentialData && atPresent) {
     let off = 37;
     if (off + 18 > authData.length) throw new Error('authData: attestedCredentialData truncated');
     const aaguid = authData.subarray(off, off + 16); off += 16;
@@ -483,7 +483,12 @@ function verifyAssertion(assertionBuf, clientDataHash, storedPublicKeyObject, st
   const ok = crypto.verify('sha256', nonce, storedPublicKeyObject, signature);
   if (!ok) throw new Error('assertion: bad signature');
 
-  const parsed = parseAuthenticatorData(authData);
+  // App Attest assertions contain the common prefix, not a new attested key.
+  // Physical devices can still set AT (0x40), so using the attestation parser's
+  // credential branch here rejects valid 37-byte assertions. Authenticate ALL
+  // raw bytes above (including any extension suffix), then read RP ID/counter.
+  // The full credential parser remains mandatory on the attestation path.
+  const parsed = parseAuthenticatorData(authData, { attestedCredentialData: false });
   if (!crypto.timingSafeEqual(parsed.rpIdHash, appIdHash())) {
     throw new Error('assertion: rpIdHash != SHA256(appID)');
   }

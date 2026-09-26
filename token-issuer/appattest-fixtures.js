@@ -233,8 +233,9 @@ function buildAttestationAuthData({ rpIdHash, aaguidLabel, credentialId, credent
   return Buffer.concat([head, aaguid, credIdLen, credentialId, cose]);
 }
 
-// Assertion authData: rpIdHash | flags | signCount  (no attestedCredentialData).
-function buildAssertionAuthData({ rpIdHash, signCount, flags = 0x00 }) {
+// Physical App Attest assertions may retain AT (0x40) despite carrying only
+// rpIdHash | flags | signCount, with no attestedCredentialData.
+function buildAssertionAuthData({ rpIdHash, signCount, flags = 0x40 }) {
   const b = Buffer.alloc(37);
   rpIdHash.copy(b, 0);
   b[32] = flags;
@@ -329,10 +330,10 @@ function makeAttestationFixture({ appId, aaguidLabel = 'appattest', challenge })
 
 // Build a valid assertion for a registered key: signs SHA-256(authData ||
 // clientDataHash) with the device key, with a chosen signCount.
-function makeAssertion({ appId, credPrivateKey, signCount, challenge }) {
+function makeAssertion({ appId, credPrivateKey, signCount, challenge, flags = 0x40, authDataSuffix = Buffer.alloc(0) }) {
   const rpIdHash = crypto.createHash('sha256').update(appId, 'utf8').digest();
   const clientDataHash = crypto.createHash('sha256').update(challenge).digest();
-  const authData = buildAssertionAuthData({ rpIdHash, signCount });
+  const authData = Buffer.concat([buildAssertionAuthData({ rpIdHash, signCount, flags }), authDataSuffix]);
   const nonce = crypto.createHash('sha256').update(authData).update(clientDataHash).digest();
   const signature = crypto.sign('sha256', nonce, credPrivateKey); // DER ECDSA
   const assertionObj = cborMap([

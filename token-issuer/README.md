@@ -225,7 +225,11 @@ The security of the whole pattern rests on these pieces.
     extract the device public key for storage.
   - *Assertion* (per issuance): verify the ECDSA-P256-SHA256 signature over
     `SHA256(authData || clientDataHash)` with the stored device key, re-check
-    `rpIdHash`, and enforce a strictly increasing sign counter.
+    `rpIdHash`, and enforce a strictly increasing sign counter. Assertions use the
+    common authenticator prefix even when physical devices retain the AT flag
+    without credential data. The signature still covers all raw authenticator
+    bytes, including any extension suffix; only attestations parse and validate
+    a newly attested credential key.
 
   It still **fails closed**: with `APPLE_APP_ATTEST_ROOT_CA_PEM_B64`,
   `APPLE_TEAM_ID`, or `APPLE_BUNDLE_ID` unset, the validator rejects every request,
