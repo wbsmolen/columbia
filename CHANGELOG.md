@@ -2,7 +2,7 @@
 
 Notable changes to Columbia. Published releases and their exact tags are listed on [GitHub Releases](https://github.com/wbsmolen/columbia/releases).
 
-## Unreleased
+## v1.7.1 - 2026-09-26
 
 ### Fixed
 
