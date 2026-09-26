@@ -13,6 +13,7 @@ Notable changes to Columbia. Published releases and their exact tags are listed 
 
 - Production issuers can require durable state with `REQUIRE_DURABLE_STATE=1`; missing storage configuration then fails startup instead of silently losing registrations after restart. Development and tests retain explicit memory support.
 - Document dedicated issuer storage, stable-secret preservation, atomic configuration rollout, and physical assertion checks across restart. Upgrading the image alone does not migrate process-local registrations or enable relay enforcement.
+- The optional Azure deployment workflow now uses BuildKit rather than the classic ACR quick-build builder, which rejects the hardened Dockerfiles' `COPY --chmod` instructions. Deployment remains manual and preserves existing runtime configuration.
 
 ## v1.7.0 - 2026-09-20
 
