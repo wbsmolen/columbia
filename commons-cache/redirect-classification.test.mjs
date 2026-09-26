@@ -11,6 +11,7 @@ test('redirects are classified without returning a Location', () => {
     [301, 'https://elsewhere.example.test/private?secret=token', 'other_origin_https'],
     [307, 'http://169.254.169.254/latest/meta-data/', 'unsafe_scheme'],
     [308, null, 'missing'],
+    [308, '   ', 'missing'],
     [302, 'http://[', 'invalid'],
   ]) {
     const response = new Response(null, { status, headers: location ? { Location: location } : {} });

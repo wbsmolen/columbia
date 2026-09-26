@@ -140,7 +140,7 @@ function upstreamFailure(status, error) {
 // only this fixed category for operations; never log the target URL or host.
 function redirectTargetClass(requestedUrl, response) {
   if (response.status < 300 || response.status >= 400) return undefined;
-  const location = response.headers.get('location');
+  const location = response.headers.get('location')?.trim();
   if (!location) return 'missing';
   try {
     const target = new URL(location, requestedUrl);
