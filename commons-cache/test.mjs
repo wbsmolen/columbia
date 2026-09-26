@@ -31,7 +31,19 @@ const mock = http.createServer((req, res) => {
   upstreamHits++;
   lastAuth = req.headers['authorization'];
   const respond = () => {
-    if (req.url.includes('rsssub')) {
+    if (req.url.includes('redirectsame')) {
+      res.writeHead(302, { Location: '/different/path?private=secret' });
+      res.end();
+    } else if (req.url.includes('redirectother')) {
+      res.writeHead(301, { Location: 'https://other.example.test/private?secret=token' });
+      res.end();
+    } else if (req.url.includes('redirectunsafe')) {
+      res.writeHead(307, { Location: 'http://169.254.169.254/latest/meta-data/' });
+      res.end();
+    } else if (req.url.includes('redirectmissing')) {
+      res.writeHead(308);
+      res.end();
+    } else if (req.url.includes('rsssub')) {
       res.writeHead(200, { 'Content-Type': 'application/rss+xml' });
       res.end(RSS_PAYLOAD);
     } else {
@@ -129,6 +141,9 @@ try {
   assert.equal(upstreamFailure(429), 'upstream_429');
   assert.equal(upstreamFailure(403), 'upstream_403');
   assert.equal(upstreamFailure(0, { name: 'TimeoutError', message: 'private' }), 'timeout');
+  assert.deepEqual(safeLogFields({ upstreamStatus: 302, redirectTarget: 'same_origin', url: 'https://private.test' }),
+    { upstreamStatus: 302, redirectTarget: 'same_origin' });
+  assert.deepEqual(safeLogFields({ upstreamStatus: 0, redirectTarget: 'https://private.test' }), {});
 
   // (a) MISS fetches upstream once and forwards Authorization
   let r = await get('/v1/commons?id=jsonsub&sort=hot', { Authorization: 'Bearer AAA' });
@@ -255,7 +270,32 @@ try {
   assert.equal(r.xcache, 'HIT', 'o: subsequent read is a HIT');
   assert.equal(imgurHits - before2, 1, 'o: HIT does NOT re-fetch imgur');
 
-  console.log('PASS: all commons-cache self-tests passed (a-o)');
+  // (p) Redirects remain fixed 502s. Logs retain only the status and a fixed
+  // target class: no Location, path, host, query or Authorization is emitted.
+  const redirectCases = [
+    ['redirectsame', 302, 'same_origin'],
+    ['redirectother', 301, 'other_origin_https'],
+    ['redirectunsafe', 307, 'unsafe_scheme'],
+    ['redirectmissing', 308, 'missing'],
+  ];
+  for (const [id, upstreamStatus, redirectTarget] of redirectCases) {
+    const captured = [];
+    const beforeRedirect = upstreamHits;
+    process.stdout.write = (chunk, ...rest) => { captured.push(String(chunk)); return realWrite(chunk, ...rest); };
+    try { r = await get(`/v1/commons?id=${id}&sort=hot`, { Authorization: 'Bearer PRIVATE' }); }
+    finally { process.stdout.write = realWrite; }
+    assert.equal(r.status, 502, `p: ${id} fixed 502`);
+    assert.equal(upstreamHits - beforeRedirect, 1, `p: ${id} redirect was not followed`);
+    assert.equal(r.ustatus, null, `p: ${id} upstream status not leaked to client`);
+    const row = captured.map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .find((line) => line?.route === '/v1/commons' && line.status === 502);
+    assert.equal(row?.reason, 'redirect', `p: ${id} reason`);
+    assert.equal(row?.upstreamStatus, upstreamStatus, `p: ${id} upstream status`);
+    assert.equal(row?.redirectTarget, redirectTarget, `p: ${id} redirect class`);
+    assert.ok(!/PRIVATE|private|secret|169\.254|other\.example|different/.test(captured.join('')), `p: ${id} log privacy`);
+  }
+
+  console.log('PASS: all commons-cache self-tests passed (a-p)');
 } catch (err) {
   failed = true;
   console.error('FAIL:', err.message);

@@ -2,6 +2,12 @@
 
 Notable changes to Columbia. Published releases and their exact tags are listed on [GitHub Releases](https://github.com/wbsmolen/columbia/releases).
 
+## Unreleased
+
+### Observability
+
+- Commons keeps redirect responses as fixed `502` errors and never follows their `Location` URL. Bounded logs now include the upstream HTTP status and, for redirects, only a fixed target class (`same_origin`, `other_origin_https`, `unsafe_scheme`, `missing`, or `invalid`). Failed background refreshes are reported separately without a client HTTP status. No target URL, host, query, credential, or upstream body is logged or returned to clients. Socket-free regression tests cover fetch, HTTP response, and background refresh paths.
+
 ## v1.7.0 - 2026-09-20
 
 ### Added
