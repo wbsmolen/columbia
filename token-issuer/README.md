@@ -1,5 +1,12 @@
 # token-issuer
 
+Rejected proofs log only allowlisted `proofMode` and `attestFailure` categories
+alongside the existing status and reason. These distinguish certificate, nonce,
+key, app identity, environment, signature, counter, and registration failures.
+Raw verifier details, identifiers, and proof bytes are never logged; public
+rejection responses remain unchanged. These diagnostics do not enable relay
+token enforcement or relax any App Attest check.
+
 The token issuer gates relay access to genuine, attested clients, supports rate
 limiting, and preserves unlinkability between a user and the content they fetch.
 

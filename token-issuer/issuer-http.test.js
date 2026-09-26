@@ -97,9 +97,13 @@ test('issuer log boundary discards arbitrary path, key, challenge and error deta
     route: `/${privateString}`, status: 403, durationMs: 12.3,
     reason: privateString, keyId: privateString, attestation: privateString,
     clientDataHash: privateString, error: privateString, issued: 999999,
+    proofMode: privateString, attestFailure: privateString,
   });
   assert.deepEqual(safe, { route: 'other', status: 403, durationMs: 12 });
   assert.ok(!JSON.stringify(safe).includes(privateString));
+  assert.deepEqual(issuer.safeLogFields({ reason: 'attest_failed', proofMode: 'assertion',
+    attestFailure: 'unknown_device_key', detail: privateString, keyId: privateString }),
+  { reason: 'attest_failed', proofMode: 'assertion', attestFailure: 'unknown_device_key' });
 });
 
 test('binding chooses exactly the current or previous epoch and rejects stale epochs', () => {

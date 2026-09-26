@@ -47,7 +47,32 @@ process.env.APPLE_APP_ATTEST_AAGUID = 'appattest';
 
 // Now import the validator (it reads the env above at load).
 const appattest = await import('./appattest.js');
-const { validateAppAttest, APP_ATTEST_READY } = appattest;
+const { validateAppAttest, attestationFailureCategory, APP_ATTEST_READY } = appattest;
+
+test('failure diagnostics distinguish actionable causes without returning arbitrary error text', () => {
+  const cases = [
+    [{ reason: 'unknown_device_key' }, 'unknown_device_key'],
+    [{ reason: 'app_attest_not_configured' }, 'configuration'],
+    [{ reason: 'state_unavailable' }, 'state_unavailable'],
+    [{ reason: 'replayed_assertion' }, 'counter'],
+    [{ reason: 'key_mismatch' }, 'key_binding'],
+    [{ reason: 'expired_epoch' }, 'expired_epoch'],
+    [{ reason: 'quota_exceeded' }, 'quota'],
+    [{ detail: 'authData: aaguid mismatch' }, 'environment'],
+    [{ detail: 'authData: rpIdHash != SHA256(appID)' }, 'app_identity'],
+    [{ detail: 'assertion: rpIdHash != SHA256(appID)' }, 'app_identity'],
+    [{ detail: 'assertion: signCount not strictly increasing' }, 'counter'],
+    [{ detail: 'assertion: bad signature' }, 'assertion_signature'],
+    [{ detail: 'chain: cert 0 signature invalid' }, 'certificate_chain'],
+    [{ detail: 'nonce: mismatch' }, 'nonce_binding'],
+    [{ detail: 'keyId: presented keyId != SHA256(pubkey)' }, 'key_binding'],
+    [{ detail: 'cbor: truncated' }, 'proof_format'],
+    [{ reason: 'private-test-marker', detail: 'private-test-marker' }, 'verification'],
+    [{ reason: '__proto__' }, 'verification'],
+    [null, 'verification'],
+  ];
+  for (const [result, expected] of cases) assert.equal(attestationFailureCategory(result), expected);
+});
 
 // A tiny in-memory attested-key store, as server.js would provide.
 function makeStore() {

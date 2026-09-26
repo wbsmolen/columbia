@@ -40,7 +40,7 @@ import { RSABSSA } from '@cloudflare/blindrsa-ts';
 import { TableClient } from '@azure/data-tables';
 import { createIssuerState, memoryDeviceBackend, azureDeviceBackend, ISSUER_STATE_CLIENT_OPTIONS } from './state-store.js';
 
-import { validateAppAttest, APP_ATTEST_READY } from './appattest.js';
+import { validateAppAttest, attestationFailureCategory, APP_ATTEST_READY } from './appattest.js';
 import { createEpochKeyProvider, derivePublicKey, keyIdFromSpki } from './epoch-keys.js';
 
 // --- Config -----------------------------------------------------------------
@@ -108,6 +108,8 @@ function safeLogFields(fields) {
   if (Number.isInteger(fields.status) && fields.status >= 100 && fields.status <= 599) safe.status = fields.status;
   if (Number.isFinite(fields.durationMs)) safe.durationMs = Math.max(0, Math.round(fields.durationMs));
   if (['bad_json', 'missing_keyid', 'bad_batch_size', 'attest_failed', 'client_data_binding_failed', 'quota_exceeded', 'bad_blinded_type', 'bad_blinded_len', 'no_signing_key', 'blind_sign_error', 'state_unavailable', 'unhandled'].includes(fields.reason)) safe.reason = fields.reason;
+  if (['attestation', 'assertion', 'missing'].includes(fields.proofMode)) safe.proofMode = fields.proofMode;
+  if (['configuration', 'client_data', 'proof_format', 'unknown_device_key', 'state_unavailable', 'key_binding', 'counter', 'expired_epoch', 'quota', 'environment', 'app_identity', 'assertion_signature', 'certificate_chain', 'nonce_binding', 'verification'].includes(fields.attestFailure)) safe.attestFailure = fields.attestFailure;
   for (const key of ['issued', 'count']) {
     if (Number.isInteger(fields[key]) && fields[key] >= 0 && fields[key] <= MAX_TOKENS_PER_REQUEST) safe[key] = fields[key];
   }
@@ -307,7 +309,9 @@ async function handleIssue(req, res, start, body) {
     const status = unavailable ? 503 : 401;
     res.writeHead(status, { 'Content-Type': 'application/json', ...(unavailable ? { 'Retry-After': '2' } : {}) });
     res.end(JSON.stringify({ error: unavailable ? 'state_unavailable' : attest?.reason === 'unknown_device_key' ? 'unknown_device_key' : 'attest_failed' }));
-    log({ route: '/issue', status, reason: unavailable ? 'state_unavailable' : 'attest_failed', durationMs: Date.now() - start });
+    log({ route: '/issue', status, reason: unavailable ? 'state_unavailable' : 'attest_failed',
+      proofMode: attestation ? 'attestation' : assertion ? 'assertion' : 'missing',
+      attestFailure: attestationFailureCategory(attest), durationMs: Date.now() - start });
     return;
   }
   let reservation;
@@ -326,7 +330,9 @@ async function handleIssue(req, res, start, body) {
     const retryAfter = Math.max(1, Math.ceil((epochId + 1) * EPOCH_SECONDS - Date.now() / 1000));
     res.writeHead(limited ? 429 : 401, { 'Content-Type': 'application/json', ...(limited ? { 'Retry-After': String(retryAfter) } : {}) });
     res.end(JSON.stringify({ error: limited ? 'quota_exceeded' : reservation.reason === 'unknown_device_key' ? 'unknown_device_key' : 'attest_failed' }));
-    log({ route: '/issue', status: limited ? 429 : 401, reason: limited ? 'quota_exceeded' : 'attest_failed', count: blinded.length, durationMs: Date.now() - start });
+    log({ route: '/issue', status: limited ? 429 : 401, reason: limited ? 'quota_exceeded' : 'attest_failed',
+      proofMode: attest.mode, attestFailure: attestationFailureCategory(reservation),
+      count: blinded.length, durationMs: Date.now() - start });
     return;
   }
 

@@ -614,8 +614,41 @@ async function validateAppAttest({ keyId, attestation, assertion, clientDataHash
   }
 }
 
+// A bounded operator diagnostic, never a client response or a free-form log.
+// In particular, do not emit `detail`: crypto/storage errors can carry values
+// outside our control. These categories distinguish configuration and device
+// proof failures without exposing identities or proof material.
+function attestationFailureCategory(result) {
+  const reasons = {
+    app_attest_not_configured: 'configuration',
+    missing_client_data_hash: 'client_data',
+    client_data_hash_not_32_bytes: 'client_data',
+    bad_client_data_hash: 'client_data',
+    no_attestation_or_assertion: 'proof_format',
+    no_attested_key_store: 'configuration',
+    unknown_device_key: 'unknown_device_key',
+    state_unavailable: 'state_unavailable',
+    key_mismatch: 'key_binding',
+    replayed_assertion: 'counter',
+    expired_epoch: 'expired_epoch',
+    quota_exceeded: 'quota',
+  };
+  if (Object.hasOwn(reasons, result?.reason)) return reasons[result.reason];
+  const detail = typeof result?.detail === 'string' ? result.detail : '';
+  if (detail === 'authData: aaguid mismatch') return 'environment';
+  if (detail === 'authData: rpIdHash != SHA256(appID)' || detail === 'assertion: rpIdHash != SHA256(appID)') return 'app_identity';
+  if (detail === 'authData: first attestation signCount must be 0' || detail === 'assertion: signCount not strictly increasing') return 'counter';
+  if (detail === 'assertion: bad signature') return 'assertion_signature';
+  if (detail.startsWith('chain:')) return 'certificate_chain';
+  if (detail.startsWith('nonce:')) return 'nonce_binding';
+  if (detail.startsWith('keyId:')) return 'key_binding';
+  if (['cbor:', 'der:', 'cose:', 'authData:', 'attestation:', 'assertion:'].some(prefix => detail.startsWith(prefix))) return 'proof_format';
+  return 'verification';
+}
+
 export {
   validateAppAttest,
+  attestationFailureCategory,
   APP_ATTEST_READY,
   // Exported for tests / operators wiring real implementations in.
   appId,
