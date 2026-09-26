@@ -7,6 +7,12 @@ Notable changes to Columbia. Published releases and their exact tags are listed 
 ### Observability
 
 - Commons keeps redirect responses as fixed `502` errors and never follows their `Location` URL. Bounded logs now include the upstream HTTP status and, for redirects, only a fixed target class (`same_origin`, `other_origin_https`, `unsafe_scheme`, `missing`, or `invalid`). Failed background refreshes are reported separately without a client HTTP status. No target URL, host, query, credential, or upstream body is logged or returned to clients. Socket-free regression tests cover fetch, HTTP response, and background refresh paths.
+- Issuer proof failures now include allowlisted failure categories and proof mode, distinguishing missing registrations, environment/app identity mismatches, and cryptographic failures without logging device IDs or proof material. Public rejection responses remain unchanged.
+
+### Operations
+
+- Production issuers can require durable state with `REQUIRE_DURABLE_STATE=1`; missing storage configuration then fails startup instead of silently losing registrations after restart. Development and tests retain explicit memory support.
+- Document dedicated issuer storage, stable-secret preservation, atomic configuration rollout, and physical assertion checks across restart. Upgrading the image alone does not migrate process-local registrations or enable relay enforcement.
 
 ## v1.7.0 - 2026-09-20
 

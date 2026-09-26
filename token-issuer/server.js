@@ -180,6 +180,9 @@ const keysForEpoch = epoch => epochKeyProvider.keysForEpoch(epoch);
 // salt mismatch against persisted configuration fails closed instead of resetting
 // every device's identity and quota. Issuer credentials never belong to the relay.
 const STATE_CONNECTION = process.env.ISSUER_STATE_CONNECTION_STRING || '';
+const REQUIRE_DURABLE_STATE = process.env.REQUIRE_DURABLE_STATE || '0';
+if (!['0', '1'].includes(REQUIRE_DURABLE_STATE)) throw new Error('issuer_durable_state_policy_invalid');
+if (REQUIRE_DURABLE_STATE === '1' && !STATE_CONNECTION) throw new Error('issuer_durable_state_required');
 const STATE_TABLE = process.env.ISSUER_STATE_TABLE || 'columbiaissuerstate';
 const STATE_SALT = STATE_CONNECTION ? Buffer.from(process.env.ISSUER_STATE_SALT || '', 'base64') : crypto.randomBytes(32);
 const ISSUER_STATE = createIssuerState({
