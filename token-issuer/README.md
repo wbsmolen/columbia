@@ -1,5 +1,12 @@
 # token-issuer
 
+Rejected proofs log only allowlisted `proofMode` and `attestFailure` categories
+alongside the existing status and reason. These distinguish certificate, nonce,
+key, app identity, environment, signature, counter, and registration failures.
+Raw verifier details, identifiers, and proof bytes are never logged; public
+rejection responses remain unchanged. These diagnostics do not enable relay
+token enforcement or relax any App Attest check.
+
 The token issuer gates relay access to genuine, attested clients, supports rate
 limiting, and preserves unlinkability between a user and the content they fetch.
 
@@ -143,6 +150,7 @@ below before running multiple replicas.
 | `ISSUER_STATE_CONNECTION_STRING` | unset | Azure Table credential owned by the issuer operator; configured means shared durable state, unset means single-process memory only |
 | `ISSUER_STATE_TABLE` | `columbiaissuerstate` | Dedicated issuer state table; never the relay redemption or analytics event table |
 | `ISSUER_STATE_SALT` | required with Azure | Stable secret, base64 at least 32 bytes; persisted salt fingerprint rejects accidental salt changes instead of silently resetting identities |
+| `REQUIRE_DURABLE_STATE` | `0` | Set `1` for a production issuer that must retain registrations. Missing Azure state configuration then stops startup instead of silently using memory. Only `0` and `1` are accepted |
 | `EPOCH_SECONDS` | `604800` | epoch length in seconds (default one week) |
 | `ISSUANCE_QUOTA_PER_EPOCH` | `256` | max tokens a single device may obtain per epoch. `0` disables the quota |
 | `MAX_TOKENS_PER_REQUEST` | `64` | max blinded messages per `/issue` call |
@@ -217,7 +225,11 @@ The security of the whole pattern rests on these pieces.
     extract the device public key for storage.
   - *Assertion* (per issuance): verify the ECDSA-P256-SHA256 signature over
     `SHA256(authData || clientDataHash)` with the stored device key, re-check
-    `rpIdHash`, and enforce a strictly increasing sign counter.
+    `rpIdHash`, and enforce a strictly increasing sign counter. Assertions use the
+    common authenticator prefix even when physical devices retain the AT flag
+    without credential data. The signature still covers all raw authenticator
+    bytes, including any extension suffix; only attestations parse and validate
+    a newly attested credential key.
 
   It still **fails closed**: with `APPLE_APP_ATTEST_ROOT_CA_PEM_B64`,
   `APPLE_TEAM_ID`, or `APPLE_BUNDLE_ID` unset, the validator rejects every request,
@@ -257,6 +269,39 @@ manifest, prove real-device attestation/assertion/registration-loss recovery, an
 stage compatibility for older clients. Keep the deployed `CLIENT_AUTH_MODE=off`
 until those gates are complete. No local test or synthetic Azure fixture establishes
 physical Apple App Attest compatibility.
+
+### Durable issuer rollout and recovery
+
+A successful enrollment is useful only while its registration remains available.
+Production issuers should use a dedicated storage account/table and
+`REQUIRE_DURABLE_STATE=1`, even while relay token enforcement is disabled. Memory
+state is retained for local tests and explicitly temporary development instances.
+It loses registrations, counters and quota history whenever the process restarts;
+subsequent assertions return `unknown_device_key`.
+
+Provision storage with HTTPS required, TLS 1.2 or later, and no public blob access.
+Keep the connection string and a newly generated base64 secret of at least 32
+random bytes in the issuer's secret store. Apply `ISSUER_STATE_CONNECTION_STRING`,
+`ISSUER_STATE_SALT`, `ISSUER_STATE_TABLE` and `REQUIRE_DURABLE_STATE=1` together in
+one deployment revision. Never give those credentials to the relay, and never use
+an analytics or redemption table. The adapter creates its table and salt-fingerprint
+config row on first use; unavailable storage returns a typed 503, not memory fallback.
+
+Qualify a physical enrollment and subsequent assertion, restart the issuer, then
+verify another assertion succeeds with the existing key and retained quota. A
+health probe alone does not access storage or establish this persistence check.
+Existing memory registrations have no supported export path; a migration from
+memory may require the client's bounded registration-loss recovery. Do not reset
+phone keys merely because a generic attestation 401 occurred: use the allowlisted
+failure category to distinguish registration loss from other verification failures.
+
+Preserve the table and stable salt across image updates, scale changes and rollbacks.
+A changed salt deliberately fails closed. Roll back the image while preserving
+durable environment settings; reverting an entire earlier memory-only revision
+would reintroduce registration loss. Back up both storage and its secret configuration
+under the operator's access policy. The reference Azure workflow updates only the
+image and preserves existing environment settings; it does not provision state for
+a new Container App, so configure and verify state before its first production use.
 
 **Remaining architecture work:**
 

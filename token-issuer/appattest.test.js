@@ -47,7 +47,32 @@ process.env.APPLE_APP_ATTEST_AAGUID = 'appattest';
 
 // Now import the validator (it reads the env above at load).
 const appattest = await import('./appattest.js');
-const { validateAppAttest, APP_ATTEST_READY } = appattest;
+const { validateAppAttest, attestationFailureCategory, APP_ATTEST_READY } = appattest;
+
+test('failure diagnostics distinguish actionable causes without returning arbitrary error text', () => {
+  const cases = [
+    [{ reason: 'unknown_device_key' }, 'unknown_device_key'],
+    [{ reason: 'app_attest_not_configured' }, 'configuration'],
+    [{ reason: 'state_unavailable' }, 'state_unavailable'],
+    [{ reason: 'replayed_assertion' }, 'counter'],
+    [{ reason: 'key_mismatch' }, 'key_binding'],
+    [{ reason: 'expired_epoch' }, 'expired_epoch'],
+    [{ reason: 'quota_exceeded' }, 'quota'],
+    [{ detail: 'authData: aaguid mismatch' }, 'environment'],
+    [{ detail: 'authData: rpIdHash != SHA256(appID)' }, 'app_identity'],
+    [{ detail: 'assertion: rpIdHash != SHA256(appID)' }, 'app_identity'],
+    [{ detail: 'assertion: signCount not strictly increasing' }, 'counter'],
+    [{ detail: 'assertion: bad signature' }, 'assertion_signature'],
+    [{ detail: 'chain: cert 0 signature invalid' }, 'certificate_chain'],
+    [{ detail: 'nonce: mismatch' }, 'nonce_binding'],
+    [{ detail: 'keyId: presented keyId != SHA256(pubkey)' }, 'key_binding'],
+    [{ detail: 'cbor: truncated' }, 'proof_format'],
+    [{ reason: 'private-test-marker', detail: 'private-test-marker' }, 'verification'],
+    [{ reason: '__proto__' }, 'verification'],
+    [null, 'verification'],
+  ];
+  for (const [result, expected] of cases) assert.equal(attestationFailureCategory(result), expected);
+});
 
 // A tiny in-memory attested-key store, as server.js would provide.
 function makeStore() {
@@ -115,6 +140,52 @@ test('(a3) two assertions with strictly increasing counters both pass', async ()
   assert.strictEqual(r2.ok, true);
   assert.strictEqual(r2.signCount, 4);
   assert.strictEqual(store.getAttestedKey(base.keyIdB64).signCount, 3);
+});
+
+test('physical assertion AT flags do not require an attestation credential suffix', async () => {
+  const reg = await validateAppAttest({ keyId: base.keyIdB64,
+    attestation: base.attestationB64, clientDataHash: base.clientDataHashB64 });
+  const store = makeStore();
+  store.register(base.keyIdB64, reg.publicKeyPem, 0);
+  for (const flags of [0x00, 0x40]) {
+    const proof = makeAssertion({ appId: APP_ID, credPrivateKey: base.credKey.privateKey,
+      signCount: 1, challenge: crypto.randomBytes(32), flags });
+    assert.equal(proof.authData.length, 37);
+    const result = await validateAppAttest({ keyId: base.keyIdB64,
+      assertion: proof.assertionB64, clientDataHash: proof.clientDataHashB64, store });
+    assert.equal(result.ok, true, result.detail);
+    // Attestations still require the complete credential data for an AT flag.
+    if (flags === 0x40) assert.throws(() => appattest.parseAuthenticatorData(proof.authData), /attestedCredentialData truncated/);
+  }
+});
+
+test('assertion extension suffix remains signed and wrong app identity still fails', async () => {
+  const reg = await validateAppAttest({ keyId: base.keyIdB64,
+    attestation: base.attestationB64, clientDataHash: base.clientDataHashB64 });
+  const store = makeStore();
+  store.register(base.keyIdB64, reg.publicKeyPem, 0);
+  const suffix = cborMap([[cborText('apple_bundle_version_01'), cborText('1.0')]]);
+  const options = { appId: APP_ID, credPrivateKey: base.credKey.privateKey,
+    signCount: 1, challenge: crypto.randomBytes(32), flags: 0xc0, authDataSuffix: suffix };
+  const proof = makeAssertion(options);
+  const verify = assertion => validateAppAttest({ keyId: base.keyIdB64,
+    assertion, clientDataHash: proof.clientDataHashB64, store });
+  assert.equal((await verify(proof.assertionB64)).ok, true);
+  const decoded = appattest.cborDecodeFirst(Buffer.from(proof.assertionB64, 'base64')).value;
+  const tampered = Buffer.from(proof.authData);
+  tampered[tampered.length - 1] ^= 1;
+  const bad = cborMap([[cborText('signature'), cborBytes(decoded.get('signature'))],
+    [cborText('authenticatorData'), cborBytes(tampered)]]);
+  assert.match((await verify(bad.toString('base64'))).detail, /bad signature/);
+  const wrongApp = makeAssertion({ ...options, appId: 'ABCDE12345.com.example.wrong' });
+  assert.match((await verify(wrongApp.assertionB64)).detail, /rpIdHash/);
+  // Even a correctly signed malformed short prefix fails closed.
+  const short = proof.authData.subarray(0, 36);
+  const nonce = crypto.createHash('sha256').update(short)
+    .update(Buffer.from(proof.clientDataHashB64, 'base64')).digest();
+  const shortProof = cborMap([[cborText('signature'), cborBytes(crypto.sign('sha256', nonce, base.credKey.privateKey))],
+    [cborText('authenticatorData'), cborBytes(short)]]);
+  assert.match((await verify(shortProof.toString('base64'))).detail, /authData: too short/);
 });
 
 // ===========================================================================

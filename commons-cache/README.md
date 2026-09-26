@@ -47,7 +47,7 @@ A second worked example of the same operator-blind cache pattern, aimed at a con
 
 `GET /v1/imgur?image=<image-id>` is the single-image form for an extensionless `imgur.com/<id>` page, whose media type a client cannot know without guessing (`.jpg`? `.gif`? `.mp4`?). It fetches `GET {IMGUR_BASE}/3/image/{id}` with the same Client-ID and normalizes to `{ image: { url, type, w, h, animated } }`; an animated upload (GIF/GIFV) resolves to imgur's `mp4` when one is offered, with `type: video/mp4`, so the client plays the small video instead of a large GIF. Cached under `imgur-image/<id>` with the same TTL / stale-while-revalidate / single-flight semantics, the same `[A-Za-z0-9]{1,15}` id validation, no redirects, and the same fixed `502` on any upstream failure. A request must carry exactly one of `?id=` or `?image=`; both or neither is a `400`.
 
-Imgur `502`s log a fixed `reason` category (`upstream_429` for rate limiting, `not_found` for a deleted or unknown id, `upstream_5xx` / `network` / `timeout` for the rest) and never the upstream body or the id.
+Imgur `502`s log a fixed `reason` category (`upstream_429` for rate limiting, `not_found` for a deleted or unknown id, `upstream_5xx` / `network` / `timeout` for the rest) and never the upstream body or the id. Both Commons routes also log a bounded `upstreamStatus` on an upstream HTTP failure. Redirect failures additionally log only a fixed `redirectTarget` class (`same_origin`, `other_origin_https`, `unsafe_scheme`, `missing`, `invalid`). Failed background refreshes log `phase: "revalidate"` without a client HTTP status, so they do not count as client-facing `502`s. They never follow a redirect, including a same-origin first hop that could lead to an internal host on a later hop. No Location, URL, host, query, credential, or upstream body is logged or returned to clients.
 
 Point `IMGUR_CLIENT_ID` at your own registered Client-ID to use one instead of the public embed default.
 
@@ -74,7 +74,7 @@ Point `IMGUR_CLIENT_ID` at your own registered Client-ID to use one instead of t
 The cache runs on internal ingress by default, so it needs no origin lock. If you instead expose it publicly behind a CDN or WAF, set `REQUIRE_FDID` to the front door's identifier and configure the front door to inject an `X-Azure-FDID` header carrying that value (and to strip any client-supplied copy). The cache then serves only requests that arrive through the front door and 403s anything hitting the origin host directly. That matters here because a direct caller could otherwise drive `/v1/commons` and burn the shared upstream credential budget. `GET /health` stays open so the platform health probe still passes. A repeated header carrying several comma-joined values passes if any one matches, and the value is never logged. See the top-level [`../SELFHOSTING.md`](../SELFHOSTING.md#edge-front-door-cdn--waf) for the front-door setup.
 
 ## Observability
-Structured JSON logs to stdout carry RED metrics only: route templates, method, status, cache state, duration. No IPs, no user data, no bodies.
+Structured JSON logs to stdout carry RED metrics only: route templates, method, status, cache state, duration, and fixed/bounded upstream failure categories. No IPs, no user data, no URLs, no bodies.
 
 ```json
 {"ts":"…","route":"/v1/commons","method":"GET","status":200,"cache":"HIT","durationMs":4}
@@ -90,6 +90,11 @@ curl 'localhost:8099/v1/commons?id=example&sort=latest'
 Run the self-test (Node built-ins only, no framework; spins the server against a local mock upstream):
 ```sh
 node test.mjs
+```
+
+The redirect-classification unit test does not open a listening socket:
+```sh
+node --test redirect-classification.test.mjs
 ```
 
 Or with Docker:

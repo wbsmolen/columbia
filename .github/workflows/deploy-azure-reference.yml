@@ -3,7 +3,7 @@
 # this workflow is one example of automating that on one platform, not a requirement.
 #
 # Manual trigger only (workflow_dispatch); there is no auto-deploy on push.
-# Images are built in ACR and tagged with the immutable commit SHA, then the
+# Images are built with BuildKit, pushed to ACR with the immutable commit SHA, then the
 # matching Container App is updated to that image.
 #
 # Required repository secrets (Settings -> Secrets and variables -> Actions).
@@ -61,12 +61,22 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Build image in ACR (tagged with commit SHA)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # The classic ACR quick-build builder rejects COPY --chmod in the hardened
+      # Dockerfiles. Use the same BuildKit path as the qualified local rollout.
+      - name: Build and push image (tagged with commit SHA)
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+          IMAGE_NAME: ${{ matrix.name }}
+          IMAGE_REVISION: ${{ github.sha }}
+          BUILD_CONTEXT: ./${{ matrix.dir }}
         run: |
-          az acr build \
-            -r "${{ secrets.ACR_NAME }}" \
-            -t "${{ matrix.name }}:${{ github.sha }}" \
-            "./${{ matrix.dir }}"
+          az acr login --name "$ACR_NAME"
+          docker buildx build --platform linux/amd64 --pull \
+            --tag "$ACR_NAME.azurecr.io/$IMAGE_NAME:$IMAGE_REVISION" \
+            --push "$BUILD_CONTEXT"
 
       - name: Update Container App to the new image
         env:

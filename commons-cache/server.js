@@ -112,6 +112,8 @@ function safeLogFields(fields) {
   if (['HIT', 'STALE', 'MISS', 'COALESCED', '-'].includes(fields.cache)) safe.cache = fields.cache;
   if (fields.phase === 'revalidate') safe.phase = fields.phase;
   if (['timeout', 'network', 'too_large', 'invalid_body', 'upstream_403', 'upstream_429', 'not_found', 'upstream_4xx', 'upstream_5xx', 'redirect', 'other'].includes(fields.reason)) safe.reason = fields.reason;
+  if (Number.isInteger(fields.upstreamStatus) && fields.upstreamStatus >= 100 && fields.upstreamStatus <= 599) safe.upstreamStatus = fields.upstreamStatus;
+  if (['same_origin', 'other_origin_https', 'unsafe_scheme', 'missing', 'invalid'].includes(fields.redirectTarget)) safe.redirectTarget = fields.redirectTarget;
   if (['fatal', 'listen'].includes(fields.event)) safe.event = fields.event;
   if (fields.reason === 'upstream_base_invalid') safe.reason = fields.reason;
   return safe;
@@ -131,6 +133,22 @@ function upstreamFailure(status, error) {
   if (status >= 400) return 'upstream_4xx';
   if (status >= 300) return 'redirect';
   return error ? 'network' : 'other';
+}
+
+// A redirect remains an upstream failure: never follow Location, including a
+// same-origin first hop that could redirect again to a private address. Retain
+// only this fixed category for operations; never log the target URL or host.
+function redirectTargetClass(requestedUrl, response) {
+  if (response.status < 300 || response.status >= 400) return undefined;
+  const location = response.headers.get('location')?.trim();
+  if (!location) return 'missing';
+  try {
+    const target = new URL(location, requestedUrl);
+    if (target.origin === new URL(requestedUrl).origin) return 'same_origin';
+    return target.protocol === 'https:' ? 'other_origin_https' : 'unsafe_scheme';
+  } catch {
+    return 'invalid';
+  }
 }
 
 // Enforce the memory limit while streaming, including decoded/compressed bodies.
@@ -220,7 +238,7 @@ async function fetchUpstream(url, authHeader) {
     });
     if (res.status !== 200) {
       await res.body?.cancel().catch(() => {});
-      return { status: res.status, body: Buffer.alloc(0), contentType: 'application/octet-stream', ms: Date.now() - started, error: true, reason: upstreamFailure(res.status) };
+      return { status: res.status, body: Buffer.alloc(0), contentType: 'application/octet-stream', ms: Date.now() - started, error: true, reason: upstreamFailure(res.status), redirectTarget: redirectTargetClass(url, res) };
     }
     const body = await readBoundedBody(res);
     return { status: res.status, body, contentType: res.headers.get('content-type') || 'application/json', ms: Date.now() - started };
@@ -267,9 +285,11 @@ async function getCachedFeed(id, sort, authHeader) {
           .then((up) => {
             if (up.status === 200 && !up.error) {
               cacheSet(key, { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), upstreamStatus: up.status, revalidating: false });
+            } else {
+              log({ route: '/v1/commons', phase: 'revalidate', reason: up.reason, upstreamStatus: up.status, redirectTarget: up.redirectTarget, durationMs: up.ms });
             }
           })
-          .catch(() => {})
+          .catch(() => { log({ route: '/v1/commons', phase: 'revalidate', reason: 'network' }); })
           .finally(() => { entry.revalidating = false; }); // always reset - never get stuck revalidating
       }
       return { ...entry, cacheState: 'STALE' };
@@ -295,7 +315,7 @@ async function getCachedFeed(id, sort, authHeader) {
     return { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), upstreamStatus: up.status, cacheState: isLeader ? 'MISS' : 'COALESCED', upstreamMs: up.ms };
   }
   // Upstream failed - fixed error result, no upstream body/status leaked downstream.
-  return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true, reason: up.reason };
+  return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true, reason: up.reason, redirectTarget: up.redirectTarget };
 }
 
 // Imgur: fetch one API path with the server-side public Client-ID and normalize
@@ -303,8 +323,9 @@ async function getCachedFeed(id, sort, authHeader) {
 // returns null (unusable body) is an upstream failure too.
 async function fetchImgurJson(path, shape) {
   const started = Date.now();
+  const url = `${IMGUR_BASE}${path}`;
   try {
-    const res = await fetch(`${IMGUR_BASE}${path}`, {
+    const res = await fetch(url, {
       headers: {
         'User-Agent': UPSTREAM_UA,
         'Accept': 'application/json',
@@ -315,7 +336,7 @@ async function fetchImgurJson(path, shape) {
     });
     if (res.status !== 200) {
       await res.body?.cancel().catch(() => {});
-      return { status: res.status, error: true, ms: Date.now() - started, reason: upstreamFailure(res.status) };
+      return { status: res.status, error: true, ms: Date.now() - started, reason: upstreamFailure(res.status), redirectTarget: redirectTargetClass(url, res) };
     }
     const out = shape(JSON.parse((await readBoundedBody(res)).toString('utf8')));
     if (!out) return { status: 200, error: true, ms: Date.now() - started, reason: 'invalid_body' };
@@ -362,8 +383,11 @@ async function getCachedImgur(key, fetcher) {
       if (!entry.revalidating) {
         entry.revalidating = true;
         fetcher()
-          .then((up) => { if (up.status === 200 && !up.error) cacheSet(key, { body: up.body, contentType: 'application/json', fetchedAt: Date.now(), upstreamStatus: 200, revalidating: false }); })
-          .catch(() => {})
+          .then((up) => {
+            if (up.status === 200 && !up.error) cacheSet(key, { body: up.body, contentType: 'application/json', fetchedAt: Date.now(), upstreamStatus: 200, revalidating: false });
+            else log({ route: '/v1/imgur', phase: 'revalidate', reason: up.reason, upstreamStatus: up.status, redirectTarget: up.redirectTarget, durationMs: up.ms });
+          })
+          .catch(() => { log({ route: '/v1/imgur', phase: 'revalidate', reason: 'network' }); })
           .finally(() => { entry.revalidating = false; });
       }
       return { ...entry, cacheState: 'STALE' };
@@ -377,7 +401,7 @@ async function getCachedImgur(key, fetcher) {
     if (isLeader) cacheSet(key, { body: up.body, contentType: 'application/json', fetchedAt: Date.now(), upstreamStatus: 200, revalidating: false });
     return { body: up.body, contentType: 'application/json', fetchedAt: Date.now(), upstreamStatus: 200, cacheState: isLeader ? 'MISS' : 'COALESCED', upstreamMs: up.ms };
   }
-  return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true, reason: up.reason };
+  return { cacheState: 'MISS', upstreamStatus: up.status, upstreamMs: up.ms, upstreamError: true, reason: up.reason, redirectTarget: up.redirectTarget };
 }
 
 async function handleProbe() {
@@ -426,6 +450,7 @@ const server = http.createServer(async (req, res) => {
   try { u = new URL(req.url, 'http://localhost'); } catch { res.writeHead(400); res.end(); return; }
   const route = u.pathname;
   let status = 404, cacheState = '-', failureReason;
+  let failureUpstreamStatus, failureRedirectTarget;
 
   // Front door origin lock: when REQUIRE_FDID is set, every non-exempt request
   // must arrive through the front door (which injects X-Azure-FDID), else 403.
@@ -460,6 +485,8 @@ const server = http.createServer(async (req, res) => {
         cacheState = out.cacheState;
         if (out.upstreamError) {
           failureReason = out.reason;
+          failureUpstreamStatus = out.upstreamStatus;
+          failureRedirectTarget = out.redirectTarget;
           // Fixed 502 - never leak upstream status, body, or error text.
           status = 502;
           res.writeHead(status, {
@@ -503,6 +530,8 @@ const server = http.createServer(async (req, res) => {
         cacheState = out.cacheState;
         if (out.upstreamError) {
           failureReason = out.reason;
+          failureUpstreamStatus = out.upstreamStatus;
+          failureRedirectTarget = out.redirectTarget;
           status = 502; // fixed - never leak imgur status/body/error text
           res.writeHead(status, { 'Content-Type': 'application/json', 'X-Cache': cacheState, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' });
           res.end(JSON.stringify({ error: 'upstream unavailable' }));
@@ -536,7 +565,7 @@ const server = http.createServer(async (req, res) => {
   // Log Analytics ingestion drowning the real signal); LOG_HEALTH=1
   // re-enables for a debugging session. Non-200 health responses still log.
   if (route !== '/health' || status !== 200 || process.env.LOG_HEALTH === '1') {
-    log({ route, method: req.method, status, cache: cacheState, reason: failureReason, durationMs: Date.now() - started });
+    log({ route, method: req.method, status, cache: cacheState, reason: failureReason, upstreamStatus: failureUpstreamStatus, redirectTarget: failureRedirectTarget, durationMs: Date.now() - started });
   }
 });
 
@@ -549,4 +578,4 @@ if (require.main === module) {
   server.listen(PORT, () => log({ event: 'listen', port: PORT, ttlMs: TTL_MS, swrMs: SWR_MS }));
 }
 
-module.exports = { safeLogFields, upstreamFailure, readBoundedBody, server, getCachedFeed, fetchUpstream, upstreamUrl, cache, validateUpstreamBase };
+module.exports = { safeLogFields, upstreamFailure, redirectTargetClass, readBoundedBody, server, getCachedFeed, fetchUpstream, upstreamUrl, cache, validateUpstreamBase };
