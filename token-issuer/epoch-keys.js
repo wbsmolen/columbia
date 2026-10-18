@@ -40,8 +40,21 @@ async function importKey(material) {
     const spki = Buffer.from(await webcrypto.subtle.exportKey('spki', pub));
     // Compare actual RSA material, not PEM/DER spelling or a truncated wire ID.
     const fingerprint = crypto.createHash('sha256').update(jwk.n).update('\0').update(jwk.e).digest('hex');
-    return { fingerprint, entry: Object.freeze({ priv, pub, spkiB64: spki.toString('base64'), keyId: keyIdFromSpki(spki) }) };
+    const signer = crypto.createPrivateKey({ key: jwk, format: 'jwk' });
+    return { fingerprint, entry: Object.freeze({ signer, verifier: crypto.createPublicKey(signer), pub,
+      spkiB64: spki.toString('base64'), keyId: keyIdFromSpki(spki) }) };
   } catch { throw new EpochKeyUnavailable(); }
+}
+
+// RFC 9474 BlindSign: s = RSASP1(sk, m), refuse unless RSAVP1(pk, s) == m, then
+// I2OSP(s, kLen). OpenSSL's raw private operation (CRT, blinded, constant time)
+// replaces the pure-JS big-integer path, which took ~0.5 CPU-s per signature.
+// Out-of-range input (m >= n) or a wrong length throws, like the library did.
+export function blindSign(entry, blindedMsg) {
+  const s = crypto.privateDecrypt({ key: entry.signer, padding: crypto.constants.RSA_NO_PADDING }, blindedMsg);
+  const check = crypto.publicEncrypt({ key: entry.verifier, padding: crypto.constants.RSA_NO_PADDING }, s);
+  if (s.length !== blindedMsg.length || !crypto.timingSafeEqual(check, blindedMsg)) throw new Error('signing failure');
+  return s;
 }
 
 /**

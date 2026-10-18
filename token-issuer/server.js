@@ -28,20 +28,14 @@
 // a device to its tokens. The device id is used transiently for the per-epoch
 // quota check and then dropped. Counters in logs are aggregate only.
 
-// Native ES module. @cloudflare/blindrsa-ts is ESM-only, so this whole package is
-// ESM ("type": "module" in package.json). require() of an ESM dep throws
-// ERR_REQUIRE_ESM on node 20 (the deploy runtime), so a CommonJS require() here
-// would crash-loop the container even though it happens to work on newer node.
-
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { RSABSSA } from '@cloudflare/blindrsa-ts';
 import { TableClient } from '@azure/data-tables';
 import { createIssuerState, memoryDeviceBackend, azureDeviceBackend, ISSUER_STATE_CLIENT_OPTIONS } from './state-store.js';
 
 import { validateAppAttest, attestationFailureCategory, APP_ATTEST_READY } from './appattest.js';
-import { createEpochKeyProvider, derivePublicKey, keyIdFromSpki } from './epoch-keys.js';
+import { createEpochKeyProvider, blindSign } from './epoch-keys.js';
 
 // --- Config -----------------------------------------------------------------
 
@@ -93,12 +87,8 @@ const REQUIRE_FDID = process.env.REQUIRE_FDID || '';
 // Node lowercases all incoming header names, so match on the lowercase form.
 const FDID_HEADER = (process.env.FDID_HEADER || 'x-azure-fdid').toLowerCase();
 
-// RSA-PSS / blind-RSA parameters. SHA-384, 2048-bit modulus, deterministic PSS -
-// the Apple PAT / RFC 9578 Token Type 2 suite.
+// Blind-RSA modulus: 2048-bit, the Apple PAT / RFC 9578 Token Type 2 suite.
 const RSA_MODULUS_BITS = 2048;
-const PSS_HASH = 'SHA-384';
-
-const suite = RSABSSA.SHA384.PSS.Deterministic();
 
 // --- Logging (RED-only) -----------------------------------------------------
 
@@ -342,8 +332,7 @@ async function handleIssue(req, res, start, body) {
   const blindSigs = [];
   try {
     for (const bm of blindedBufs) {
-      const sig = await suite.blindSign(keys.priv, bm);
-      blindSigs.push(Buffer.from(sig).toString('base64'));
+      blindSigs.push(blindSign(keys, bm).toString('base64'));
     }
   } catch {
     res.writeHead(500); res.end();
@@ -556,11 +545,8 @@ if (isEntrypoint) {
 // Export internals for the test harness (no network needed to unit test).
 export {
   server,
-  suite,
   currentEpoch,
   keysForEpoch,
-  keyIdFromSpki,
-  derivePublicKey,
   expectedClientDataHash,
   boundEpoch,
   safeLogFields,
@@ -568,5 +554,4 @@ export {
   beginShutdown,
   EPOCH_SECONDS,
   RSA_MODULUS_BITS,
-  PSS_HASH,
 };

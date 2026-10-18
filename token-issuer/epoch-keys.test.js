@@ -3,7 +3,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto, { webcrypto } from 'node:crypto';
 import { RSABSSA } from '@cloudflare/blindrsa-ts';
-import { createEpochKeyProvider, keyIdFromSpki, parsePrivateKeyEnv } from './epoch-keys.js';
+import { readFileSync } from 'node:fs';
+import { blindSign, createEpochKeyProvider, keyIdFromSpki, parsePrivateKeyEnv } from './epoch-keys.js';
 
 const algorithm = { name: 'RSA-PSS', modulusLength: 2048,
   publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-384' };
@@ -46,11 +47,30 @@ test('explicit current/previous keys independently complete the actual blind-RSA
   for (const [key, other] of [[current, previous], [previous, current]]) {
     const prepared = suite.prepare(crypto.randomBytes(32));
     const { blindedMsg, inv } = await suite.blind(key.pub, prepared);
-    const blindSignature = await suite.blindSign(key.priv, blindedMsg);
+    const blindSignature = blindSign(key, blindedMsg);
     const signature = await suite.finalize(key.pub, prepared, blindSignature, inv);
     assert.equal(await suite.verify(key.pub, signature, prepared), true);
     assert.equal(await suite.verify(other.pub, signature, prepared), false);
   }
+});
+
+test('native blindSign reproduces the RFC 9474 vector and keeps full-length output', async () => {
+  const v = JSON.parse(readFileSync(new URL('./rfc9474-vector.json', import.meta.url)));
+  const big = h => BigInt('0x' + h), [p, q, d] = [big(v.p), big(v.q), big(v.d)];
+  const inv = (a, m) => { let [r0, r1, s0, s1] = [a, m, 1n, 0n];
+    while (r1) { const k = r0 / r1; [r0, r1, s0, s1] = [r1, r0 - k * r1, s1, s0 - k * s1]; } return (s0 % m + m) % m; };
+  const b64u = n => Buffer.from(n.toString(16).padStart(Math.ceil(n.toString(16).length / 2) * 2, '0'), 'hex').toString('base64url');
+  const signer = crypto.createPrivateKey({ format: 'jwk', key: { kty: 'RSA', n: b64u(big(v.n)), e: b64u(big(v.e)),
+    d: b64u(d), p: b64u(p), q: b64u(q), dp: b64u(d % (p - 1n)), dq: b64u(d % (q - 1n)), qi: b64u(inv(q, p)) } });
+  const key = { signer, verifier: crypto.createPublicKey(signer) };
+  assert.equal(blindSign(key, Buffer.from(v.blinded_msg, 'hex')).toString('hex'), v.blind_sig);
+
+  // About 1 in 256 signatures starts with a zero byte; I2OSP must keep it.
+  const s = Buffer.alloc(512); s[100] = 1; s[511] = 7;
+  const m = crypto.publicEncrypt({ key: key.verifier, padding: crypto.constants.RSA_NO_PADDING }, s);
+  assert.deepEqual(blindSign(key, m), s);
+  // m >= n is not a valid blinded message.
+  assert.throws(() => blindSign(key, Buffer.alloc(512, 0xff)));
 });
 
 test('duplicate actual RSA material is rejected even under different encodings and epoch labels', async () => {

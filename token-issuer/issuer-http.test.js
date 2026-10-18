@@ -6,6 +6,7 @@ import crypto, { webcrypto } from 'node:crypto';
 import { once } from 'node:events';
 import { RSABSSA } from '@cloudflare/blindrsa-ts';
 import { makeAttestationFixture, makeAssertion } from './appattest-fixtures.js';
+import { keyIdFromSpki } from './epoch-keys.js';
 
 const suite = RSABSSA.SHA384.PSS.Deterministic();
 const signingKey = await suite.generateKey({ modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]) });
@@ -50,7 +51,7 @@ test('HTTP keys contract and previous-epoch issuance agree with the client envel
     assert.notEqual(doc.keys[0].keyId, doc.keys[1].keyId, 'HTTP rollover uses distinct actual keys');
     for (const key of doc.keys) {
       assert.deepEqual(Object.keys(key).sort(), ['epoch', 'keyId', 'publicKeySpki']);
-      assert.equal(issuer.keyIdFromSpki(Buffer.from(key.publicKeySpki, 'base64')), key.keyId);
+      assert.equal(keyIdFromSpki(Buffer.from(key.publicKeySpki, 'base64')), key.keyId);
     }
 
     const request = {
