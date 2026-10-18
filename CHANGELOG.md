@@ -2,6 +2,25 @@
 
 Notable changes to Columbia. Published releases and their exact tags are listed on [GitHub Releases](https://github.com/wbsmolen/columbia/releases).
 
+## v1.7.2 - 2026-10-18
+
+### Performance
+
+- The issuer now blind-signs with Node's built-in OpenSSL raw RSA private operation (CRT, blinded, constant time) instead of the pure-JavaScript big-integer path. That path had no CRT and took about 0.5 CPU-seconds per signature, so a 16-token batch took around 10 seconds on half a vCPU. A batch now takes under 100 ms with the same output. Output is unchanged: RFC 9474 `BlindSign` semantics, the verification self-check before returning, full-length I2OSP output, and rejection of out-of-range input. Signing keys, key IDs, `/issuer-keys` and the wire protocol are unchanged, so tokens from either version interoperate.
+
+### Changed
+
+- `@cloudflare/blindrsa-ts` moved to a test-only dependency (the reference client). The runtime image no longer ships it or `sjcl`.
+- Removed unused issuer exports (`suite`, `PSS_HASH`, `derivePublicKey`, `keyIdFromSpki`); tests import key helpers from `epoch-keys.js`.
+
+### Tests
+
+- `epoch-keys.test.js` pins the RFC 9474 Appendix A `RSABSSA-SHA384-PSS-Deterministic` vector, leading-zero output and out-of-range rejection. `test.js` and `issuer-http.test.js` now exercise the production signer end to end.
+
+### Upgrade notes
+
+- Image-only rollout: no configuration, secret, key or storage change. Roll back by redeploying the v1.7.1 issuer image.
+
 ## v1.7.1 - 2026-09-26
 
 ### Fixed

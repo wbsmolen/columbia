@@ -11,20 +11,22 @@
 //   (e) unlinkability sanity: the issuer's view (blinded request + blind sig)
 //       cannot be matched to the finished token, and blinding is randomized.
 //
-// The tests use the issuer's OWN blind-RSA suite and the relay's OWN
-// verifyAccessToken, generating an ephemeral epoch keypair so no env-injected
+// The tests use the issuer's OWN blindSign (the production signer), the
+// reference RFC 9474 client library and the relay's OWN verifyAccessToken, generating an ephemeral epoch keypair so no env-injected
 // signing key is needed. The relay is required with a dummy (valid) GATEWAY_URL
 // and ISSUER_KEYS_URL unset, so requiring it starts no socket and makes no network
 // call; the epoch public key is injected directly via setIssuerKeysForTest.
 
-// Native ES module (the issuer package is ESM; see server.js).
+// Native ES module (the issuer package is ESM).
 
 import test from 'node:test';
 import assert from 'node:assert';
 import crypto, { webcrypto } from 'node:crypto';
 
+import { RSABSSA } from '@cloudflare/blindrsa-ts';
 import * as issuer from './server.js';
-const { suite, keyIdFromSpki, derivePublicKey } = issuer;
+import { blindSign, keyIdFromSpki } from './epoch-keys.js';
+const suite = RSABSSA.SHA384.PSS.Deterministic();
 
 // The relay validates GATEWAY_URL at load and exits if it is missing/not https, so
 // the dummy MUST be set before the relay module is evaluated. Static ESM imports
@@ -38,8 +40,8 @@ const relay = (await import('../ohttp-relay/server.js')).default;
 
 // --- Shared helpers ---------------------------------------------------------
 
-// Generate an ephemeral epoch keypair using the issuer's blind-RSA suite, plus its
-// SPKI bytes, derived RSA-PSS public KeyObject for the relay, and the key id.
+// Generate an ephemeral epoch keypair, plus its SPKI bytes, derived RSA-PSS public
+// KeyObject for the relay, the key id, and the issuer's native signer keys.
 async function makeEpochKey() {
   const { publicKey, privateKey } = await suite.generateKey({
     modulusLength: 2048,
@@ -48,7 +50,8 @@ async function makeEpochKey() {
   const spki = new Uint8Array(await webcrypto.subtle.exportKey('spki', publicKey));
   const keyId = keyIdFromSpki(spki);
   const relayPub = crypto.createPublicKey({ key: Buffer.from(spki), format: 'der', type: 'spki' });
-  return { publicKey, privateKey, spki, keyId, relayPub };
+  return { publicKey, privateKey, spki, keyId, relayPub,
+    signer: crypto.KeyObject.from(privateKey), verifier: crypto.KeyObject.from(publicKey) };
 }
 
 // One full client+issuer exchange for a fresh token. Returns every intermediate so
@@ -60,7 +63,7 @@ async function mintToken(epoch, tokenInputBytes) {
 
   // Issuer side: blind-sign the blinded message ONLY. The issuer never sees
   // `prepared` (the token input) or the finished signature.
-  const blindSig = await suite.blindSign(epoch.privateKey, blindedMsg);
+  const blindSig = blindSign(epoch, blindedMsg);
 
   // Client side: finalize (unblind) into the real, publicly-verifiable signature.
   const signature = await suite.finalize(epoch.publicKey, prepared, blindSig, inv);

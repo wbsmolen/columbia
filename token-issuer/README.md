@@ -68,9 +68,12 @@ publicly-verifiable Privacy Pass token (Token Type 2,
 Tokens use. "Publicly verifiable" is the property that lets the relay verify a
 spent token offline with only the public key.
 
-The blind RSA math comes from `@cloudflare/blindrsa-ts`, Cloudflare's
-implementation of RFC 9474. It is the exact construction Apple uses, which is the
-reason to use it rather than a hand-rolled implementation.
+Blind signing is RFC 9474 `BlindSign`: Node's built-in OpenSSL raw RSA private
+operation (CRT, blinded, constant time), followed by the RFC's verification
+self-check before any signature is returned. The RFC 9474 Appendix A test vector
+is pinned in `epoch-keys.test.js`. Cloudflare's `@cloudflare/blindrsa-ts` is the
+test-time reference client that blinds, finalizes and verifies against it. No RSA
+arithmetic is hand-rolled.
 
 ## Endpoints
 
@@ -197,10 +200,11 @@ The security of the whole pattern rests on these pieces.
 
 **Production ready:**
 
-- The blind RSA issuance and verification. Blind, blind-sign, finalize, and
-  verify all round-trip correctly under the epoch public key, using the vetted
-  `@cloudflare/blindrsa-ts` (RFC 9474) library and the Apple PAT suite. Proven by
-  `test.js`.
+- The blind RSA issuance and verification. The issuer's native signer reproduces
+  the RFC 9474 test vector, and blind, blind-sign, finalize, and verify round-trip
+  under the epoch public key through the `@cloudflare/blindrsa-ts` reference
+  client and the Apple PAT suite. Proven by `epoch-keys.test.js`, `test.js` and
+  `issuer-http.test.js`.
 - The relay's token verification path. It verifies the RSA-PSS signature offline
   against the cached epoch public key and enforces spend-once. Valid tokens pass,
   double-spends are rejected, tampered and forged tokens are rejected. Proven by
@@ -403,13 +407,14 @@ a synthetic chain, pending one real-device confirmation."
 
 ## Dependencies
 
-This service and the optional relay state adapter use locked npm packages,
-because hand-rolling blind RSA is exactly the kind of custom cryptography to avoid:
+The lockfile is committed so the image build is reproducible.
 
-- `@cloudflare/blindrsa-ts` (RFC 9474 blind RSA, the Apple PAT construction). Its
-  only transitive dependency is `sjcl` (the Stanford JS Crypto Library) for the
-  big-integer math. Two packages total, no known vulnerabilities at the pinned
-  version. The lockfile is committed so the image build is reproducible.
+- Runtime: `@azure/data-tables`, only for the optional durable state adapter.
+  Signing uses Node's built-in `crypto` (OpenSSL), so the image ships no
+  big-integer or RSA library.
+- Tests only: `@cloudflare/blindrsa-ts` (RFC 9474 blind RSA, the Apple PAT
+  construction) as the reference client, and `@azure/core-rest-pipeline` for
+  the storage adapter tests.
 
 ### Client contract and diagnostics
 
