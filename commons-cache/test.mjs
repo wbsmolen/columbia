@@ -25,11 +25,13 @@ const RSS_PAYLOAD = '<rss><channel><title>mock</title></channel></rss>';
 // --- mock upstream: records every hit + the Authorization it saw, routes by id ---
 let upstreamHits = 0;
 let lastAuth;
+let lastPath;
 let releaseSlowResponse;
 let slowRequestsReceived = 0;
 const mock = http.createServer((req, res) => {
   upstreamHits++;
   lastAuth = req.headers['authorization'];
+  lastPath = req.url;
   const respond = () => {
     if (req.url.includes('redirectsame')) {
       res.writeHead(302, { Location: '/different/path?private=secret' });
@@ -295,7 +297,26 @@ try {
     assert.ok(!/PRIVATE|private|secret|169\.254|other\.example|different/.test(captured.join('')), `p: ${id} log privacy`);
   }
 
-  console.log('PASS: all commons-cache self-tests passed (a-p)');
+
+  // (q) /v1/comments: a thread is fetched once under its own template and served to every reader.
+  {
+    upstreamHits = 0;
+    const first = await get('/v1/comments?id=abc123&sort=top');
+    assert.equal(first.status, 200, 'comments MISS fetches upstream');
+    assert.equal(first.xcache, 'MISS');
+    assert.equal(upstreamHits, 1);
+    assert.ok(lastPath && lastPath.startsWith('/comments/abc123?sort=top'), `thread template drives the upstream path: ${lastPath}`);
+    const second = await get('/v1/comments?id=abc123&sort=top', { authorization: 'Bearer other' });
+    assert.equal(second.xcache, 'HIT', 'a second reader is served from the cache');
+    assert.equal(upstreamHits, 1, 'no second upstream fetch');
+    const feed = await get('/v1/commons?id=abc123&sort=top');
+    assert.equal(feed.xcache, 'MISS', 'a feed with the same id is a different key');
+    const bad = await get('/v1/comments?id=&sort=top');
+    assert.equal(bad.status, 400);
+    console.log('ok  (p) /v1/comments cached per (id, sort) under its own template');
+  }
+
+  console.log('PASS: all commons-cache self-tests passed (a-q)');
 } catch (err) {
   failed = true;
   console.error('FAIL:', err.message);

@@ -44,6 +44,11 @@ const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || 'https://example.com').repla
 // sanitized and percent-encoded). Default is the generic form; an operator can
 // set e.g. /feed/{id}/{sort}.xml to target a specific upstream without a code edit.
 const UPSTREAM_PATH_TEMPLATE = process.env.UPSTREAM_PATH_TEMPLATE || '/{id}/{sort}.rss';
+// Public comment threads, same cache semantics under their own template:
+// {id} is the public item id, {sort} its comment sort. One upstream fetch per
+// (id, sort) serves every client that opens the same thread within the TTL,
+// so a hot thread no longer costs the shared credential one call per reader.
+const COMMENTS_PATH_TEMPLATE = process.env.COMMENTS_PATH_TEMPLATE || '/comments/{id}?sort={sort}&raw_json=1';
 const UPSTREAM_UA = process.env.UPSTREAM_UA ||
   'columbia-commons/1.0 (+https://example.com)';
 const MAX_ENTRIES = parseInt(process.env.COMMONS_MAX_ENTRIES || '5000', 10);     // cache bound (LRU)
@@ -105,7 +110,7 @@ const cache = new Map();
 
 function safeLogFields(fields) {
   const safe = {};
-  if (fields.route !== undefined) safe.route = ['/health', '/v1/commons', '/v1/imgur', '/v1/probe'].includes(fields.route) ? fields.route : 'other';
+  if (fields.route !== undefined) safe.route = ['/health', '/v1/commons', '/v1/comments', '/v1/imgur', '/v1/probe'].includes(fields.route) ? fields.route : 'other';
   if (fields.method !== undefined) safe.method = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].includes(fields.method) ? fields.method : 'other';
   if (Number.isInteger(fields.status) && fields.status >= 100 && fields.status <= 599) safe.status = fields.status;
   if (Number.isFinite(fields.durationMs)) safe.durationMs = Math.max(0, Math.round(fields.durationMs));
@@ -251,8 +256,8 @@ async function fetchUpstream(url, authHeader) {
 // UPSTREAM_PATH_TEMPLATE so the upstream layout is config, not code. id/sort are
 // already sanitized by the caller; we percent-encode each before substituting so
 // the template controls structure only and can never be used for path injection.
-function upstreamUrl(id, sort) {
-  const path = UPSTREAM_PATH_TEMPLATE
+function upstreamUrl(id, sort, template = UPSTREAM_PATH_TEMPLATE) {
+  const path = template
     .replace(/\{id\}/g, encodeURIComponent(id))
     .replace(/\{sort\}/g, encodeURIComponent(sort));
   return `${UPSTREAM_BASE}${path.startsWith('/') ? '' : '/'}${path}`;
@@ -268,9 +273,10 @@ const inflight = new Map();
 // FORWARD_UPSTREAM_AUTH is enabled; it is NEVER part of the cache key. A HIT below
 // returns before any fetch, so a cached (shared, public) response is served without
 // touching the upstream and without requiring the caller to present a credential.
-async function getCachedFeed(id, sort, authHeader) {
-  const key = `${id}/${sort}`;
-  const url = upstreamUrl(id, sort);
+async function getCachedFeed(id, sort, authHeader, kind = 'commons') {
+  // Threads live under their own keys; feed keys are unchanged.
+  const key = kind === 'commons' ? `${id}/${sort}` : `${kind}:${id}/${sort}`;
+  const url = upstreamUrl(id, sort, kind === 'comments' ? COMMENTS_PATH_TEMPLATE : UPSTREAM_PATH_TEMPLATE);
   const now = Date.now();
   const entry = cache.get(key);
 
@@ -470,18 +476,19 @@ const server = http.createServer(async (req, res) => {
       status = 200;
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ note: 'upstream-surface reachability from this host: status, size, and latency', results }, null, 2));
-    } else if (route === '/v1/commons') {
+    } else if (route === '/v1/commons' || route === '/v1/comments') {
+      const kind = route === '/v1/comments' ? 'comments' : 'commons';
       const id = (u.searchParams.get('id') || '').replace(/[^A-Za-z0-9_]/g, '');
       const sort = (u.searchParams.get('sort') || 'latest').toLowerCase();
       if (!id || !SORT_RE.test(sort)) {
         status = 400;
         res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'require ?id=<feed-id>&sort=<sort>' }));
+        res.end(JSON.stringify({ error: `require ?id=<${kind === 'comments' ? 'item' : 'feed'}-id>&sort=<sort>` }));
       } else {
         // Forward the caller's credential only on a fetch (MISS/revalidate) and only
         // when enabled; a HIT never reaches the upstream so it needs no credential.
         const authHeader = FORWARD_UPSTREAM_AUTH ? (req.headers['authorization'] || undefined) : undefined;
-        const out = await getCachedFeed(id, sort, authHeader);
+        const out = await getCachedFeed(id, sort, authHeader, kind);
         cacheState = out.cacheState;
         if (out.upstreamError) {
           failureReason = out.reason;
