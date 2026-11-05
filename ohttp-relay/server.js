@@ -326,6 +326,7 @@ function fdidExempt(req, path) {
 
 // Short-lived cache of the gateway's public key config. { body, contentType, fetchedAt }.
 let configCache = null;
+let configFlight = null;
 
 // Serve GET /ohttp-configs by proxying the gateway's public key config. Read-only,
 // no secret needed (public material), cached for CONFIG_TTL_MS.
@@ -342,6 +343,7 @@ function serveConfig(res, start) {
     log({ route: '/ohttp-configs', status: 502, durationMs: Date.now() - start });
     return;
   }
+  if (configFlight && configFlight.add(res, start)) return;
   const opts = {
     hostname: cfgGw.hostname,
     port: cfgGw.port || 443,
@@ -350,11 +352,11 @@ function serveConfig(res, start) {
     timeout: GW_TIMEOUT_MS,
     agent: gwAgent, // same host as the gateway POST, share the keep-alive pool
   };
-  proxyGatewayRequest(opts, undefined, res, start, '/ohttp-configs', (status, headers, body) => {
+  configFlight = proxyGatewayRequest(opts, undefined, res, start, '/ohttp-configs', (status, headers, body) => {
     const contentType = headers['content-type'] || 'application/octet-stream';
     if (status === 200) configCache = { body, contentType, fetchedAt: Date.now() };
     return { 'Content-Type': contentType };
-  });
+  }, () => { configFlight = null; });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -507,32 +509,43 @@ function forwardToGateway(body, res, start) {
   proxyGatewayRequest(opts, body, res, start, '/relay', () => ({ 'Content-Type': 'message/ohttp-res' }));
 }
 
-// Both gateway endpoints use the same size limit and terminal-state handling.
-// headersForResponse may cache successful public configs; it runs only after a
-// complete response. A caller disconnect cancels work before capacity is freed.
-function proxyGatewayRequest(opts, body, res, start, route, headersForResponse) {
+function proxyGatewayRequest(opts, body, res, start, route, headersForResponse, onFinish = () => {}) {
   let completed = false;
   let gatewayResponse;
-  // Request and response errors can both fire for the same socket teardown.
-  // Complete once so RED logs count one relay outcome and cleanup is symmetric.
+  const callers = new Map();
   const finish = (status, reason, error, responseBody, responseHeaders = {}) => {
     if (completed) return;
     completed = true;
-    res.removeListener('close', clientClosed);
-    if (!res.destroyed && !res.headersSent) {
-      res.writeHead(status, responseHeaders);
-      res.end(responseBody);
+    onFinish();
+    for (const [caller, waiter] of callers) {
+      caller.removeListener('close', waiter.closed);
+      if (!caller.destroyed && !caller.headersSent) {
+        caller.writeHead(status, responseHeaders);
+        caller.end(responseBody);
+      }
+      log({ route, status, reason, code: error?.code,
+        reused: reason === 'gw_error' ? greq.reusedSocket : undefined, durationMs: Date.now() - waiter.start });
     }
-    log({ route, status, reason, code: error?.code,
-      reused: reason === 'gw_error' ? greq.reusedSocket : undefined, durationMs: Date.now() - start });
+    callers.clear();
   };
-  const clientClosed = () => {
-    if (res.writableEnded || completed) return;
-    // Releasing a slot without destroying its outbound work lets disconnecting
-    // callers bypass MAX_INFLIGHT and fill the Agent's pending-request queue.
-    finish(499, 'client_disconnect');
-    gatewayResponse?.destroy();
-    greq.destroy();
+  const add = (caller, callerStart) => {
+    if (completed) return false;
+    const closed = () => {
+      if (caller.writableEnded || completed) return;
+      callers.delete(caller);
+      caller.removeListener('close', closed);
+      log({ route, status: 499, reason: 'client_disconnect', durationMs: Date.now() - callerStart });
+      if (callers.size === 0) {
+        finish(499, 'client_disconnect');
+        gatewayResponse?.destroy();
+        greq.destroy();
+      }
+    };
+    callers.set(caller, { start: callerStart, closed });
+    // For POST, cancel upstream before the existing capacity-release listener.
+    caller.prependListener('close', closed);
+    if (caller.destroyed) closed();
+    return true;
   };
   const greq = https.request(opts, (gres) => {
     gatewayResponse = gres;
@@ -561,7 +574,6 @@ function proxyGatewayRequest(opts, body, res, start, route, headersForResponse) 
       greq.destroy();
     });
   });
-  res.prependListener('close', clientClosed); // cancel upstream before the slot-release listener
   greq.on('timeout', () => {
     greq.destroy(Object.assign(new Error('gw timeout'), { code: 'ETIMEDOUT' }));
   });
@@ -569,8 +581,9 @@ function proxyGatewayRequest(opts, body, res, start, route, headersForResponse) 
     finish(502, 'gw_error', err);
     gatewayResponse?.destroy();
   });
-  if (res.destroyed) { clientClosed(); return; }
-  greq.end(body);
+  add(res, start);
+  if (!completed) greq.end(body);
+  return { add };
 }
 
 // Crash forensics: an uncaught throw or unhandled rejection used to kill the

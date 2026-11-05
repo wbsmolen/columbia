@@ -78,14 +78,14 @@ RED metrics only, structured JSON to stdout:
 
 No IP, no content, no headers, no target. `route` is a fixed template.
 
-Both `/relay` and `/ohttp-configs` cancel outbound work when the caller disconnects and log one terminal outcome. A failure adds a bounded `reason` and normalized transport `code`, so a 502 is attributable:
+Concurrent cold `/ohttp-configs` reads share one gateway fetch. Each caller logs one terminal outcome; only the last caller disconnect cancels that fetch. `/relay` cancels its outbound work when its caller disconnects and never replays it. A failure adds a bounded `reason` and normalized transport `code`, so a 502 is attributable:
 
 | `reason` | Meaning |
 |---|---|
 | `gw_error` | the request to the gateway errored; also logs `reused` (whether the socket came from the keep-alive pool) |
 | `gres_error` | the gateway errored part-way through its response |
 | `resp_too_large` | the gateway response exceeded `MAX_RESP_BYTES` |
-| `client_disconnect` | the caller disconnected; outbound gateway work was cancelled (logged status 499) |
+| `client_disconnect` | the caller disconnected (status 499); outbound work is cancelled when no callers remain |
 | `rate_limit` / `capacity` | per-client budget exhausted / process concurrency cap reached |
 | `origin` / `client_auth` | front-door origin lock / client authorization rejected |
 
@@ -158,7 +158,9 @@ separate staged rollout with older-client and physical-device acceptance.
 Run `npm ci && npm test` (Node 24). The local HTTPS gateway exercises successful forwarding,
 ambiguous resets without replay, response size limits, response-stream resets,
 timeouts, aborted uploads, caller disconnects, slot recovery, and config caching.
-Every gateway failure and cancellation must produce exactly one outcome log.
+Cold-config tests also cover shared fetches, independent cancellation, last-caller
+abort, error recovery, and pool availability for an opaque POST. Each caller must
+produce exactly one terminal outcome log.
 
 ## Run locally
 
