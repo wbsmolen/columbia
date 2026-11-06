@@ -141,6 +141,8 @@ const GW_PORT = gw.port || 443; // honor a non-default port instead of hardcodin
 // Reusing sockets avoids a TCP+TLS handshake per relay request; maxSockets
 // bounds the pool (excess requests queue on the agent).
 const gwAgent = new https.Agent({ keepAlive: true, maxSockets: 128 });
+// Leave room for the coalesced config fetch and another client.
+const MAX_CLIENT_INFLIGHT = Math.min(RATE_LIMIT_RPM > 0 ? RATE_LIMIT_RPM : Infinity, gwAgent.maxSockets - 2);
 
 // The gateway's /ohttp-configs URL, derived from GATEWAY_URL (same host) unless
 // explicitly overridden. The relay reaches the gateway at the same host whether
@@ -153,6 +155,7 @@ try { cfgGw = new URL(GATEWAY_CONFIGS_URL); } catch { cfgGw = null; }
 // lazily on access; hard-capped key count so a spoofed-source flood can't grow
 // the table unbounded.
 const rateBuckets = new Map();
+const clientInflight = new Map();
 let inflight = 0;
 let draining = false, httpClosed = false, shutdownTimer;
 function finishDrain() {
@@ -416,24 +419,34 @@ const server = http.createServer(async (req, res) => {
 
   // Per-IP rate limit. The address is used ONLY as a transient limiter key and is
   // never logged. See clientIpKey for why we read the trusted X-Forwarded-For.
-  if (rateLimited(clientIpKey(req))) {
+  const ipBucket = clientIpKey(req);
+  if (rateLimited(ipBucket)) {
     res.writeHead(429); res.end();
     log({ route: '/relay', status: 429, reason: 'rate_limit', durationMs: Date.now() - start });
     return;
   }
 
-  // Global in-flight concurrency cap. Reserve a slot; release it on every
+  // Per-client and global concurrency caps. Reserve a slot; release it on every
   // terminal path (success, error, abort, oversize, client disconnect).
-  if (inflight >= MAX_INFLIGHT) {
+  const clientRequests = clientInflight.get(ipBucket) || 0;
+  if (inflight >= MAX_INFLIGHT || clientRequests >= MAX_CLIENT_INFLIGHT) {
     res.writeHead(429); res.end();
     log({ route: '/relay', status: 429, reason: 'capacity', durationMs: Date.now() - start });
     return;
   }
   inflight += 1;
+  clientInflight.set(ipBucket, clientRequests + 1);
   let slotReleased = false, authPending = true, releaseRequested = false;
   const releaseSlot = () => {
     if (authPending) { releaseRequested = true; return; }
-    if (!slotReleased) { slotReleased = true; inflight -= 1; finishDrain(); }
+    if (!slotReleased) {
+      slotReleased = true;
+      inflight -= 1;
+      const remaining = clientInflight.get(ipBucket) - 1;
+      if (remaining === 0) clientInflight.delete(ipBucket);
+      else clientInflight.set(ipBucket, remaining);
+      finishDrain();
+    }
   };
   res.on('finish', releaseSlot); // retain capacity until buffered output is flushed
   res.on('close', releaseSlot);   // safety net for any teardown path

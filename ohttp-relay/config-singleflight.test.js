@@ -20,7 +20,7 @@ async function within(predicate, message) {
 }
 
 async function fixture(t, overrides = {}) {
-  const logs = [], configs = [], clientPromises = [], clients = new Set();
+  const logs = [], configs = [], heldPosts = [], heldPostBodies = new Set(), clientPromises = [], clients = new Set();
   let gatewayPosts = 0, incomingConfigs = 0, sharedAgent, gateway, relay;
   const originalWrite = process.stdout.write, Agent = https.Agent;
   const events = ['uncaughtException', 'unhandledRejection'];
@@ -59,9 +59,12 @@ async function fixture(t, overrides = {}) {
       configs.push(entry);
     } else if (req.method === 'POST' && req.url === '/gateway') {
       gatewayPosts += 1;
-      req.resume();
-      res.writeHead(200, { 'Content-Type': 'message/ohttp-res' });
-      res.end('opaque-response-fixture');
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        if (heldPostBodies.has(Buffer.concat(chunks).toString())) heldPosts.push(res);
+        else replyPost(res);
+      });
     } else { res.writeHead(404); res.end(); }
   });
   gateway.listen(0, '127.0.0.1');
@@ -135,6 +138,10 @@ async function fixture(t, overrides = {}) {
     configs[index].res.writeHead(status, { 'Content-Type': 'application/ohttp-keys' });
     configs[index].res.end(body);
   }
+  function replyPost(res) {
+    res.writeHead(200, { 'Content-Type': 'message/ohttp-res' });
+    res.end('opaque-response-fixture');
+  }
   async function joined(count, expectedDispatches = 1) {
     try { await within(() => incomingConfigs === count && configs.length >= 1, 'Config callers failed to arrive'); }
     catch (error) { throw Error(`${error.message}: incoming=${incomingConfigs};gateway=${configs.length};active=${agentCount('sockets')};queued=${agentCount('requests')}`); }
@@ -143,7 +150,8 @@ async function fixture(t, overrides = {}) {
     assert.equal(agentCount('requests'), 0, 'Cold callers must not build an agent queue');
     assert.equal(configs.length, expectedDispatches, 'Concurrent callers must share the actual gateway GET');
   }
-  return { logs, configs, request, reply, joined, gatewayPosts: () => gatewayPosts,
+  return { logs, configs, request, reply, joined, heldPosts, replyPost,
+    holdPostBody: body => heldPostBodies.add(body), gatewayPosts: () => gatewayPosts,
     incomingConfigs: () => incomingConfigs };
 }
 
@@ -229,4 +237,47 @@ test('coalesced config reads retain response-body and gateway-idle bounds', asyn
   await within(() => f.configs.length === 3, 'Timeout must not stick or cache');
   f.reply(2);
   assert.equal((await retry.promise).body, 'public-keys');
+});
+
+test('unfinished POSTs retain one identity ceiling across the default rate-window reset', { timeout: 80000 }, async t => {
+  const f = await fixture(t);
+  const anchor = await f.request('/relay', 'anchor-client-request').promise;
+  assert.equal(anchor.status, 200);
+  const anchorCompleted = performance.now();
+  f.holdPostBody('held-client-request');
+  await new Promise(resolve => setTimeout(resolve, 55000));
+  const before = Array.from({ length: 119 }, () => f.request('/relay', 'held-client-request'));
+  await within(() => f.heldPosts.length === 119, 'The complete first-window allowance must reach the gateway');
+  assert.ok(performance.now() - anchorCompleted < 60000);
+  await new Promise(resolve => setTimeout(resolve, Math.max(0, anchorCompleted + 60100 - performance.now())));
+  const refused = [];
+  const after = Array.from({ length: 9 }, () => {
+    const client = f.request('/relay', 'held-client-request');
+    client.promise.then(response => refused.push(response), () => {});
+    return client;
+  });
+  let peerResponse;
+  const peer = f.request('/relay', 'peer-client-request', '198.51.100.2');
+  peer.promise.then(response => { peerResponse = response; }, () => {});
+  await within(() => peerResponse !== undefined,
+    'Another identity must complete before any held response is released');
+  assert.equal(peerResponse.status, 200);
+  assert.equal(peerResponse.body, 'opaque-response-fixture');
+  await within(() => refused.length === 8 && f.heldPosts.length === 120,
+    'Only one additional request may join the unfinished first-window requests');
+  for (const response of refused) {
+    assert.equal(response.status, 429);
+    assert.equal(response.body, '');
+  }
+  assert.equal(f.gatewayPosts(), 122, 'Only the anchor, 120 held requests and peer may reach the gateway');
+  assert.equal(f.logs.filter(entry => entry.status === 429 && entry.reason === 'rate_limit').length, 0);
+  assert.equal(f.logs.filter(entry => entry.status === 429 && entry.reason === 'capacity').length, 8);
+  for (const response of f.heldPosts) f.replyPost(response);
+  const results = await Promise.all([...before, ...after].map(client => client.promise));
+  assert.equal(results.filter(response => response.status === 200).length, 120);
+  assert.equal(results.filter(response => response.status === 429).length, 8);
+  assert.equal(f.gatewayPosts(), 122, 'Opaque POSTs must never replay');
+  assert.equal((await f.request('/relay', 'released-client-request').promise).status, 200,
+    'Finishing the held responses must release this identity capacity');
+  assert.equal(f.gatewayPosts(), 123);
 });
