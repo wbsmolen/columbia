@@ -2,6 +2,21 @@
 
 Notable changes to Columbia. Published releases and their exact tags are listed on [GitHub Releases](https://github.com/wbsmolen/columbia/releases).
 
+## v1.7.3 - 2026-11-06
+
+### Added
+
+- Commons serves cached public comment threads at `GET /v1/comments?id=&sort=`. One upstream fetch per (item id, sort) serves every reader inside the TTL, with the same stale-while-revalidate, single-flight, bounded-body and no-leak behavior as `/v1/commons`. Threads use their own cache keys under `COMMENTS_PATH_TEMPLATE`; feed keys are unchanged.
+
+### Fixed
+
+- The relay coalesces cold config reads, so they can't exhaust gateway sockets.
+- The relay bounds unfinished POSTs per trusted identity independently of the fixed-window RPM counter, so one identity can't take peers' capacity across a rate-window reset. Rate, window, global and socket settings are unchanged.
+
+### Upgrade notes
+
+- Image-only rollout for the relay and commons. The gateway and issuer are unchanged from v1.7.2.
+
 ## v1.7.2 - 2026-10-18
 
 ### Performance
