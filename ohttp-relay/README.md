@@ -78,15 +78,15 @@ RED metrics only, structured JSON to stdout:
 
 No IP, no content, no headers, no target. `route` is a fixed template.
 
-Both `/relay` and `/ohttp-configs` cancel outbound work when the caller disconnects and log one terminal outcome. A failure adds a bounded `reason` and normalized transport `code`, so a 502 is attributable:
+Concurrent cold `/ohttp-configs` reads share one gateway fetch. Each caller logs one terminal outcome; only the last caller disconnect cancels that fetch. `/relay` cancels its outbound work when its caller disconnects and never replays it. A failure adds a bounded `reason` and normalized transport `code`, so a 502 is attributable:
 
 | `reason` | Meaning |
 |---|---|
 | `gw_error` | the request to the gateway errored; also logs `reused` (whether the socket came from the keep-alive pool) |
 | `gres_error` | the gateway errored part-way through its response |
 | `resp_too_large` | the gateway response exceeded `MAX_RESP_BYTES` |
-| `client_disconnect` | the caller disconnected; outbound gateway work was cancelled (logged status 499) |
-| `rate_limit` / `capacity` | per-client budget exhausted / process concurrency cap reached |
+| `client_disconnect` | the caller disconnected (status 499); outbound work is cancelled when no callers remain |
+| `rate_limit` / `capacity` | per-client window budget exhausted / per-client or process concurrency cap reached |
 | `origin` / `client_auth` | front-door origin lock / client authorization rejected |
 
 An uncaught exception or unhandled rejection logs a bounded `{event, code, errorType}` and exits non-zero. Free-form messages, stack text, unknown request paths and unknown error codes are excluded by the logging boundary.
@@ -108,7 +108,7 @@ The relay never automatically replays ciphertext after a connection reset, even 
 | `REDEMPTION_MAX_KEYS` | `5000000` | single-process memory capacity; full capacity fails503, never evicts a live spend |
 | `REDEMPTION_CONNECTION_STRING` | unset | Relay-operator Azure Table credential; enables shared durable redemption; never issuer-state credentials |
 | `REDEMPTION_TABLE` | `columbiaredemptions` | Dedicated relay spend table |
-| `RATE_LIMIT_RPM` | `120` | per-IP requests per minute; `0` disables per-IP limiting |
+| `RATE_LIMIT_RPM` | `120` | per-IP requests per minute; `0` disables the window budget, while concurrent ownership stays bounded |
 | `RATE_WINDOW_MS` | `60000` | the window `RATE_LIMIT_RPM` is measured over |
 | `RATE_MAX_KEYS` | `100000` | per-IP rate-limit bucket memory bound |
 | `MAX_INFLIGHT` | `256` | global cap on concurrent relays; further requests get a 429 |
@@ -122,6 +122,10 @@ The relay never automatically replays ciphertext after a connection reset, even 
 | `REQUIRE_FDID` | (none) | front-door origin lock: when set, reject any request that did not arrive through the edge front door (which injects `X-Azure-FDID`). `GET /health` is exempt. Unset disables the check |
 | `FDID_HEADER` | `x-azure-fdid` | name of the header the edge front door injects for the `REQUIRE_FDID` lock above; override for a non-Azure CDN or WAF that injects a differently named header |
 | `LOG_HEALTH` | unset | successful `GET /health` probe hits are not logged (at platform probe cadence they are almost all log volume, drowning the RED signal); set `1` to log them again for a debugging session. Failing probes are unaffected |
+
+Unfinished `/relay` requests also retain a per-client concurrency bound across
+window resets: the positive RPM budget or126, whichever is smaller (default120).
+This leaves socket capacity for the coalesced config fetch and another client.
 
 ### Token mode (Privacy Pass)
 
@@ -158,7 +162,9 @@ separate staged rollout with older-client and physical-device acceptance.
 Run `npm ci && npm test` (Node 24). The local HTTPS gateway exercises successful forwarding,
 ambiguous resets without replay, response size limits, response-stream resets,
 timeouts, aborted uploads, caller disconnects, slot recovery, and config caching.
-Every gateway failure and cancellation must produce exactly one outcome log.
+Cold-config tests also cover shared fetches, independent cancellation, last-caller
+abort, error recovery, and pool availability for an opaque POST. Each caller must
+produce exactly one terminal outcome log.
 
 ## Run locally
 
