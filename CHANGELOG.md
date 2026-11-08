@@ -2,6 +2,12 @@
 
 Notable changes to Columbia. Published releases and their exact tags are listed on [GitHub Releases](https://github.com/wbsmolen/columbia/releases).
 
+## Unreleased
+
+### Changed
+
+- Commons gzips successful `/v1/commons`, `/v1/comments` and `/v1/imgur` responses when the caller accepts gzip, and sends `Content-Length` and `Vary: Accept-Encoding` with them. The gateway's Go client asks for gzip and decodes it transparently, so clients get identical bytes; the commons-to-gateway hop, which runs through the CDN, shrinks several-fold. Callers that don't ask for gzip get the plain body, as before.
+
 ## v1.7.3 - 2026-11-06
 
 ### Added

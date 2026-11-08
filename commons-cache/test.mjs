@@ -18,6 +18,7 @@
 
 import http from 'node:http';
 import assert from 'node:assert/strict';
+import { gunzipSync } from 'node:zlib';
 
 const JSON_PAYLOAD = JSON.stringify({ ok: true, id: 'jsonsub', items: [1, 2, 3] });
 const RSS_PAYLOAD = '<rss><channel><title>mock</title></channel></rss>';
@@ -158,6 +159,24 @@ try {
   // (d) JSON passes through byte-for-byte with a JSON content-type
   assert.match(r.ctype, /^application\/json/, 'd: JSON content-type');
   assert.equal(r.body, JSON_PAYLOAD, 'd: JSON body byte-for-byte');
+
+  // (d2) gzip only when asked (the gateway's Go client asks and decodes), with a
+  // Content-Length so a CDN can pass it through; the decoded bytes are unchanged.
+  const raw = (acceptEncoding) => new Promise((resolve, reject) => {
+    http.get(base + '/v1/commons?id=jsonsub&sort=hot', { headers: { 'Accept-Encoding': acceptEncoding } }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ headers: res.headers, body: Buffer.concat(chunks) }));
+    }).on('error', reject);
+  });
+  const zipped = await raw('gzip');
+  assert.equal(zipped.headers['content-encoding'], 'gzip', 'd2: gzip when accepted');
+  assert.equal(Number(zipped.headers['content-length']), zipped.body.length, 'd2: exact Content-Length');
+  assert.equal(gunzipSync(zipped.body).toString(), JSON_PAYLOAD, 'd2: decodes to the same JSON');
+  const plain = await raw('identity');
+  assert.equal(plain.headers['content-encoding'], undefined, 'd2: identity stays plain');
+  assert.equal(plain.body.toString(), JSON_PAYLOAD, 'd2: identity body unchanged');
+  assert.match(plain.headers.vary || '', /Accept-Encoding/, 'd2: Vary so caches keep both');
 
   // (b) HIT serves cached bytes with NO upstream fetch and NO Authorization required
   r = await get('/v1/commons?id=jsonsub&sort=hot'); // deliberately no auth header

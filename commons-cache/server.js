@@ -23,6 +23,8 @@
 
 const http = require('http');
 const crypto = require('crypto');
+const { promisify } = require('util');
+const gzip = promisify(require('zlib').gzip);
 
 // Front door origin lock (mirrors the relay). When REQUIRE_FDID is set, a request
 // is accepted only if it arrives through a front door (a CDN/WAF, e.g. Azure Front
@@ -154,6 +156,18 @@ function redirectTargetClass(requestedUrl, response) {
   } catch {
     return 'invalid';
   }
+}
+
+// Gzip a success body when the caller accepts it. The gateway's Go client asks for
+// gzip and decodes it transparently, so clients see the same bytes and only the
+// gateway-to-commons hop (through the CDN, billed as egress) shrinks: Reddit
+// thread JSON compresses roughly 5-8x. Some CDNs, Azure Front Door among them,
+// won't compress a response that arrives without a Content-Length.
+// ponytail: gzips on every request; cache the encoded body if commons CPU climbs.
+async function encodeForClient(req, body) {
+  if (!/\bgzip\b/i.test(req.headers['accept-encoding'] || '')) return { body, headers: { Vary: 'Accept-Encoding' } };
+  const encoded = await gzip(body);
+  return { body: encoded, headers: { 'Content-Encoding': 'gzip', 'Content-Length': String(encoded.length), Vary: 'Accept-Encoding' } };
 }
 
 // Enforce the memory limit while streaming, including decoded/compressed bodies.
@@ -508,7 +522,9 @@ const server = http.createServer(async (req, res) => {
           const ageS = out.fetchedAt ? Math.max(0, Math.floor((Date.now() - out.fetchedAt) / 1000)) : 0;
           // CDN-ready: a downstream CDN can edge-cache public feeds, collapsing
           // the public-read tier to origin-shield traffic. Only cache successes.
+          const encoded = await encodeForClient(req, out.body);
           res.writeHead(status, {
+            ...encoded.headers,
             'Content-Type': safeContentType(out.contentType),
             'X-Cache': cacheState,
             // Upstream status behind the cached bytes. Only 200s are ever cached, so
@@ -518,7 +534,7 @@ const server = http.createServer(async (req, res) => {
             'Cache-Control': `public, max-age=${Math.floor(TTL_MS / 1000)}, stale-while-revalidate=${Math.floor(SWR_MS / 1000)}`,
             'Age': String(ageS),
           });
-          res.end(out.body);
+          res.end(encoded.body);
         }
       }
     } else if (route === '/v1/imgur') {
@@ -545,7 +561,9 @@ const server = http.createServer(async (req, res) => {
         } else {
           status = 200;
           const ageS = out.fetchedAt ? Math.max(0, Math.floor((Date.now() - out.fetchedAt) / 1000)) : 0;
+          const encoded = await encodeForClient(req, out.body);
           res.writeHead(status, {
+            ...encoded.headers,
             'Content-Type': 'application/json',
             'X-Cache': cacheState,
             'X-Upstream-Status': String(out.upstreamStatus || 200),
@@ -553,7 +571,7 @@ const server = http.createServer(async (req, res) => {
             'Cache-Control': `public, max-age=${Math.floor(TTL_MS / 1000)}, stale-while-revalidate=${Math.floor(SWR_MS / 1000)}`,
             'Age': String(ageS),
           });
-          res.end(out.body);
+          res.end(encoded.body);
         }
       }
     } else {
