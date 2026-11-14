@@ -1,0 +1,27 @@
+# Columbia token issuer (Privacy Pass Attester + Issuer) on Workers.
+# Deployment-specific values are Worker secrets, never committed to this public repo:
+#   ISSUER_SIGNING_KEY, ISSUER_STATE_SALT, APPLE_TEAM_ID, APPLE_BUNDLE_ID,
+#   APPLE_APP_ATTEST_ROOT_CA_PEM_B64, REQUIRE_FDID
+# Everything else uses the token-issuer defaults (token-issuer/README.md).
+name = "columbia-issuer"
+main = "index.js"
+compatibility_date = "2026-11-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = false
+
+[vars]
+REQUIRE_DURABLE_STATE = "1"
+
+[[d1_databases]]
+binding = "ISSUER_DB"
+database_name = "columbia-issuer-state"
+database_id = "c7bb540c-dc5d-4394-88ee-8091f767e4fa"
+
+[observability]
+enabled = true
+
+# The issuer logs only its own RED-only fields. Invocation logs would also
+# record request headers (client IP, front-door id), so they stay off.
+[observability.logs]
+invocation_logs = false

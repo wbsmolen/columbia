@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto, { webcrypto } from 'node:crypto';
 import { RSABSSA } from '@cloudflare/blindrsa-ts';
-import { readFileSync } from 'node:fs';
+import vector from './rfc9474-vector.json' with { type: 'json' };
 import { blindSign, createEpochKeyProvider, keyIdFromSpki, parsePrivateKeyEnv } from './epoch-keys.js';
 
 const algorithm = { name: 'RSA-PSS', modulusLength: 2048,
@@ -55,7 +55,7 @@ test('explicit current/previous keys independently complete the actual blind-RSA
 });
 
 test('native blindSign reproduces the RFC 9474 vector and keeps full-length output', async () => {
-  const v = JSON.parse(readFileSync(new URL('./rfc9474-vector.json', import.meta.url)));
+  const v = vector;
   const big = h => BigInt('0x' + h), [p, q, d] = [big(v.p), big(v.q), big(v.d)];
   const inv = (a, m) => { let [r0, r1, s0, s1] = [a, m, 1n, 0n];
     while (r1) { const k = r0 / r1; [r0, r1, s0, s1] = [r1, r0 - k * r1, s1, s0 - k * s1]; } return (s0 % m + m) % m; };
