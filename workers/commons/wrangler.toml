@@ -1,0 +1,15 @@
+name = "columbia-commons"
+main = "index.js"
+compatibility_date = "2026-11-01"
+workers_dev = true
+preview_urls = false
+
+[vars]
+UPSTREAM_BASE = "https://oauth.reddit.com"
+UPSTREAM_PATH_TEMPLATE = "/r/{id}/{sort}?raw_json=1&limit=25&sr_detail=true"
+FORWARD_UPSTREAM_AUTH = "true"
+COMMONS_TTL_MS = "300000"
+COMMONS_SWR_MS = "300000"
+
+[observability]
+enabled = true

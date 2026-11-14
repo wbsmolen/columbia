@@ -1,0 +1,14 @@
+{
+  "name": "columbia-workers",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@hpke/core": "1.7.2"
+  },
+  "devDependencies": {
+    "wrangler": "4.162.0"
+  }
+}

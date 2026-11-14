@@ -1,0 +1,13 @@
+name = "columbia-gateway"
+main = "index.js"
+compatibility_date = "2026-11-01"
+workers_dev = false
+preview_urls = false
+
+[vars]
+OHTTP_KEY_ID = "128"
+OHTTP_CONFIG_HEX = "80002050b83a3321de19b0e1d906dc5dde83efbde71a05245b7d3ff8c614be70fdf811000400010001"
+ALLOWED_TARGET_ORIGINS = "lander-mw-commons-fpdvd7eearhkewap.z03.azurefd.net,oauth.reddit.com,matrix.redditspace.com"
+
+[observability]
+enabled = true
