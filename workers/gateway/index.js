@@ -40,9 +40,12 @@ async function targetResponse(req, env) {
   for (const [name, value] of req.headers) if (!HOP.has(name.toLowerCase())) headers.append(name, value)
   const init = { method: req.method, headers, redirect: 'follow', signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) }
   if (req.body.length && req.method !== 'GET' && req.method !== 'HEAD') init.body = req.body
+  const commonsHosts = new Set((env.COMMONS_HOSTS || '').split(',').map((h) => h.trim()).filter(Boolean))
   let resp
   try {
-    resp = await fetch(`${scheme}://${host}${req.path}`, init)
+    resp = commonsHosts.has(req.authority) && env.COMMONS
+      ? await env.COMMONS.fetch(`https://commons.internal${req.path}`, init)
+      : await fetch(`${scheme}://${host}${req.path}`, init)
   } catch (e) {
     return { error: INTERNAL, reason: 'upstream_error', code: e?.name }
   }

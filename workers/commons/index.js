@@ -198,7 +198,10 @@ export default {
     const c = cfg(env)
     const u = new URL(request.url)
     const route = u.pathname
-    if (env.REQUIRE_FDID && !(request.method === 'GET' && route === '/health') && !(await frontDoorAllowed(request, env))) {
+    // Front Door reaches this Worker on workers.dev; the custom domain and the
+    // gateway's service binding serve apps directly.
+    const viaWorkersDev = u.hostname.endsWith('.workers.dev')
+    if (env.REQUIRE_FDID && viaWorkersDev && !(request.method === 'GET' && route === '/health') && !(await frontDoorAllowed(request, env))) {
       log({ route, status: 403, durationMs: Date.now() - started })
       return new Response(null, { status: 403 })
     }

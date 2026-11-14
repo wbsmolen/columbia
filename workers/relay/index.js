@@ -9,14 +9,17 @@ const GW_TIMEOUT_MS = 15000
 function log(fields) { console.log(JSON.stringify({ svc: 'relay', ...fields })) }
 
 function fdidAllowed(request, env) {
-  // While Azure Front Door fronts this Worker, only accept requests it forwards.
-  if (!env.REQUIRE_FDID) return true
+  // Azure Front Door reaches this Worker on its workers.dev hostname; only accept
+  // requests it forwards there. The landerapp.xyz custom domain serves apps directly.
+  if (!env.REQUIRE_FDID || !new URL(request.url).hostname.endsWith('.workers.dev')) return true
   return request.headers.get('x-azure-fdid') === env.REQUIRE_FDID
 }
 
 async function rateLimited(request, env) {
   if (!env.RELAY_RATE_LIMITER) return false
-  const ip = request.headers.get(env.TRUSTED_CLIENT_IP_HEADER || 'cf-connecting-ip') || request.headers.get('cf-connecting-ip') || 'unknown'
+  // Front Door's socket-IP header is only trustworthy on the hostname Front Door uses.
+  const viaFrontDoor = new URL(request.url).hostname.endsWith('.workers.dev') && env.TRUSTED_CLIENT_IP_HEADER
+  const ip = (viaFrontDoor && request.headers.get(env.TRUSTED_CLIENT_IP_HEADER)) || request.headers.get('cf-connecting-ip') || 'unknown'
   const { success } = await env.RELAY_RATE_LIMITER.limit({ key: ip })
   return !success
 }
