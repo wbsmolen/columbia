@@ -11,8 +11,8 @@ const key = existing.match(/const KEY = `([\s\S]*?)`;/)?.[1];
 const cert = existing.match(/const CERT = `([\s\S]*?)`;/)?.[1];
 assert.ok(key && cert, 'Existing loopback certificate fixture is required');
 const turn = () => new Promise(resolve => setImmediate(resolve));
-async function within(predicate, message) {
-  const deadline = performance.now() + 2000;
+async function within(predicate, message, ms = 2000) {
+  const deadline = performance.now() + ms;
   while (!predicate()) {
     if (performance.now() > deadline) throw Error(message);
     await new Promise(resolve => setTimeout(resolve, 5));
@@ -239,17 +239,22 @@ test('coalesced config reads retain response-body and gateway-idle bounds', asyn
   assert.equal((await retry.promise).body, 'public-keys');
 });
 
-test('unfinished POSTs retain one identity ceiling across the default rate-window reset', { timeout: 80000 }, async t => {
+test('unfinished POSTs retain one identity ceiling across the default rate-window reset', async t => {
+  // The rate window reads Date.now(). Skew it past the default 60 s window rather
+  // than sleeping 55 s and then racing 119 in-process TLS round-trips into the
+  // last 5 s of the window under a 2 s deadline, which flaked on a loaded machine.
+  const realNow = Date.now;
+  let skew = 0;
+  Date.now = () => realNow() + skew;
+  t.after(() => { Date.now = realNow; });
   const f = await fixture(t);
   const anchor = await f.request('/relay', 'anchor-client-request').promise;
   assert.equal(anchor.status, 200);
-  const anchorCompleted = performance.now();
   f.holdPostBody('held-client-request');
-  await new Promise(resolve => setTimeout(resolve, 55000));
   const before = Array.from({ length: 119 }, () => f.request('/relay', 'held-client-request'));
-  await within(() => f.heldPosts.length === 119, 'The complete first-window allowance must reach the gateway');
-  assert.ok(performance.now() - anchorCompleted < 60000);
-  await new Promise(resolve => setTimeout(resolve, Math.max(0, anchorCompleted + 60100 - performance.now())));
+  // 8 s keeps the first held POST under the relay's 15 s GW_TIMEOUT_MS idle bound.
+  await within(() => f.heldPosts.length === 119, 'The complete first-window allowance must reach the gateway', 8000);
+  skew = 60100; // the anchor's default 60 s window has now elapsed
   const refused = [];
   const after = Array.from({ length: 9 }, () => {
     const client = f.request('/relay', 'held-client-request');
