@@ -216,7 +216,12 @@ async function viaEgressCommons(request, env, u) {
   // Anything else that isn't commons answering (503, a platform error page) means the
   // egress is down: null sends the request to this Worker's own commons.
   if (resp.status === 503 || (resp.status >= 400 && (resp.headers.get('content-type') || '').includes('text/html'))) return null
-  return new Response(resp.body, { status: resp.status, headers: resp.headers, encodeBody: resp.headers.get('content-encoding') ? 'manual' : 'automatic' })
+  // fetch() already decompressed the egress's gzip, so the body is plain while the
+  // headers still say gzip. 'automatic' re-encodes it to match; 'manual' sent plain
+  // JSON labelled gzip, which URLSession can't read (seen from 2.3.15 and the watch).
+  const out = new Headers(resp.headers)
+  out.delete('content-length')
+  return new Response(resp.body, { status: resp.status, headers: out })
 }
 
 export default {
