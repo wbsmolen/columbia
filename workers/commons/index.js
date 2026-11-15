@@ -194,6 +194,7 @@ async function serveCached(request, c, out) {
 
 // Reddit rate-limits Cloudflare's shared egress IPs, so while EGRESS_COMMONS_ORIGIN is
 // set, app traffic on the custom domain is proxied to a commons with its own egress.
+let egressDownUntil = 0
 async function viaEgressCommons(request, env, u) {
   const headers = new Headers()
   for (const h of ['authorization', 'accept', 'accept-encoding', 'accept-language', 'user-agent']) {
@@ -206,6 +207,9 @@ async function viaEgressCommons(request, env, u) {
   // Cloudflare replaces an origin's 502 body with its own HTML page; answer the way
   // commons does so clients see the same JSON.
   if (resp.status === 502) return json(502, { error: 'upstream unavailable' }, { 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' })
+  // Anything else that isn't commons answering (503, a platform error page) means the
+  // egress is down: null sends the request to this Worker's own commons.
+  if (resp.status === 503 || (resp.status >= 400 && (resp.headers.get('content-type') || '').includes('text/html'))) return null
   return new Response(resp.body, { status: resp.status, headers: resp.headers, encodeBody: resp.headers.get('content-encoding') ? 'manual' : 'automatic' })
 }
 
@@ -214,9 +218,16 @@ export default {
     const started = Date.now()
     const c = cfg(env)
     const u = new URL(request.url)
-    if (env.EGRESS_COMMONS_ORIGIN && !u.hostname.endsWith('.workers.dev') && u.pathname !== '/health') {
-      try { return await viaEgressCommons(request, env, u) }
-      catch (e) { log({ route: u.pathname, status: 502, reason: 'egress_error' }); return json(502, { error: 'upstream unavailable' }) }
+    // Reads only, so any egress failure can fall back to this Worker's own commons
+    // (more Reddit 429s from Cloudflare IPs, but no outage). The breaker skips a dead
+    // egress for a minute per isolate.
+    if (env.EGRESS_COMMONS_ORIGIN && !u.hostname.endsWith('.workers.dev') && u.pathname !== '/health' && Date.now() >= egressDownUntil) {
+      try {
+        const viaEgress = await viaEgressCommons(request, env, u)
+        if (viaEgress) return viaEgress
+        log({ route: u.pathname, reason: 'egress_unavailable' })
+      } catch (e) { log({ route: u.pathname, reason: 'egress_error', code: e?.name }) }
+      egressDownUntil = Date.now() + 60000
     }
     const route = u.pathname
     // Front Door reaches this Worker on workers.dev; the custom domain and the
