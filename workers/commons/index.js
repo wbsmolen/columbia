@@ -5,7 +5,9 @@
 const SORT_RE = /^[a-z]+$/
 const IMGUR_ID_RE = /^[A-Za-z0-9]{1,15}$/
 const ALLOWED_CONTENT_TYPES = new Set(['application/rss+xml', 'application/atom+xml', 'application/xml', 'text/xml', 'application/json'])
-const ROUTES = ['/health', '/v1/commons', '/v1/comments', '/v1/imgur', '/v1/probe']
+const ROUTES = ['/health', '/v1/commons', '/v1/comments', '/v1/page', '/v1/imgur', '/v1/probe']
+// A later listing page is keyed by the post it follows (Reddit's `after`).
+const AFTER_RE = /^t3_[a-z0-9]{1,13}$/
 const MAX_ENTRIES = 5000
 const MAX_BODY_BYTES = 5000000
 
@@ -19,6 +21,8 @@ const cfg = (env) => ({
   base: (env.UPSTREAM_BASE || 'https://oauth.reddit.com').replace(/\/+$/, ''),
   template: env.UPSTREAM_PATH_TEMPLATE || '/r/{id}/{sort}?raw_json=1&limit=25&sr_detail=true',
   commentsTemplate: env.COMMENTS_PATH_TEMPLATE || '/comments/{id}?sort={sort}&raw_json=1',
+  // Every reader of a shared page 1 follows the same cursor, so later pages share too.
+  pageTemplate: env.PAGE_PATH_TEMPLATE || '/r/{id}/{sort}?raw_json=1&limit=100&sr_detail=true&after={after}',
   ua: env.UPSTREAM_UA || 'columbia-commons/1.0 (+https://example.com)',
   forwardAuth: /^(1|true|yes|on)$/i.test(env.FORWARD_UPSTREAM_AUTH || ''),
   imgurBase: (env.IMGUR_BASE || 'https://api.imgur.com').replace(/\/+$/, ''),
@@ -78,8 +82,8 @@ async function fetchUpstream(c, url, auth) {
   }
 }
 
-const upstreamUrl = (c, id, sort, template) => {
-  const path = template.replace(/\{id\}/g, encodeURIComponent(id)).replace(/\{sort\}/g, encodeURIComponent(sort))
+const upstreamUrl = (c, id, sort, template, after = '') => {
+  const path = template.replace(/\{id\}/g, encodeURIComponent(id)).replace(/\{sort\}/g, encodeURIComponent(sort)).replace(/\{after\}/g, encodeURIComponent(after))
   return `${c.base}${path.startsWith('/') ? '' : '/'}${path}`
 }
 
@@ -250,16 +254,18 @@ export default {
     } else if (route === '/v1/probe') {
       const up = await fetchUpstream(c, upstreamUrl(c, 'example', 'latest', c.template))
       resp = new Response(JSON.stringify({ note: 'upstream-surface reachability from this host: status, size, and latency', results: { commons: { status: up.status, bytes: up.body?.length || 0, ms: up.ms } } }, null, 2), { headers: { 'Content-Type': 'application/json' } })
-    } else if (route === '/v1/commons' || route === '/v1/comments') {
-      const kind = route === '/v1/comments' ? 'comments' : 'commons'
+    } else if (route === '/v1/commons' || route === '/v1/comments' || route === '/v1/page') {
+      const kind = route === '/v1/comments' ? 'comments' : route === '/v1/page' ? 'page' : 'commons'
       const id = (u.searchParams.get('id') || '').replace(/[^A-Za-z0-9_]/g, '')
       const sort = (u.searchParams.get('sort') || 'latest').toLowerCase()
-      if (!id || !SORT_RE.test(sort)) {
-        resp = json(400, { error: `require ?id=<${kind === 'comments' ? 'item' : 'feed'}-id>&sort=<sort>` })
+      const after = kind === 'page' ? u.searchParams.get('after') || '' : ''
+      if (!id || !SORT_RE.test(sort) || (kind === 'page' && !AFTER_RE.test(after))) {
+        resp = json(400, { error: `require ?id=<${kind === 'comments' ? 'item' : 'feed'}-id>&sort=<sort>${kind === 'page' ? '&after=<t3_id>' : ''}` })
       } else {
         const auth = c.forwardAuth ? request.headers.get('authorization') || undefined : undefined
-        const key = kind === 'commons' ? `${id}/${sort}` : `${kind}:${id}/${sort}`
-        const url = upstreamUrl(c, id, sort, kind === 'comments' ? c.commentsTemplate : c.template)
+        const key = kind === 'commons' ? `${id}/${sort}` : kind === 'page' ? `page:${id}/${sort}/${after}` : `${kind}:${id}/${sort}`
+        const template = kind === 'comments' ? c.commentsTemplate : kind === 'page' ? c.pageTemplate : c.template
+        const url = upstreamUrl(c, id, sort, template, after)
         const out = await cached(c, ctx, key, () => fetchUpstream(c, url, auth), route)
         ;({ cacheState, reason, upstreamStatus } = out)
         resp = await serveCached(request, c, out)
@@ -277,7 +283,7 @@ export default {
         resp = await serveCached(request, c, out)
       }
     } else {
-      resp = json(404, { error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort=', '/v1/imgur?id=|image=', '/v1/comments?id=&sort='] })
+      resp = json(404, { error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort=', '/v1/imgur?id=|image=', '/v1/comments?id=&sort=', '/v1/page?id=&sort=&after='] })
     }
     log({ route, status: resp.status, cache: cacheState, reason, upstreamStatus: reason ? upstreamStatus : undefined, durationMs: Date.now() - started })
     return resp
