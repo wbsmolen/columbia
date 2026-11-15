@@ -1,0 +1,28 @@
+{
+	# TCP only: UDP 443 is closed, and the commons Worker passes response headers
+	# (an Alt-Svc h3 advert included) through to apps.
+	servers {
+		protocols h1 h2
+	}
+}
+
+# Public site. Certificates come over TLS-ALPN on 443 (port 80 is closed at the
+# VCN; Caddy falls back from the HTTP challenge on its own). The Workers'
+# EGRESS_RELAY_ORIGIN and EGRESS_COMMONS_ORIGIN both point here.
+{$EGRESS_HOST} {
+	@relay path /relay /ohttp-configs /health
+	handle @relay {
+		reverse_proxy relay:8080
+	}
+	handle {
+		reverse_proxy commons:8080
+	}
+}
+
+# Internal only (not published): the gateway's commons requests land here via
+# TARGET_REWRITES, and Caddy adds the origin-lock header commons requires.
+http://:8081 {
+	reverse_proxy commons:8080 {
+		header_up X-Azure-FDID {$REQUIRE_FDID}
+	}
+}
