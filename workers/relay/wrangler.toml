@@ -1,0 +1,20 @@
+name = "columbia-relay"
+main = "index.js"
+compatibility_date = "2026-11-01"
+workers_dev = true
+preview_urls = false
+
+[vars]
+TRUSTED_CLIENT_IP_HEADER = "x-azure-socketip"
+
+[[services]]
+binding = "GATEWAY"
+service = "columbia-gateway"
+
+[[ratelimits]]
+name = "RELAY_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 120, period = 60 }
+
+[observability]
+enabled = true
