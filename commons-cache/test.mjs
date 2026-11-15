@@ -46,6 +46,9 @@ const mock = http.createServer((req, res) => {
     } else if (req.url.includes('redirectmissing')) {
       res.writeHead(308);
       res.end();
+    } else if (req.url.includes('gonesub')) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ message: 'upstream secret text', error: 404 }));
     } else if (req.url.includes('rsssub')) {
       res.writeHead(200, { 'Content-Type': 'application/rss+xml' });
       res.end(RSS_PAYLOAD);
@@ -83,6 +86,11 @@ const imgurMock = http.createServer((req, res) => {
   }
   if (req.url.startsWith('/3/image/')) {
     const id = req.url.slice('/3/image/'.length);
+    if (id === 'goneimg') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, status: 404, data: { error: 'imgur secret text' } }));
+      return;
+    }
     if (id === 'ratelimited') {
       res.writeHead(429, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: false, status: 429, data: { error: 'imgur throttled you' } }));
@@ -335,7 +343,24 @@ try {
     console.log('ok  (p) /v1/comments cached per (id, sort) under its own template');
   }
 
-  console.log('PASS: all commons-cache self-tests passed (a-q)');
+  // (r) a deleted post or image (upstream 404) answers 404, not a 5xx outage:
+  //     no-store, fixed body, logged as not_found; other failures stay 502 (j, n, p).
+  for (const path of ['/v1/comments?id=gonesub&sort=best', '/v1/commons?id=gonesub&sort=hot', '/v1/imgur?image=goneimg']) {
+    const captured = [];
+    process.stdout.write = (chunk, ...rest) => { captured.push(String(chunk)); return realWrite(chunk, ...rest); };
+    let res;
+    try { res = await fetch(base + path); } finally { process.stdout.write = realWrite; }
+    assert.equal(res.status, 404, `r: ${path} -> 404`);
+    assert.equal(res.headers.get('cache-control'), 'no-store', `r: ${path} no-store`);
+    const body = await res.text();
+    assert.deepEqual(JSON.parse(body), { error: 'not found' }, `r: ${path} fixed body`);
+    assert.ok(!/secret/.test(body + captured.join('')), `r: ${path} upstream text never leaks`);
+    const row = captured.map((l) => { try { return JSON.parse(l); } catch { return null; } }).find((l) => l?.status === 404);
+    assert.equal(row?.reason, 'not_found', `r: ${path} logged as not_found`);
+  }
+  console.log('ok  (r) upstream 404 -> 404 not_found');
+
+  console.log('PASS: all commons-cache self-tests passed (a-r)');
 } catch (err) {
   failed = true;
   console.error('FAIL:', err.message);

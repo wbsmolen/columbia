@@ -142,6 +142,11 @@ function upstreamFailure(status, error) {
   return error ? 'network' : 'other';
 }
 
+// A deleted post or image (upstream 404) is the client's answer, not an outage:
+// 404 keeps it out of the 5xx monitor. Every other failure stays a fixed 502.
+const failureStatus = (reason) => (reason === 'not_found' ? 404 : 502);
+const failureBody = (status) => ({ error: status === 404 ? 'not found' : 'upstream unavailable' });
+
 // A redirect remains an upstream failure: never follow Location, including a
 // same-origin first hop that could redirect again to a private address. Retain
 // only this fixed category for operations; never log the target URL or host.
@@ -508,15 +513,15 @@ const server = http.createServer(async (req, res) => {
           failureReason = out.reason;
           failureUpstreamStatus = out.upstreamStatus;
           failureRedirectTarget = out.redirectTarget;
-          // Fixed 502 - never leak upstream status, body, or error text.
-          status = 502;
+          // Fixed 404 (deleted/missing upstream) or 502 - never leak upstream body or error text.
+          status = failureStatus(out.reason);
           res.writeHead(status, {
             'Content-Type': 'application/json',
             'X-Cache': cacheState,
             'X-Content-Type-Options': 'nosniff',
             'Cache-Control': 'no-store',
           });
-          res.end(JSON.stringify({ error: 'upstream unavailable' }));
+          res.end(JSON.stringify(failureBody(status)));
         } else {
           status = 200;
           const ageS = out.fetchedAt ? Math.max(0, Math.floor((Date.now() - out.fetchedAt) / 1000)) : 0;
@@ -555,9 +560,9 @@ const server = http.createServer(async (req, res) => {
           failureReason = out.reason;
           failureUpstreamStatus = out.upstreamStatus;
           failureRedirectTarget = out.redirectTarget;
-          status = 502; // fixed - never leak imgur status/body/error text
+          status = failureStatus(out.reason); // fixed 404/502 - never leak imgur body/error text
           res.writeHead(status, { 'Content-Type': 'application/json', 'X-Cache': cacheState, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' });
-          res.end(JSON.stringify({ error: 'upstream unavailable' }));
+          res.end(JSON.stringify(failureBody(status)));
         } else {
           status = 200;
           const ageS = out.fetchedAt ? Math.max(0, Math.floor((Date.now() - out.fetchedAt) / 1000)) : 0;
