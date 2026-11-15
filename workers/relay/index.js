@@ -24,10 +24,22 @@ async function rateLimited(request, env) {
   return !success
 }
 
-async function forward(env, path, init, route, start) {
+// Reddit rate-limits Cloudflare's shared egress IPs, so while EGRESS_RELAY_ORIGIN is
+// set this Worker hands requests to a relay with its own egress (Azure today),
+// passing Front Door's origin-lock header and the real client IP for its rate limit.
+async function viaEgressRelay(env, request, path, init) {
+  const headers = new Headers(init.headers || {})
+  headers.set('x-azure-fdid', env.REQUIRE_FDID || '')
+  headers.set('x-azure-socketip', request.headers.get('cf-connecting-ip') || '')
+  return fetch(`${env.EGRESS_RELAY_ORIGIN}${path === '/gateway' ? '/relay' : path}`, { ...init, headers, signal: AbortSignal.timeout(GW_TIMEOUT_MS) })
+}
+
+async function forward(env, path, init, route, start, request) {
   let resp
   try {
-    resp = await env.GATEWAY.fetch(`https://gateway.internal${path}`, { ...init, signal: AbortSignal.timeout(GW_TIMEOUT_MS) })
+    resp = env.EGRESS_RELAY_ORIGIN && request
+      ? await viaEgressRelay(env, request, path, init)
+      : await env.GATEWAY.fetch(`https://gateway.internal${path}`, { ...init, signal: AbortSignal.timeout(GW_TIMEOUT_MS) })
   } catch (e) {
     const timeout = e?.name === 'TimeoutError'
     log({ route, status: timeout ? 504 : 502, reason: timeout ? 'gw_timeout' : 'gw_error', code: e?.name, durationMs: Date.now() - start })
@@ -53,7 +65,7 @@ export default {
     if (request.method === 'GET' && pathname === '/health') return new Response('ok')
     if (!fdidAllowed(request, env)) return new Response(null, { status: 403 })
     if (request.method === 'GET' && pathname === '/ohttp-configs') {
-      return forward(env, '/ohttp-configs', { method: 'GET' }, '/ohttp-configs', start)
+      return forward(env, '/ohttp-configs', { method: 'GET' }, '/ohttp-configs', start, request)
     }
     if (!(request.method === 'POST' && pathname === '/relay')) return new Response(null, { status: 404 })
     const ctype = (request.headers.get('content-type') || '').split(';')[0].trim().toLowerCase()
@@ -77,7 +89,7 @@ export default {
     }
     const headers = { 'content-type': 'message/ohttp-req' }
     if (env.RELAY_GATEWAY_SECRET) headers['x-columbia-relay-auth'] = env.RELAY_GATEWAY_SECRET
-    const resp = await forward(env, '/gateway', { method: 'POST', headers, body }, '/relay', start)
+    const resp = await forward(env, '/gateway', { method: 'POST', headers, body }, '/relay', start, request)
     if (resp.status === 200) return new Response(resp.body, { status: 200, headers: { 'content-type': 'message/ohttp-res' } })
     return resp
   }
