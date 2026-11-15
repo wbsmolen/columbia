@@ -203,6 +203,9 @@ async function viaEgressCommons(request, env, u) {
   headers.set('x-azure-fdid', env.REQUIRE_FDID || '')
   headers.set('x-azure-socketip', request.headers.get('cf-connecting-ip') || '')
   const resp = await fetch(`${env.EGRESS_COMMONS_ORIGIN}${u.pathname}${u.search}`, { method: request.method, headers, signal: AbortSignal.timeout(15000) })
+  // Cloudflare replaces an origin's 502 body with its own HTML page; answer the way
+  // commons does so clients see the same JSON.
+  if (resp.status === 502) return json(502, { error: 'upstream unavailable' }, { 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' })
   return new Response(resp.body, { status: resp.status, headers: resp.headers, encodeBody: resp.headers.get('content-encoding') ? 'manual' : 'automatic' })
 }
 
