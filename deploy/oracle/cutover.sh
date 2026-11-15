@@ -5,6 +5,7 @@
 #
 #   ./cutover.sh check           canary: call the Oracle origin the way the Workers do. Changes nothing.
 #   ./cutover.sh deploy          check, point both Workers at Oracle, deploy, verify; rolls back on failure
+#   ./cutover.sh verify          after a deploy: probe through the public hosts, confirm Oracle served it
 #   ./cutover.sh rollback        redeploy with the origins that were live before the last deploy (Azure today)
 #   ./cutover.sh rollback none   redeploy with no egress origin: the Workers use Cloudflare's own IPs
 #   DRY_RUN=1 ./cutover.sh deploy   bundle with `wrangler deploy --dry-run`; nothing goes live
@@ -144,5 +145,5 @@ case ${1:-} in
   deploy) deploy ;;
   verify) verify ;;
   rollback) rollback "${2:-}" ;;
-  *) sed -n '3,14p' "$0"; exit 2 ;;
+  *) sed -n '3,14p' "$0" | grep '^#'; exit 2 ;;
 esac

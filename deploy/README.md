@@ -27,6 +27,12 @@ The shape it follows is portable to any host:
    Apple App Attest inputs, any shared secrets) from the host's secret store at
    runtime. Nothing secret is baked into an image or committed to this repo.
 
+## Oracle Cloud egress (one example)
+
+[`oracle/`](oracle/README.md) runs the relay, gateway and commons cache on one
+Oracle Cloud Always Free VM behind Caddy, as the Reddit-facing egress for the
+Cloudflare Workers. It covers provisioning, secrets, DNS and cutover.
+
 ## Non-collusion
 
 Whatever host you pick, the operator-blind guarantee holds only when the relay and
