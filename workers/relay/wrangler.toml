@@ -5,6 +5,7 @@ workers_dev = true
 preview_urls = false
 
 [vars]
+EGRESS_RELAY_ORIGIN = "https://lander-mw-ohttp-relay.redwave-3ead07a8.eastus2.azurecontainerapps.io"
 TRUSTED_CLIENT_IP_HEADER = "x-azure-socketip"
 
 [[services]]
