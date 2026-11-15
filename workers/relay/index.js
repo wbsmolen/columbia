@@ -34,12 +34,43 @@ async function viaEgressRelay(env, request, path, init) {
   return fetch(`${env.EGRESS_RELAY_ORIGIN}${path === '/gateway' ? '/relay' : path}`, { ...init, headers, signal: AbortSignal.timeout(GW_TIMEOUT_MS) })
 }
 
+// If the egress relay is down (Azure credit lapsed, outage), send traffic through the
+// gateway binding instead: Cloudflare's IPs draw more Reddit 429s, but requests keep
+// flowing. A POST falls back only when the egress provably never reached its gateway
+// (connection error, 502/503, a platform error page), so a write is never sent twice.
+// The breaker skips the egress for a minute per isolate so each request doesn't pay
+// for the failure. ponytail: per-isolate breaker; a shared one needs KV or a DO.
+const EGRESS_COOLDOWN_MS = 60000
+let egressDownUntil = 0
+export function egressUnavailable(resp) {
+  if (resp.status === 502 || resp.status === 503) return true
+  return resp.status >= 400 && (resp.headers.get('content-type') || '').includes('text/html')
+}
+
+async function viaEgressOrNull(env, request, path, init, route) {
+  try {
+    const resp = await viaEgressRelay(env, request, path, init)
+    if (!egressUnavailable(resp)) return resp
+    log({ route, reason: 'egress_unavailable', egressStatus: resp.status })
+  } catch (e) {
+    const timeout = e?.name === 'TimeoutError'
+    log({ route, reason: timeout ? 'egress_timeout' : 'egress_error', code: e?.name })
+    egressDownUntil = Date.now() + EGRESS_COOLDOWN_MS
+    // A timed-out write may have reached Reddit; only reads retry elsewhere.
+    if (timeout && init.method !== 'GET') throw e
+    return null
+  }
+  egressDownUntil = Date.now() + EGRESS_COOLDOWN_MS
+  return null
+}
+
 async function forward(env, path, init, route, start, request) {
   let resp
   try {
-    resp = env.EGRESS_RELAY_ORIGIN && request
-      ? await viaEgressRelay(env, request, path, init)
-      : await env.GATEWAY.fetch(`https://gateway.internal${path}`, { ...init, signal: AbortSignal.timeout(GW_TIMEOUT_MS) })
+    if (env.EGRESS_RELAY_ORIGIN && request && Date.now() >= egressDownUntil) {
+      resp = await viaEgressOrNull(env, request, path, init, route)
+    }
+    resp ??= await env.GATEWAY.fetch(`https://gateway.internal${path}`, { ...init, signal: AbortSignal.timeout(GW_TIMEOUT_MS) })
   } catch (e) {
     const timeout = e?.name === 'TimeoutError'
     log({ route, status: timeout ? 504 : 502, reason: timeout ? 'gw_timeout' : 'gw_error', code: e?.name, durationMs: Date.now() - start })
