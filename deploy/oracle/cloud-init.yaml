@@ -1,0 +1,13 @@
+#cloud-config
+# Columbia egress VM (Ubuntu 24.04 aarch64, OCI A1). Installs Docker and checks out
+# the repo; secrets.sh then writes /etc/columbia/egress.env and starts compose.yaml
+# (Caddy + relay + gateway + commons). Docker's restart policy brings them back
+# after a reboot. up.sh fills in @COLUMBIA_REF@.
+package_update: true
+packages:
+  - docker.io
+  - docker-compose-v2
+  - git
+  - openssl
+runcmd:
+  - [git, clone, --branch, "@COLUMBIA_REF@", "https://github.com/wbsmolen/columbia.git", /opt/columbia]
