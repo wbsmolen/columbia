@@ -1,0 +1,16 @@
+{
+  "name": "columbia-issuer-worker",
+  "private": true,
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/blindrsa-ts": "0.4.6",
+    "@cloudflare/vitest-plugin": "1.8.2",
+    "vitest": "4.1.12",
+    "wrangler": "4.162.0"
+  }
+}
