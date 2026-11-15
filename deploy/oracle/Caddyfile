@@ -1,3 +1,11 @@
+{
+	# TCP only: UDP 443 is closed, and the commons Worker passes response headers
+	# (an Alt-Svc h3 advert included) through to apps.
+	servers {
+		protocols h1 h2
+	}
+}
+
 # Public site. Certificates come over TLS-ALPN on 443 (port 80 is closed at the
 # VCN; Caddy falls back from the HTTP challenge on its own). The Workers'
 # EGRESS_RELAY_ORIGIN and EGRESS_COMMONS_ORIGIN both point here.
