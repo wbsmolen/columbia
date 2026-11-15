@@ -172,7 +172,9 @@ const json = (status, obj, extra = {}) => new Response(JSON.stringify(obj), { st
 
 async function serveCached(request, c, out) {
   if (out.upstreamError) {
-    return json(502, { error: 'upstream unavailable' }, { 'X-Cache': out.cacheState, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' })
+    // A deleted post or image (upstream 404) is the client's answer, not an outage.
+    const notFound = out.reason === 'not_found'
+    return json(notFound ? 404 : 502, { error: notFound ? 'not found' : 'upstream unavailable' }, { 'X-Cache': out.cacheState, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' })
   }
   const ageS = out.fetchedAt ? Math.max(0, Math.floor((Date.now() - out.fetchedAt) / 1000)) : 0
   const encoded = await encodeForClient(request, out.body)
@@ -272,7 +274,7 @@ export default {
     } else {
       resp = json(404, { error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort=', '/v1/imgur?id=|image=', '/v1/comments?id=&sort='] })
     }
-    log({ route, status: resp.status, cache: cacheState, reason: resp.status >= 500 ? reason : undefined, upstreamStatus: resp.status >= 500 ? upstreamStatus : undefined, durationMs: Date.now() - started })
+    log({ route, status: resp.status, cache: cacheState, reason, upstreamStatus: reason ? upstreamStatus : undefined, durationMs: Date.now() - started })
     return resp
   },
 }
