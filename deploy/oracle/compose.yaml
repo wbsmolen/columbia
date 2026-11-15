@@ -1,0 +1,82 @@
+# Columbia's Reddit-facing egress on one VM: relay + gateway + commons, configured
+# like the Azure container apps they replace. Caddy is the only published port: it
+# terminates TLS for EGRESS_HOST and routes /relay, /ohttp-configs and /health to the
+# relay and everything else (/v1/*) to commons. The relay and commons only accept
+# requests carrying x-azure-fdid = REQUIRE_FDID, which the Cloudflare Workers send.
+#
+# Secrets come from --env-file /etc/columbia/egress.env (written by secrets.sh);
+# compose refuses to start without them, so the gateway can never come up on a
+# random key. The gateway's internal TLS cert/key live in CERT_DIR on the host.
+name: columbia-egress
+
+x-service: &service
+  restart: unless-stopped
+  logging:
+    driver: local # rotated: 5 x 20 MB per container
+
+services:
+  caddy:
+    <<: *service
+    image: caddy:2
+    ports:
+      - "${EGRESS_HTTPS_PORT:-443}:443"
+    environment:
+      EGRESS_HOST: ${EGRESS_HOST:-egress.landerapp.xyz}
+      REQUIRE_FDID: ${REQUIRE_FDID:?run secrets.sh}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+
+  relay:
+    <<: *service
+    build: ../../ohttp-relay
+    environment:
+      GATEWAY_URL: https://gateway:8443/gateway
+      GATEWAY_CONFIGS_URL: https://gateway:8443/ohttp-configs
+      NODE_EXTRA_CA_CERTS: /certs/gateway.crt
+      RELAY_GATEWAY_SECRET: ${RELAY_GATEWAY_SECRET:?run secrets.sh}
+      REQUIRE_FDID: ${REQUIRE_FDID:?run secrets.sh}
+      RATE_LIMIT_RPM: "120"
+      # Set by the Workers to the app's address; trusted only because the FDID passed.
+      TRUSTED_CLIENT_IP_HEADER: x-azure-socketip
+      ISSUER_KEYS_URL: https://issuer.landerapp.xyz/issuer-keys
+    volumes:
+      - ${CERT_DIR:-/etc/columbia}/gateway.crt:/certs/gateway.crt:ro
+
+  gateway:
+    <<: *service
+    build: ../../ohttp-gateway
+    environment:
+      PORT: "8443"
+      CERT: /certs/gateway.crt
+      KEY: /certs/gateway.key
+      SEED_SECRET_KEY: ${SEED_SECRET_KEY:?run secrets.sh}
+      RELAY_GATEWAY_SECRET: ${RELAY_GATEWAY_SECRET:?run secrets.sh}
+      ALLOWED_TARGET_ORIGINS: lander-mw-commons-fpdvd7eearhkewap.z03.azurefd.net,commons.landerapp.xyz,oauth.reddit.com,matrix.redditspace.com
+      # Commons requests stay on this VM: Caddy's internal :8081 adds the FDID header.
+      # The Front Door host keeps working after Azure is gone.
+      TARGET_REWRITES: >-
+        {"commons.landerapp.xyz":{"Scheme":"http","Host":"caddy:8081"},
+        "lander-mw-commons-fpdvd7eearhkewap.z03.azurefd.net":{"Scheme":"http","Host":"caddy:8081"}}
+      LOG_FORMAT: json
+      ECHO_ENDPOINT: ""
+      METADATA_ENDPOINT: ""
+    volumes:
+      - ${CERT_DIR:-/etc/columbia}/gateway.crt:/certs/gateway.crt:ro
+      - ${CERT_DIR:-/etc/columbia}/gateway.key:/certs/gateway.key:ro
+
+  commons:
+    <<: *service
+    build: ../../commons-cache
+    environment:
+      LOG_FORMAT: json
+      UPSTREAM_BASE: https://oauth.reddit.com
+      UPSTREAM_PATH_TEMPLATE: "/r/{id}/{sort}?raw_json=1&limit=25&sr_detail=true"
+      FORWARD_UPSTREAM_AUTH: "true"
+      COMMONS_TTL_MS: "300000"
+      COMMONS_SWR_MS: "300000"
+      REQUIRE_FDID: ${REQUIRE_FDID:?run secrets.sh}
+      IMGUR_CLIENT_ID: ${IMGUR_CLIENT_ID:-}
+
+volumes:
+  caddy-data:
