@@ -72,6 +72,7 @@ services:
       LOG_FORMAT: json
       UPSTREAM_BASE: https://oauth.reddit.com
       UPSTREAM_PATH_TEMPLATE: "/r/{id}/{sort}?raw_json=1&limit=25&sr_detail=true"
+      PAGE_PATH_TEMPLATE: "/r/{id}/{sort}?raw_json=1&limit=100&sr_detail=true&after={after}"
       FORWARD_UPSTREAM_AUTH: "true"
       COMMONS_TTL_MS: "300000"
       COMMONS_SWR_MS: "300000"

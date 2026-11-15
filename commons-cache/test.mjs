@@ -70,6 +70,7 @@ const mockPort = mock.address().port;
 // --- configure + load the real server (env MUST be set before import) ---
 process.env.UPSTREAM_BASE = `http://127.0.0.1:${mockPort}`;
 process.env.UPSTREAM_PATH_TEMPLATE = '/{id}/{sort}';
+process.env.PAGE_PATH_TEMPLATE = '/{id}/{sort}?limit=100&after={after}';
 process.env.FORWARD_UPSTREAM_AUTH = 'true';
 process.env.COMMONS_TTL_MS = '60000'; // keep HITs fresh through the whole test
 
@@ -360,7 +361,30 @@ try {
   }
   console.log('ok  (r) upstream 404 -> 404 not_found');
 
-  console.log('PASS: all commons-cache self-tests passed (a-r)');
+  // (s) /v1/page: a later page is keyed by the post it follows and shared by every
+  //     reader of that cursor; a bad cursor is a 400 that never reaches upstream.
+  {
+    upstreamHits = 0;
+    const first = await get('/v1/page?id=pagesub&sort=hot&after=t3_abc123');
+    assert.equal(first.status, 200, 's: page MISS fetches upstream');
+    assert.equal(first.xcache, 'MISS');
+    assert.equal(lastPath, '/pagesub/hot?limit=100&after=t3_abc123', `s: page template drives the upstream path: ${lastPath}`);
+    const second = await get('/v1/page?id=pagesub&sort=hot&after=t3_abc123', { authorization: 'Bearer other' });
+    assert.equal(second.xcache, 'HIT', 's: a second reader of the cursor is served from the cache');
+    const next = await get('/v1/page?id=pagesub&sort=hot&after=t3_def456');
+    assert.equal(next.xcache, 'MISS', 's: another cursor is another page');
+    const firstPage = await get('/v1/commons?id=pagesub&sort=hot');
+    assert.equal(firstPage.xcache, 'MISS', 's: page 1 is its own key');
+    assert.equal(upstreamHits, 3);
+    for (const bad of ['after=', 'after=t1_abc', 'after=t3_ABC', 'after=t3_abc%26limit%3D1']) {
+      const res = await get(`/v1/page?id=pagesub&sort=hot&${bad}`);
+      assert.equal(res.status, 400, `s: ${bad} -> 400`);
+    }
+    assert.equal(upstreamHits, 3, 's: a rejected cursor never reaches upstream');
+    console.log('ok  (s) /v1/page cached per (id, sort, after); bad cursors are 400');
+  }
+
+  console.log('PASS: all commons-cache self-tests passed (a-s)');
 } catch (err) {
   failed = true;
   console.error('FAIL:', err.message);

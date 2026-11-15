@@ -51,6 +51,11 @@ const UPSTREAM_PATH_TEMPLATE = process.env.UPSTREAM_PATH_TEMPLATE || '/{id}/{sor
 // (id, sort) serves every client that opens the same thread within the TTL,
 // so a hot thread no longer costs the shared credential one call per reader.
 const COMMENTS_PATH_TEMPLATE = process.env.COMMENTS_PATH_TEMPLATE || '/comments/{id}?sort={sort}&raw_json=1';
+// A later listing page: {after} is the post it follows (validated `t3_` id). Every
+// reader of a shared page 1 follows the same cursor, so later pages share too.
+// Unset = no /v1/page route (clients fall back to reading the page themselves).
+const PAGE_PATH_TEMPLATE = process.env.PAGE_PATH_TEMPLATE || '';
+const AFTER_RE = /^t3_[a-z0-9]{1,13}$/;
 const UPSTREAM_UA = process.env.UPSTREAM_UA ||
   'columbia-commons/1.0 (+https://example.com)';
 const MAX_ENTRIES = parseInt(process.env.COMMONS_MAX_ENTRIES || '5000', 10);     // cache bound (LRU)
@@ -112,7 +117,7 @@ const cache = new Map();
 
 function safeLogFields(fields) {
   const safe = {};
-  if (fields.route !== undefined) safe.route = ['/health', '/v1/commons', '/v1/comments', '/v1/imgur', '/v1/probe'].includes(fields.route) ? fields.route : 'other';
+  if (fields.route !== undefined) safe.route = ['/health', '/v1/commons', '/v1/comments', '/v1/page', '/v1/imgur', '/v1/probe'].includes(fields.route) ? fields.route : 'other';
   if (fields.method !== undefined) safe.method = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].includes(fields.method) ? fields.method : 'other';
   if (Number.isInteger(fields.status) && fields.status >= 100 && fields.status <= 599) safe.status = fields.status;
   if (Number.isFinite(fields.durationMs)) safe.durationMs = Math.max(0, Math.round(fields.durationMs));
@@ -275,10 +280,11 @@ async function fetchUpstream(url, authHeader) {
 // UPSTREAM_PATH_TEMPLATE so the upstream layout is config, not code. id/sort are
 // already sanitized by the caller; we percent-encode each before substituting so
 // the template controls structure only and can never be used for path injection.
-function upstreamUrl(id, sort, template = UPSTREAM_PATH_TEMPLATE) {
+function upstreamUrl(id, sort, template = UPSTREAM_PATH_TEMPLATE, after = '') {
   const path = template
     .replace(/\{id\}/g, encodeURIComponent(id))
-    .replace(/\{sort\}/g, encodeURIComponent(sort));
+    .replace(/\{sort\}/g, encodeURIComponent(sort))
+    .replace(/\{after\}/g, encodeURIComponent(after));
   return `${UPSTREAM_BASE}${path.startsWith('/') ? '' : '/'}${path}`;
 }
 
@@ -292,10 +298,11 @@ const inflight = new Map();
 // FORWARD_UPSTREAM_AUTH is enabled; it is NEVER part of the cache key. A HIT below
 // returns before any fetch, so a cached (shared, public) response is served without
 // touching the upstream and without requiring the caller to present a credential.
-async function getCachedFeed(id, sort, authHeader, kind = 'commons') {
-  // Threads live under their own keys; feed keys are unchanged.
-  const key = kind === 'commons' ? `${id}/${sort}` : `${kind}:${id}/${sort}`;
-  const url = upstreamUrl(id, sort, kind === 'comments' ? COMMENTS_PATH_TEMPLATE : UPSTREAM_PATH_TEMPLATE);
+async function getCachedFeed(id, sort, authHeader, kind = 'commons', after = '') {
+  // Threads and later pages live under their own keys; feed keys are unchanged.
+  const key = kind === 'commons' ? `${id}/${sort}` : kind === 'page' ? `page:${id}/${sort}/${after}` : `${kind}:${id}/${sort}`;
+  const template = kind === 'comments' ? COMMENTS_PATH_TEMPLATE : kind === 'page' ? PAGE_PATH_TEMPLATE : UPSTREAM_PATH_TEMPLATE;
+  const url = upstreamUrl(id, sort, template, after);
   const now = Date.now();
   const entry = cache.get(key);
 
@@ -495,19 +502,20 @@ const server = http.createServer(async (req, res) => {
       status = 200;
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ note: 'upstream-surface reachability from this host: status, size, and latency', results }, null, 2));
-    } else if (route === '/v1/commons' || route === '/v1/comments') {
-      const kind = route === '/v1/comments' ? 'comments' : 'commons';
+    } else if (route === '/v1/commons' || route === '/v1/comments' || (route === '/v1/page' && PAGE_PATH_TEMPLATE)) {
+      const kind = route === '/v1/comments' ? 'comments' : route === '/v1/page' ? 'page' : 'commons';
       const id = (u.searchParams.get('id') || '').replace(/[^A-Za-z0-9_]/g, '');
       const sort = (u.searchParams.get('sort') || 'latest').toLowerCase();
-      if (!id || !SORT_RE.test(sort)) {
+      const after = kind === 'page' ? u.searchParams.get('after') || '' : '';
+      if (!id || !SORT_RE.test(sort) || (kind === 'page' && !AFTER_RE.test(after))) {
         status = 400;
         res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `require ?id=<${kind === 'comments' ? 'item' : 'feed'}-id>&sort=<sort>` }));
+        res.end(JSON.stringify({ error: `require ?id=<${kind === 'comments' ? 'item' : 'feed'}-id>&sort=<sort>${kind === 'page' ? '&after=<t3_id>' : ''}` }));
       } else {
         // Forward the caller's credential only on a fetch (MISS/revalidate) and only
         // when enabled; a HIT never reaches the upstream so it needs no credential.
         const authHeader = FORWARD_UPSTREAM_AUTH ? (req.headers['authorization'] || undefined) : undefined;
-        const out = await getCachedFeed(id, sort, authHeader, kind);
+        const out = await getCachedFeed(id, sort, authHeader, kind, after);
         cacheState = out.cacheState;
         if (out.upstreamError) {
           failureReason = out.reason;
@@ -581,7 +589,7 @@ const server = http.createServer(async (req, res) => {
       }
     } else {
       res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort=', '/v1/imgur?id=', '/v1/imgur?image='] }));
+      res.end(JSON.stringify({ error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort=', '/v1/imgur?id=', '/v1/imgur?image=', ...(PAGE_PATH_TEMPLATE ? ['/v1/page?id=&sort=&after='] : [])] }));
     }
   } catch {
     // Fixed 500 - never place exception text into the response body.
