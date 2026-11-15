@@ -32,6 +32,7 @@ cleanup() {
   rm -rf "$TMP"
 }
 trap cleanup EXIT
+if [ -n "${DRY_RUN:-}" ]; then cp "$RELAY_TOML" "$TMP/relay.toml"; cp "$COMMONS_TOML" "$TMP/commons.toml"; fi
 
 FAILED=
 ok() { echo "  ok    $*"; }
@@ -113,6 +114,7 @@ deploy_workers() {
 rollback() {
   local r='' c=''
   if [ "${1:-}" != none ]; then
+    [ -f "$OPS/cutover-previous.env" ] || { echo "no $OPS/cutover-previous.env; use: $0 rollback none" >&2; exit 1; }
     # shellcheck disable=SC1091
     . "$OPS/cutover-previous.env"; r=$PREV_RELAY_ORIGIN c=$PREV_COMMONS_ORIGIN
   fi
@@ -125,7 +127,6 @@ deploy() {
     [ -n "${DRY_RUN:-}" ] || { echo "canary failed: not deploying" >&2; exit 1; }
     echo "canary failed (dry run: carrying on)"
   fi
-  if [ -n "${DRY_RUN:-}" ]; then cp "$RELAY_TOML" "$TMP/relay.toml"; cp "$COMMONS_TOML" "$TMP/commons.toml"; fi
   local r c; r=$(origin_of EGRESS_RELAY_ORIGIN "$RELAY_TOML") c=$(origin_of EGRESS_COMMONS_ORIGIN "$COMMONS_TOML")
   if [ "$r" != "$ORIGIN" ] && [ -z "${DRY_RUN:-}" ]; then
     (umask 077; printf 'PREV_RELAY_ORIGIN=%q\nPREV_COMMONS_ORIGIN=%q\n' "$r" "$c" >"$OPS/cutover-previous.env")
@@ -143,5 +144,5 @@ case ${1:-} in
   deploy) deploy ;;
   verify) verify ;;
   rollback) rollback "${2:-}" ;;
-  *) sed -n '2,13p' "$0"; exit 2 ;;
+  *) sed -n '3,14p' "$0"; exit 2 ;;
 esac

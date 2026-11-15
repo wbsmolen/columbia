@@ -51,9 +51,9 @@ push() {
   [ -n "${EGRESS_IP:-}" ] || . "$OPS/state.env"
   ssh -i "$OPS/ssh/id_ed25519" -o UserKnownHostsFile="$OPS/ssh/known_hosts" -o StrictHostKeyChecking=accept-new \
     "ubuntu@$EGRESS_IP" 'set -e
-      cloud-init status --wait >/dev/null || true
-      sudo install -d -m 700 /etc/columbia
-      sudo sh -c "umask 077; cat > /etc/columbia/egress.env"
+      cloud-init status --wait </dev/null >/dev/null || true
+      sudo install -d -m 700 /etc/columbia </dev/null
+      sudo sh -c "umask 077; cat > /etc/columbia/egress.env" # stdin: the local egress.env
       # The relay only talks https to the gateway; this cert never leaves the VM.
       sudo test -s /etc/columbia/gateway.key || sudo openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -nodes -days 3650 -subj /CN=gateway -addext subjectAltName=DNS:gateway \
