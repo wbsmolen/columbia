@@ -252,7 +252,10 @@ export function createIssuer(env, { now = Date.now } = {}) {
       const route = url.search ? null : path;
 
       // GET /health and GET /issuer-keys are exempt: public, and fetched in-environment.
-      if (REQUIRE_FDID && !(request.method === 'GET' && (path === '/health' || path === '/issuer-keys')) &&
+      // FDID_GATED_HOST_SUFFIX (e.g. ".workers.dev") limits the gate to the hostname Front
+      // Door uses; the custom domain serves apps directly. Unset gates every host.
+      const gatedHost = !env.FDID_GATED_HOST_SUFFIX || url.hostname.endsWith(env.FDID_GATED_HOST_SUFFIX);
+      if (REQUIRE_FDID && gatedHost && !(request.method === 'GET' && (path === '/health' || path === '/issuer-keys')) &&
           !frontDoorAllowed(request)) {
         log({ route: path, status: 403, durationMs: Date.now() - start });
         return empty(403);

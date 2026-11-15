@@ -11,6 +11,7 @@ workers_dev = true
 preview_urls = false
 
 [vars]
+FDID_GATED_HOST_SUFFIX = ".workers.dev"
 REQUIRE_DURABLE_STATE = "1"
 
 [[d1_databases]]
