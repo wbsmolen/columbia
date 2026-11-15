@@ -10,14 +10,25 @@ generate the gateway HPKE seed, build each service image, run the relay and gate
 under separate operators so the non-collusion property holds, and (optionally) add
 the commons cache and token issuer.
 
-## Reference automation (one example)
+## Cloudflare Workers
 
-[`.github/workflows/deploy-azure-reference.yml`](../.github/workflows/deploy-azure-reference.yml)
-is one example of automating a deployment, targeting Azure Container Apps. It is
-optional and not required to run Columbia. Use it as a template if you deploy on
-Azure, or adapt the same build-and-update steps to whatever container host you run.
+`workers/` is the Workers port: `columbia-relay`, `columbia-gateway`, `columbia-commons`
+and `columbia-issuer`. Deploy from a machine signed in to wrangler (`npx wrangler login`):
 
-The shape it follows is portable to any host:
+```sh
+cd workers && npm ci && (cd issuer && npm ci) && npm run deploy
+```
+
+That runs the Workers tests, then deploys commons, gateway and relay in binding order
+(relay calls gateway, gateway calls commons), then tests and deploys the issuer. Secrets
+are set once per Worker with `npx wrangler secret put` and are never committed.
+
+There is no deploy workflow. `.github/workflows/test.yml` only runs the unit tests on
+pull requests and on main.
+
+## Container hosts
+
+A container deployment follows the same shape on any host:
 
 1. Build each service image from its directory (`ohttp-relay/`, `ohttp-gateway/`,
    `commons-cache/`, `token-issuer/`).
