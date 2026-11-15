@@ -1,0 +1,41 @@
+# Unit tests on every pull request and push to main. GitHub-hosted runners are
+# free for public repositories, so this keeps working when the account's
+# Actions budget blocks private-repo jobs. Deploys are not here: the Workers
+# ship with `npm run deploy` in workers/ (see deploy/README.md).
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ohttp-gateway/go.mod
+      - run: go test ./...
+        working-directory: ohttp-gateway
+
+  node:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [ohttp-relay, token-issuer, commons-cache, workers, workers/issuer]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: npm test (node --test where there is no package.json)
+        working-directory: ${{ matrix.dir }}
+        run: |
+          if [ -f package-lock.json ]; then npm ci; fi
+          if [ -f package.json ]; then npm test; else node --test; fi
