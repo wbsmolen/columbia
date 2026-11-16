@@ -10,6 +10,8 @@ const ROUTES = ['/health', '/v1/commons', '/v1/comments', '/v1/page', '/v1/imgur
 const AFTER_RE = /^t3_[a-z0-9]{1,13}$/
 const MAX_ENTRIES = 5000
 const MAX_BODY_BYTES = 5000000
+// On an upstream 429/5xx a copy this young stands in for the error (stale-if-error).
+const STALE_IF_ERROR_MS = 2 * 60 * 60 * 1000
 
 const cache = new Map()
 const inflight = new Map()
@@ -57,6 +59,14 @@ function cacheSet(key, val) {
   cache.delete(key)
   cache.set(key, val)
   while (cache.size > MAX_ENTRIES) cache.delete(cache.keys().next().value)
+}
+
+// ponytail: per-isolate like the SWR cache, so a fresh isolate has no copy; the
+// Cache API on the custom domain would share copies across isolates if that matters.
+const refused = (status) => status === 429 || status >= 500 || status === 0
+function lastGood(key) {
+  const entry = cache.get(key)
+  return entry && Date.now() - entry.fetchedAt <= STALE_IF_ERROR_MS ? entry : null
 }
 
 async function readBounded(res) {
@@ -114,6 +124,8 @@ async function cached(c, ctx, key, fetcher, route) {
     if (isLeader) cacheSet(key, { ...val, revalidating: false })
     return { ...val, cacheState: isLeader ? 'MISS' : 'COALESCED' }
   }
+  const stale = refused(up.status) && lastGood(key)
+  if (stale) return { ...stale, cacheState: 'STALE-ERROR', upstreamStatus: up.status, reason: up.reason }
   return { cacheState: 'MISS', upstreamStatus: up.status, upstreamError: true, reason: up.reason }
 }
 
@@ -201,7 +213,7 @@ async function serveCached(request, c, out) {
 // Reddit rate-limits Cloudflare's shared egress IPs, so while EGRESS_COMMONS_ORIGIN is
 // set, app traffic on the custom domain is proxied to a commons with its own egress.
 let egressDownUntil = 0
-async function viaEgressCommons(request, env, u) {
+async function viaEgressCommons(request, env, c, u, key) {
   const headers = new Headers()
   for (const h of ['authorization', 'accept', 'accept-encoding', 'accept-language', 'user-agent']) {
     const v = request.headers.get(h)
@@ -210,18 +222,61 @@ async function viaEgressCommons(request, env, u) {
   headers.set('x-azure-fdid', env.REQUIRE_FDID || '')
   headers.set('x-azure-socketip', request.headers.get('cf-connecting-ip') || '')
   const resp = await fetch(`${env.EGRESS_COMMONS_ORIGIN}${u.pathname}${u.search}`, { method: request.method, headers, signal: AbortSignal.timeout(15000) })
-  // Cloudflare replaces an origin's 502 body with its own HTML page; answer the way
-  // commons does so clients see the same JSON.
+  // Anything that isn't commons answering (503, a platform error page) means the
+  // egress is down: null sends the request to this Worker's own commons, which has
+  // its own stale-if-error. Cloudflare swaps an origin's 502 body for HTML, so a 502
+  // is still commons answering.
+  if (resp.status === 503 || (resp.status !== 502 && resp.status >= 400 && (resp.headers.get('content-type') || '').includes('text/html'))) return null
+  // Commons answered but its Reddit fetch failed: the last good copy beats the error.
+  const stale = key && refused(resp.status) && lastGood(key)
+  if (stale) {
+    await resp.body?.cancel().catch(() => {})
+    log({ route: u.pathname, status: 200, cache: 'STALE-ERROR', phase: 'egress', upstreamStatus: resp.status })
+    return serveCached(request, c, { ...stale, cacheState: 'STALE-ERROR', upstreamStatus: resp.status })
+  }
+  // Answer the way commons does so clients see the same JSON.
   if (resp.status === 502) return json(502, { error: 'upstream unavailable' }, { 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' })
-  // Anything else that isn't commons answering (503, a platform error page) means the
-  // egress is down: null sends the request to this Worker's own commons.
-  if (resp.status === 503 || (resp.status >= 400 && (resp.headers.get('content-type') || '').includes('text/html'))) return null
   // fetch() already decompressed the egress's gzip, so the body is plain while the
   // headers still say gzip. 'automatic' re-encodes it to match; 'manual' sent plain
   // JSON labelled gzip, which URLSession can't read (seen from 2.3.15 and the watch).
   const out = new Headers(resp.headers)
   out.delete('content-length')
-  return new Response(resp.body, { status: resp.status, headers: out })
+  if (!key || resp.status !== 200) return new Response(resp.body, { status: resp.status, headers: out })
+  // Keep a good read as the last good copy, aged by commons' own Age header.
+  const body = new Uint8Array(await resp.arrayBuffer())
+  if (body.length <= MAX_BODY_BYTES) {
+    const ageMs = (Number(resp.headers.get('age')) || 0) * 1000
+    cacheSet(key, { body, contentType: safeContentType(resp.headers.get('content-type')), fetchedAt: Date.now() - ageMs, upstreamStatus: 200, revalidating: false })
+  }
+  return new Response(body, { status: 200, headers: out })
+}
+
+// A valid read's cache key and upstream fetcher, shared by the egress and own paths;
+// { error } for a bad query, null for any other route.
+function parseRead(c, u, request) {
+  const route = u.pathname
+  if (route === '/v1/commons' || route === '/v1/comments' || route === '/v1/page') {
+    const kind = route === '/v1/comments' ? 'comments' : route === '/v1/page' ? 'page' : 'commons'
+    const id = (u.searchParams.get('id') || '').replace(/[^A-Za-z0-9_]/g, '')
+    const sort = (u.searchParams.get('sort') || 'latest').toLowerCase()
+    const after = kind === 'page' ? u.searchParams.get('after') || '' : ''
+    if (!id || !SORT_RE.test(sort) || (kind === 'page' && !AFTER_RE.test(after))) {
+      return { error: `require ?id=<${kind === 'comments' ? 'item' : 'feed'}-id>&sort=<sort>${kind === 'page' ? '&after=<t3_id>' : ''}` }
+    }
+    const auth = c.forwardAuth ? request.headers.get('authorization') || undefined : undefined
+    const key = kind === 'commons' ? `${id}/${sort}` : kind === 'page' ? `page:${id}/${sort}/${after}` : `${kind}:${id}/${sort}`
+    const template = kind === 'comments' ? c.commentsTemplate : kind === 'page' ? c.pageTemplate : c.template
+    const url = upstreamUrl(c, id, sort, template, after)
+    return { key, fetcher: () => fetchUpstream(c, url, auth) }
+  }
+  if (route === '/v1/imgur') {
+    const id = (u.searchParams.get('id') || '').trim()
+    const image = (u.searchParams.get('image') || '').trim()
+    const valid = (id && !image && IMGUR_ID_RE.test(id)) || (image && !id && IMGUR_ID_RE.test(image))
+    if (!valid) return { error: 'require ?id=<imgur album id> or ?image=<imgur image id>' }
+    return id ? { key: `imgur/${id}`, fetcher: () => imgurAlbum(c, id) } : { key: `imgur-image/${image}`, fetcher: () => imgurImage(c, image) }
+  }
+  return null
 }
 
 export default {
@@ -229,12 +284,13 @@ export default {
     const started = Date.now()
     const c = cfg(env)
     const u = new URL(request.url)
+    const read = parseRead(c, u, request)
     // Reads only, so any egress failure can fall back to this Worker's own commons
     // (more Reddit 429s from Cloudflare IPs, but no outage). The breaker skips a dead
     // egress for a minute per isolate.
     if (env.EGRESS_COMMONS_ORIGIN && !u.hostname.endsWith('.workers.dev') && u.pathname !== '/health' && Date.now() >= egressDownUntil) {
       try {
-        const viaEgress = await viaEgressCommons(request, env, u)
+        const viaEgress = await viaEgressCommons(request, env, c, u, read?.key)
         if (viaEgress) return viaEgress
         log({ route: u.pathname, reason: 'egress_unavailable' })
       } catch (e) { log({ route: u.pathname, reason: 'egress_error', code: e?.name }) }
@@ -254,34 +310,12 @@ export default {
     } else if (route === '/v1/probe') {
       const up = await fetchUpstream(c, upstreamUrl(c, 'example', 'latest', c.template))
       resp = new Response(JSON.stringify({ note: 'upstream-surface reachability from this host: status, size, and latency', results: { commons: { status: up.status, bytes: up.body?.length || 0, ms: up.ms } } }, null, 2), { headers: { 'Content-Type': 'application/json' } })
-    } else if (route === '/v1/commons' || route === '/v1/comments' || route === '/v1/page') {
-      const kind = route === '/v1/comments' ? 'comments' : route === '/v1/page' ? 'page' : 'commons'
-      const id = (u.searchParams.get('id') || '').replace(/[^A-Za-z0-9_]/g, '')
-      const sort = (u.searchParams.get('sort') || 'latest').toLowerCase()
-      const after = kind === 'page' ? u.searchParams.get('after') || '' : ''
-      if (!id || !SORT_RE.test(sort) || (kind === 'page' && !AFTER_RE.test(after))) {
-        resp = json(400, { error: `require ?id=<${kind === 'comments' ? 'item' : 'feed'}-id>&sort=<sort>${kind === 'page' ? '&after=<t3_id>' : ''}` })
-      } else {
-        const auth = c.forwardAuth ? request.headers.get('authorization') || undefined : undefined
-        const key = kind === 'commons' ? `${id}/${sort}` : kind === 'page' ? `page:${id}/${sort}/${after}` : `${kind}:${id}/${sort}`
-        const template = kind === 'comments' ? c.commentsTemplate : kind === 'page' ? c.pageTemplate : c.template
-        const url = upstreamUrl(c, id, sort, template, after)
-        const out = await cached(c, ctx, key, () => fetchUpstream(c, url, auth), route)
-        ;({ cacheState, reason, upstreamStatus } = out)
-        resp = await serveCached(request, c, out)
-      }
-    } else if (route === '/v1/imgur') {
-      const id = (u.searchParams.get('id') || '').trim()
-      const image = (u.searchParams.get('image') || '').trim()
-      const valid = (id && !image && IMGUR_ID_RE.test(id)) || (image && !id && IMGUR_ID_RE.test(image))
-      if (!valid) {
-        resp = json(400, { error: 'require ?id=<imgur album id> or ?image=<imgur image id>' })
-      } else {
-        const out = id ? await cached(c, ctx, `imgur/${id}`, () => imgurAlbum(c, id), route)
-          : await cached(c, ctx, `imgur-image/${image}`, () => imgurImage(c, image), route)
-        ;({ cacheState, reason, upstreamStatus } = out)
-        resp = await serveCached(request, c, out)
-      }
+    } else if (read?.error) {
+      resp = json(400, { error: read.error })
+    } else if (read) {
+      const out = await cached(c, ctx, read.key, read.fetcher, route)
+      ;({ cacheState, reason, upstreamStatus } = out)
+      resp = await serveCached(request, c, out)
     } else {
       resp = json(404, { error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort=', '/v1/imgur?id=|image=', '/v1/comments?id=&sort=', '/v1/page?id=&sort=&after='] })
     }
