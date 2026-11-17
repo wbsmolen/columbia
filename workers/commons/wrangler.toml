@@ -5,7 +5,6 @@ workers_dev = true
 preview_urls = false
 
 [vars]
-EGRESS_COMMONS_ORIGIN = "https://lander-mw-commons.redwave-3ead07a8.eastus2.azurecontainerapps.io"
 UPSTREAM_BASE = "https://oauth.reddit.com"
 UPSTREAM_PATH_TEMPLATE = "/r/{id}/{sort}?raw_json=1&limit=25&sr_detail=true"
 FORWARD_UPSTREAM_AUTH = "true"
