@@ -7,7 +7,7 @@
     "deploy": "npm test && wrangler deploy -c commons/wrangler.toml && wrangler deploy -c gateway/wrangler.toml && wrangler deploy -c relay/wrangler.toml && cd issuer && npm test && npm run deploy"
   },
   "dependencies": {
-    "@hpke/core": "1.7.2"
+    "@hpke/core": "1.7.5"
   },
   "devDependencies": {
     "wrangler": "4.162.0"
