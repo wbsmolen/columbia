@@ -13,11 +13,10 @@ const HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'proxy-auth
 const STRIP_RESPONSE = new Set(['content-encoding', 'content-length', 'transfer-encoding', 'connection', 'keep-alive'])
 const UPSTREAM_TIMEOUT_MS = 30000
 
-let keyPromise
-const config = (env) => {
-  keyPromise ??= importPrivateKey(env.OHTTP_SK_HEX)
-  return keyPromise
-}
+// The imported key, not the import's promise, is shared: a Workers promise settles only in
+// the request that created it, so a shared import that request abandoned would never settle.
+let key
+const config = async (env) => (key ??= await importPrivateKey(env.OHTTP_SK_HEX))
 
 function log(fields) { console.log(JSON.stringify({ svc: 'gateway', ...fields })) }
 
