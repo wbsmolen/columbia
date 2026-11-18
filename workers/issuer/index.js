@@ -68,16 +68,20 @@ function timingSafeEqualStr(presented, expected) {
 export function d1DeviceBackend(db, { salt } = {}) {
   if (!db || !Buffer.isBuffer(salt) || salt.length < 32) throw Error('issuer_state_salt_required');
   const saltFingerprint = crypto.createHash('sha256').update(salt).digest('hex');
-  let ready;
-  function initialize() {
-    ready ??= (async () => {
+  // A flag, not a shared promise: a Workers promise settles only in the request that created
+  // it, so a readiness check that request abandoned would never settle for the others.
+  // Concurrent first requests each run the idempotent check.
+  let ready = false;
+  async function initialize() {
+    if (ready) return;
+    try {
       await db.batch([
         db.prepare('CREATE TABLE IF NOT EXISTS issuer_state (k TEXT PRIMARY KEY, state TEXT NOT NULL, rev INTEGER NOT NULL)'),
         db.prepare("INSERT INTO issuer_state (k, state, rev) VALUES ('config', ?, 1) ON CONFLICT (k) DO NOTHING").bind(saltFingerprint),
       ]);
       if (await db.prepare("SELECT state FROM issuer_state WHERE k = 'config'").first('state') !== saltFingerprint) throw new StateUnavailable();
-    })().catch(() => { ready = undefined; throw new StateUnavailable(); });
-    return ready;
+      ready = true;
+    } catch { throw new StateUnavailable(); }
   }
   async function read(key) {
     try {
