@@ -15,6 +15,7 @@ const STALE_IF_ERROR_MS = 2 * 60 * 60 * 1000
 
 const cache = new Map()
 const inflight = new Map()
+const FLIGHT_MAX_MS = 20000 // above the 10 s Reddit/imgur and 15 s egress fetch timeouts
 const bootedAt = Date.now()
 
 const cfg = (env) => ({
@@ -115,10 +116,29 @@ async function cached(c, ctx, key, fetcher, route) {
       return { ...entry, cacheState: 'STALE' }
     }
   }
-  let promise = inflight.get(key)
-  const isLeader = !promise
-  if (isLeader) { promise = fetcher().finally(() => inflight.delete(key)); inflight.set(key, promise) }
-  const up = await promise
+  // Coalescing across requests: a Workers promise settles only in the request that created it.
+  // When that request ends first (the client gave up), awaiting its flight throws "can never
+  // settle" and the flight never clears, so every later read of the key failed until the
+  // isolate restarted. A follower drops such a flight, and any flight older than the fetch
+  // timeouts, and fetches for itself.
+  let flight = inflight.get(key)
+  if (flight && now - flight.at > FLIGHT_MAX_MS) flight = null
+  let isLeader = !flight
+  if (isLeader) {
+    const mine = { at: now }
+    mine.promise = fetcher().finally(() => { if (inflight.get(key) === mine) inflight.delete(key) })
+    inflight.set(key, mine)
+    flight = mine
+  }
+  let up
+  try {
+    up = await flight.promise
+  } catch (error) {
+    if (isLeader) throw error
+    if (inflight.get(key) === flight) inflight.delete(key)
+    isLeader = true
+    up = await fetcher()
+  }
   if (up.status === 200 && !up.error) {
     const val = { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), upstreamStatus: 200 }
     if (isLeader) cacheSet(key, { ...val, revalidating: false })
