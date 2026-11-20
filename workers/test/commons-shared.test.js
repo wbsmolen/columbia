@@ -190,3 +190,10 @@ test('/health reports the tiers without secrets', async () => {
   assert.equal(body.ownCredential, true)
   assert.ok(!JSON.stringify(body).includes('sec'))
 })
+
+test('a multi-community id keeps its + (it read r/picsaww)', async () => {
+  const w = await isolate()
+  await get(w, {}, newCtx(), '/v1/commons?id=Pics%2BAww&sort=hot')
+  assert.equal(calls[0].url, 'https://oauth.reddit.com/r/pics+aww/hot?raw_json=1&limit=25&sr_detail=true')
+  assert.equal((await get(w, {}, newCtx(), '/v1/commons?id=pics%2Baww&sort=hot')).headers.get('x-cache'), 'HIT', 'one key whatever the case')
+})

@@ -248,7 +248,7 @@ async function fetchUpstream(c, url, auth, slot) {
 }
 
 const upstreamUrl = (c, id, sort, template, after = '') => {
-  const path = template.replace(/\{id\}/g, encodeURIComponent(id)).replace(/\{sort\}/g, encodeURIComponent(sort)).replace(/\{after\}/g, encodeURIComponent(after))
+  const path = template.replace(/\{id\}/g, encodeURIComponent(id).replace(/%2B/g, '+')).replace(/\{sort\}/g, encodeURIComponent(sort)).replace(/\{after\}/g, encodeURIComponent(after))
   return `${c.base}${path.startsWith('/') ? '' : '/'}${path}`
 }
 
@@ -468,7 +468,8 @@ function parseRead(c, env, u, request) {
   }
   if (route === '/v1/commons' || route === '/v1/comments' || route === '/v1/page') {
     const kind = route === '/v1/comments' ? 'comments' : route === '/v1/page' ? 'page' : 'commons'
-    const id = (u.searchParams.get('id') || '').replace(/[^A-Za-z0-9_]/g, '')
+    // `+` joins communities (r/pics+aww); dropping it used to read r/picsaww.
+    const id = (u.searchParams.get('id') || '').replace(/[^A-Za-z0-9_+]/g, '').toLowerCase()
     const sort = (u.searchParams.get('sort') || 'latest').toLowerCase()
     const after = kind === 'page' ? u.searchParams.get('after') || '' : ''
     if (!id || !SORT_RE.test(sort) || (kind === 'page' && !AFTER_RE.test(after))) {
