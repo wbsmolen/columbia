@@ -9,7 +9,18 @@ UPSTREAM_BASE = "https://oauth.reddit.com"
 UPSTREAM_PATH_TEMPLATE = "/r/{id}/{sort}?raw_json=1&limit=25&sr_detail=true"
 FORWARD_UPSTREAM_AUTH = "true"
 COMMONS_TTL_MS = "300000"
-COMMONS_SWR_MS = "300000"
+# A copy past TTL is served while one background read refreshes it, for up to 30 min.
+COMMONS_SWR_MS = "1500000"
 
 [observability]
 enabled = true
+
+# The shared tier: one copy per read for every isolate and colo (see index.js).
+[[kv_namespaces]]
+binding = "COMMONS_KV"
+id = "48fce71bbd2b47d79298abacf5bc80f2"
+
+# Optional, never in this file: Columbia's own Reddit credential, as secrets.
+#   npx wrangler secret put REDDIT_CLIENT_ID -c commons/wrangler.toml
+#   npx wrangler secret put REDDIT_CLIENT_SECRET -c commons/wrangler.toml   (web/script app only)
+# Without them, misses spend the caller's guest bearer, as before.

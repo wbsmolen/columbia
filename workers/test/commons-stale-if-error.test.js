@@ -1,5 +1,5 @@
 // Stale-if-error: when Reddit (or the egress commons) refuses a read with 429/5xx,
-// the last good copy up to 2 h old answers 200 with X-Cache: STALE-ERROR.
+// the last good copy up to 6 h old (COMMONS_STALE_IF_ERROR_MS) answers 200 with X-Cache: STALE-ERROR.
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import commons from '../commons/index.js'
@@ -24,7 +24,7 @@ const own = (path) => commons.fetch(new Request(`https://commons.landerapp.xyz${
 const viaEgress = (path) => commons.fetch(new Request(`https://commons.landerapp.xyz${path}`), { EGRESS_COMMONS_ORIGIN: 'https://egress.test' }, ctx)
 const atom = { 'content-type': 'application/atom+xml' }
 
-test('a refused Reddit read serves the last good copy, never one older than 2 h', async () => {
+test('a refused Reddit read serves the last good copy, never one older than 6 h', async () => {
   reddit = [200, 'good-1', atom]
   assert.equal((await own('/v1/commons?id=stale1&sort=hot')).headers.get('x-cache'), 'MISS')
   now += 11 * 60 * 1000 // past TTL + SWR, so every read goes upstream
@@ -36,10 +36,10 @@ test('a refused Reddit read serves the last good copy, never one older than 2 h'
     assert.equal(resp.headers.get('content-type'), 'application/atom+xml')
     assert.equal(await resp.text(), 'good-1')
   }
-  now += 2 * HOUR
+  now += 6 * HOUR
   reddit = [429, 'reddit error', {}]
   const old = await own('/v1/commons?id=stale1&sort=hot')
-  assert.equal(old.status, 502, 'a copy over 2 h old is not served')
+  assert.equal(old.status, 502, 'a copy over 6 h old is not served')
   assert.equal(old.headers.get('cache-control'), 'no-store')
 })
 
@@ -92,7 +92,7 @@ test('the egress path keeps its good reads and serves them when commons fails', 
   const fallback = await viaEgress('/v1/commons?id=stale3&sort=hot')
   assert.equal(fallback.headers.get('x-cache'), 'STALE-ERROR')
   assert.equal(await fallback.text(), 'egress-2')
-  // The egress copy is aged by its Age header (1 h at fetch): 1 h later it's too old.
-  now += HOUR + 1000
+  // The egress copy is aged by its Age header (1 h at fetch): 5 h later it's too old.
+  now += 5 * HOUR + 1000
   assert.equal((await viaEgress('/v1/commons?id=stale3&sort=hot')).status, 502)
 })

@@ -1,17 +1,37 @@
 // Columbia commons cache on Cloudflare Workers, ported from commons-cache/server.js.
 // Same routes, validation, upstream template, SWR semantics and response headers.
-// The cache is per isolate (in memory); the Cache API is not available on
-// workers.dev, and a per-isolate LRU matches the single Azure replica's design.
+// Two tiers: a per-isolate LRU (L1) and, when COMMONS_KV is bound, a KV copy every
+// isolate and colo shares (L2), so one Reddit read per key per TTL serves everyone,
+// not one per isolate. Every guest read Lander makes spends ONE Reddit bucket
+// (1000 requests / 600 s for the app's client ID), so the commons also watches that
+// bucket's headers and, when it runs low, serves the copy it has instead of spending
+// what readers with no copy need (STALE-BUDGET).
 const SORT_RE = /^[a-z]+$/
 const IMGUR_ID_RE = /^[A-Za-z0-9]{1,15}$/
 const ALLOWED_CONTENT_TYPES = new Set(['application/rss+xml', 'application/atom+xml', 'application/xml', 'text/xml', 'application/json'])
-const ROUTES = ['/health', '/v1/commons', '/v1/comments', '/v1/page', '/v1/imgur', '/v1/probe']
+const ROUTES = ['/health', '/v1/commons', '/v1/comments', '/v1/page', '/v1/imgur', '/v1/probe', '/v1/read']
 // A later listing page is keyed by the post it follows (Reddit's `after`).
 const AFTER_RE = /^t3_[a-z0-9]{1,13}$/
 const MAX_ENTRIES = 5000
 const MAX_BODY_BYTES = 5000000
-// On an upstream 429/5xx a copy this young stands in for the error (stale-if-error).
-const STALE_IF_ERROR_MS = 2 * 60 * 60 * 1000
+// /v1/read/<reddit path>?<query>: any other public read the app makes as the guest,
+// shared by every reader of the same path and query. Lowercased paths; no search and no
+// user pages (their keys would name what someone looked for).
+const READ_PATHS = [
+  /^\/(hot|new|top|rising|best|controversial)$/,
+  /^\/r\/[a-z0-9_+]{1,400}(\/(hot|new|top|rising|best|controversial))?$/,
+  /^\/r\/[a-z0-9_]{1,21}\/about(\/rules)?$/,
+  /^\/r\/[a-z0-9_]{1,21}\/wiki\/[a-z0-9_/-]{1,100}$/,
+  /^\/comments\/[a-z0-9]{1,13}$/,
+  /^\/by_id\/t3_[a-z0-9]{1,13}(,t3_[a-z0-9]{1,13}){0,99}$/,
+  /^\/duplicates\/[a-z0-9]{1,13}$/,
+  /^\/api\/morechildren$/,
+  /^\/subreddits\/popular$/,
+]
+const READ_PARAMS = new Set(['limit', 'after', 'before', 'count', 'sr_detail', 'raw_json', 't', 'g', 'sort', 'comment', 'context', 'depth', 'api_type', 'link_id', 'children', 'limit_children', 'show'])
+const READ_VALUE_RE = /^[A-Za-z0-9_,.-]{1,2000}$/
+// Community info, rules and wiki pages change rarely.
+const SLOW_READ_RE = /\/about(\/rules)?$|\/wiki\/|^\/subreddits\//
 
 const cache = new Map()
 const inflight = new Map()
@@ -30,11 +50,20 @@ const cfg = (env) => ({
   forwardAuth: /^(1|true|yes|on)$/i.test(env.FORWARD_UPSTREAM_AUTH || ''),
   imgurBase: (env.IMGUR_BASE || 'https://api.imgur.com').replace(/\/+$/, ''),
   imgurClientId: env.IMGUR_CLIENT_ID || '546c25a59c58ad7',
+  // On an upstream 429/5xx (or a low budget) a copy this young stands in for the error.
+  staleIfError: Number(env.COMMONS_STALE_IF_ERROR_MS || 6 * 60 * 60 * 1000),
+  slowTtl: Number(env.COMMONS_SLOW_TTL_MS || 60 * 60 * 1000),
+  // `fresh=1` (a person's refresh) takes a copy at most this old, else reads Reddit.
+  freshMs: Number(env.COMMONS_FRESH_MS || 30000),
+  // Below this many requests left in a bucket's window, a copy is served instead.
+  budgetFloor: Number(env.COMMONS_BUDGET_FLOOR || 150),
+  tokenUrl: env.REDDIT_TOKEN_URL || 'https://www.reddit.com/api/v1/access_token',
 })
 
 function log(fields) {
-  const safe = { svc: 'commons', route: ROUTES.includes(fields.route) ? fields.route : 'other' }
-  for (const k of ['status', 'durationMs', 'cache', 'phase', 'reason', 'upstreamStatus']) if (fields[k] !== undefined) safe[k] = fields[k]
+  const route = String(fields.route || '').startsWith('/v1/read/') ? '/v1/read' : fields.route
+  const safe = { svc: 'commons', route: ROUTES.includes(route) ? route : 'other' }
+  for (const k of ['status', 'durationMs', 'cache', 'phase', 'reason', 'upstreamStatus', 'cred', 'remaining']) if (fields[k] !== undefined) safe[k] = fields[k]
   console.log(JSON.stringify(safe))
 }
 
@@ -65,9 +94,133 @@ function cacheSet(key, val) {
 // ponytail: per-isolate like the SWR cache, so a fresh isolate has no copy; the
 // Cache API on the custom domain would share copies across isolates if that matters.
 const refused = (status) => status === 429 || status >= 500 || status === 0
-function lastGood(key) {
-  const entry = cache.get(key)
-  return entry && Date.now() - entry.fetchedAt <= STALE_IF_ERROR_MS ? entry : null
+function lastGood(c, entry) {
+  return entry && Date.now() - entry.fetchedAt <= c.staleIfError ? entry : null
+}
+
+// --- Shared tier (KV). Keys are hashed, so a listing of the namespace names nothing,
+// and bodies are stored gzip (Reddit JSON shrinks ~6x). Reads use KV's edge cache for
+// 60 s, so a copy written in one colo reaches the others within a minute.
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
+const kvKey = async (key) => `c1:${hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(key)))}`
+const pipe = async (body, stream) => new Uint8Array(await new Response(new Blob([body]).stream().pipeThrough(stream)).arrayBuffer())
+
+async function sharedGet(env, key) {
+  if (!env.COMMONS_KV) return null
+  try {
+    const { value, metadata } = await env.COMMONS_KV.getWithMetadata(await kvKey(key), { type: 'arrayBuffer', cacheTtl: 60 })
+    if (!value || !metadata || typeof metadata.fetchedAt !== 'number') return null
+    const body = metadata.gz ? await pipe(value, new DecompressionStream('gzip')) : new Uint8Array(value)
+    return { body, contentType: safeContentType(metadata.contentType), fetchedAt: metadata.fetchedAt, upstreamStatus: 200 }
+  } catch (e) {
+    log({ route: 'kv', phase: 'kv_get', reason: e?.name || 'error' })
+    return null
+  }
+}
+
+async function sharedPut(c, env, key, entry) {
+  if (!env.COMMONS_KV) return
+  try {
+    const gz = await pipe(entry.body, new CompressionStream('gzip'))
+    await env.COMMONS_KV.put(await kvKey(key), gz, {
+      expirationTtl: Math.max(60, Math.ceil(c.staleIfError / 1000)),
+      metadata: { fetchedAt: entry.fetchedAt, contentType: entry.contentType, gz: 1 },
+    })
+  } catch (e) {
+    // KV allows one write per key per second; a racing colo already wrote this copy.
+    log({ route: 'kv', phase: 'kv_put', reason: e?.name || 'error' })
+  }
+}
+
+// A good read lands in both tiers; the KV write never delays the reader.
+function keep(c, env, ctx, key, val) {
+  const entry = { ...val, revalidating: false }
+  cacheSet(key, entry)
+  ctx.waitUntil(sharedPut(c, env, key, entry))
+}
+
+// --- The bucket. Reddit reports each credential's window on every answer
+// (x-ratelimit-remaining / -reset). Per isolate: settled numbers, never promises.
+const budgets = { own: { remaining: Infinity, resetAt: 0 }, guest: { remaining: Infinity, resetAt: 0 } }
+function noteBudget(slot, res) {
+  if (!slot) return
+  const now = Date.now()
+  const reset = Number(res.headers.get('x-ratelimit-reset'))
+  if (res.status === 429) {
+    slot.remaining = 0
+    slot.resetAt = now + (Number.isFinite(reset) && reset > 0 ? reset : 60) * 1000
+    return
+  }
+  const remaining = Number(res.headers.get('x-ratelimit-remaining'))
+  if (res.headers.has('x-ratelimit-remaining') && Number.isFinite(remaining) && Number.isFinite(reset)) {
+    slot.remaining = remaining
+    slot.resetAt = now + reset * 1000
+  }
+}
+const slotLow = (c, slot, now) => now < slot.resetAt && slot.remaining < c.budgetFloor
+// Low when every credential this commons could spend is low.
+function budgetLow(c, env, now = Date.now()) {
+  if (env.REDDIT_CLIENT_ID && !slotLow(c, budgets.own, now) && !ownMintBlocked(now)) return false
+  return slotLow(c, budgets.guest, now)
+}
+
+// --- Columbia's own Reddit credential (optional). With REDDIT_CLIENT_ID (and, for a
+// web/script app, REDDIT_CLIENT_SECRET) set as wrangler secrets, misses spend Columbia's
+// own bucket instead of the app's shared guest bucket; the caller's guest bearer is the
+// fallback when the own bucket refuses. The token lives only in this isolate's memory.
+let ownToken = null // { token, exp } once minted (a settled value)
+let ownMintingSince = 0
+let ownMintBackoffUntil = 0
+const ownMintBlocked = (now) => now < ownMintBackoffUntil
+
+async function ownBearer(c, env) {
+  if (!env.REDDIT_CLIENT_ID) return null
+  const now = Date.now()
+  if (ownToken && ownToken.exp - 60000 > now) return ownToken.token
+  // Another request in this isolate is minting: this read uses the guest bearer.
+  if (ownMintBlocked(now) || now - ownMintingSince < 10000) return null
+  ownMintingSince = now
+  try {
+    const secret = env.REDDIT_CLIENT_SECRET || ''
+    const form = secret
+      ? 'grant_type=client_credentials'
+      : 'grant_type=https%3A%2F%2Foauth.reddit.com%2Fgrants%2Finstalled_client&device_id=DO_NOT_TRACK_THIS_DEVICE'
+    const res = await fetch(c.tokenUrl, {
+      method: 'POST',
+      headers: { Authorization: `Basic ${btoa(`${env.REDDIT_CLIENT_ID}:${secret}`)}`, 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': c.ua },
+      body: form, redirect: 'manual', signal: AbortSignal.timeout(10000),
+    })
+    const j = res.status === 200 ? await res.json().catch(() => null) : null
+    if (!j?.access_token) {
+      await res.body?.cancel().catch(() => {})
+      ownMintBackoffUntil = Date.now() + 5 * 60 * 1000
+      log({ route: 'token', phase: 'mint', reason: 'refused', upstreamStatus: res.status })
+      return null
+    }
+    ownToken = { token: j.access_token, exp: Date.now() + (Number(j.expires_in) || 3600) * 1000 }
+    return ownToken.token
+  } catch (e) {
+    ownMintBackoffUntil = Date.now() + 60 * 1000
+    log({ route: 'token', phase: 'mint', reason: upstreamFailure(0, e) })
+    return null
+  } finally {
+    ownMintingSince = 0
+  }
+}
+
+// One Reddit read: Columbia's own bearer when it has one and its bucket isn't low,
+// else (or when the own bucket refuses) the caller's guest bearer.
+async function fetchReddit(c, env, url, callerAuth) {
+  const own = await ownBearer(c, env)
+  if (own && !slotLow(c, budgets.own, Date.now())) {
+    const up = await fetchUpstream(c, url, `Bearer ${own}`, budgets.own)
+    if (up.status === 401) ownToken = null
+    up.cred = 'own'
+    if (!(up.status === 429 || up.status === 401) || !callerAuth) return up
+  }
+  const up = await fetchUpstream(c, url, callerAuth, callerAuth ? budgets.guest : null)
+  up.cred = callerAuth ? 'guest' : 'none'
+  return up
 }
 
 async function readBounded(res) {
@@ -76,12 +229,13 @@ async function readBounded(res) {
   return buf
 }
 
-async function fetchUpstream(c, url, auth) {
+async function fetchUpstream(c, url, auth, slot) {
   const started = Date.now()
   const headers = { 'User-Agent': c.ua, Accept: 'application/json, text/plain, */*', 'Accept-Language': 'en-US,en;q=0.9' }
-  if (c.forwardAuth && auth) headers.Authorization = auth
+  if (auth) headers.Authorization = auth
   try {
     const res = await fetch(url, { headers, redirect: 'manual', signal: AbortSignal.timeout(10000) })
+    noteBudget(slot, res)
     if (res.status !== 200) {
       await res.body?.cancel().catch(() => {})
       return { status: res.status, error: true, ms: Date.now() - started, reason: upstreamFailure(res.status) }
@@ -98,19 +252,37 @@ const upstreamUrl = (c, id, sort, template, after = '') => {
   return `${c.base}${path.startsWith('/') ? '' : '/'}${path}`
 }
 
-// Shared SWR + coalescing logic for feeds and imgur, as in the Node service.
-async function cached(c, ctx, key, fetcher, route) {
+// Shared SWR + coalescing logic for feeds and imgur, as in the Node service, over both
+// tiers. `read.ttl` overrides the fresh window (slow reads); `read.fresh` (a person's
+// refresh) takes only a copy younger than `freshMs`, else reads Reddit, and still gets
+// the last good copy when Reddit refuses.
+async function cached(c, env, ctx, read, route) {
+  const { key, fetcher } = read
+  const ttl = read.ttl || c.ttl
+  const freshFor = read.fresh ? Math.min(c.freshMs, ttl) : ttl
   const now = Date.now()
-  const entry = cache.get(key)
+  let entry = cache.get(key)
+  // L1 is missing or not fresh enough: another isolate or colo may hold a newer copy.
+  if (!entry || now - entry.fetchedAt >= freshFor) {
+    const shared = await sharedGet(env, key)
+    if (shared && (!entry || shared.fetchedAt > entry.fetchedAt)) {
+      entry = { ...shared, revalidating: false }
+      cacheSet(key, entry)
+      if (now - entry.fetchedAt < freshFor) return { ...entry, cacheState: 'HIT-SHARED' }
+    }
+  }
   if (entry) {
     const age = now - entry.fetchedAt
-    if (age < c.ttl) return { ...entry, cacheState: 'HIT' }
-    if (age < c.ttl + c.swr) {
+    if (age < freshFor) return { ...entry, cacheState: 'HIT' }
+    // The bucket is nearly spent: the copy in hand beats spending what readers with
+    // no copy need, and beats a refusal.
+    if (age <= c.staleIfError && budgetLow(c, env, now)) return { ...entry, cacheState: 'STALE-BUDGET' }
+    if (!read.fresh && age < ttl + c.swr) {
       if (!entry.revalidating) {
         entry.revalidating = true
         ctx.waitUntil(fetcher().then((up) => {
-          if (up.status === 200 && !up.error) cacheSet(key, { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), upstreamStatus: 200, revalidating: false })
-          else log({ route, phase: 'revalidate', reason: up.reason, upstreamStatus: up.status, durationMs: up.ms })
+          if (up.status === 200 && !up.error) keep(c, env, ctx, key, { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), upstreamStatus: 200 })
+          else log({ route, phase: 'revalidate', reason: up.reason, upstreamStatus: up.status, durationMs: up.ms, cred: up.cred })
         }).catch(() => log({ route, phase: 'revalidate', reason: 'network' })).finally(() => { entry.revalidating = false }))
       }
       return { ...entry, cacheState: 'STALE' }
@@ -141,12 +313,12 @@ async function cached(c, ctx, key, fetcher, route) {
   }
   if (up.status === 200 && !up.error) {
     const val = { body: up.body, contentType: safeContentType(up.contentType), fetchedAt: Date.now(), upstreamStatus: 200 }
-    if (isLeader) cacheSet(key, { ...val, revalidating: false })
-    return { ...val, cacheState: isLeader ? 'MISS' : 'COALESCED' }
+    if (isLeader) keep(c, env, ctx, key, val)
+    return { ...val, cacheState: isLeader ? 'MISS' : 'COALESCED', cred: up.cred }
   }
-  const stale = refused(up.status) && lastGood(key)
-  if (stale) return { ...stale, cacheState: 'STALE-ERROR', upstreamStatus: up.status, reason: up.reason }
-  return { cacheState: 'MISS', upstreamStatus: up.status, upstreamError: true, reason: up.reason }
+  const stale = refused(up.status) && lastGood(c, entry)
+  if (stale) return { ...stale, cacheState: 'STALE-ERROR', upstreamStatus: up.status, reason: up.reason, cred: up.cred }
+  return { cacheState: 'MISS', upstreamStatus: up.status, upstreamError: true, reason: up.reason, cred: up.cred }
 }
 
 async function fetchImgurJson(c, path, shape) {
@@ -233,7 +405,7 @@ async function serveCached(request, c, out) {
 // Reddit rate-limits Cloudflare's shared egress IPs, so while EGRESS_COMMONS_ORIGIN is
 // set, app traffic on the custom domain is proxied to a commons with its own egress.
 let egressDownUntil = 0
-async function viaEgressCommons(request, env, c, u, key) {
+async function viaEgressCommons(request, env, ctx, c, u, key) {
   const headers = new Headers()
   for (const h of ['authorization', 'accept', 'accept-encoding', 'accept-language', 'user-agent']) {
     const v = request.headers.get(h)
@@ -248,7 +420,7 @@ async function viaEgressCommons(request, env, c, u, key) {
   // is still commons answering.
   if (resp.status === 503 || (resp.status !== 502 && resp.status >= 400 && (resp.headers.get('content-type') || '').includes('text/html'))) return null
   // Commons answered but its Reddit fetch failed: the last good copy beats the error.
-  const stale = key && refused(resp.status) && lastGood(key)
+  const stale = key && refused(resp.status) && lastGood(c, cache.get(key))
   if (stale) {
     await resp.body?.cancel().catch(() => {})
     log({ route: u.pathname, status: 200, cache: 'STALE-ERROR', phase: 'egress', upstreamStatus: resp.status })
@@ -266,15 +438,34 @@ async function viaEgressCommons(request, env, c, u, key) {
   const body = new Uint8Array(await resp.arrayBuffer())
   if (body.length <= MAX_BODY_BYTES) {
     const ageMs = (Number(resp.headers.get('age')) || 0) * 1000
-    cacheSet(key, { body, contentType: safeContentType(resp.headers.get('content-type')), fetchedAt: Date.now() - ageMs, upstreamStatus: 200, revalidating: false })
+    keep(c, env, ctx, key, { body, contentType: safeContentType(resp.headers.get('content-type')), fetchedAt: Date.now() - ageMs, upstreamStatus: 200 })
   }
   return new Response(body, { status: 200, headers: out })
 }
 
 // A valid read's cache key and upstream fetcher, shared by the egress and own paths;
 // { error } for a bad query, null for any other route.
-function parseRead(c, u, request) {
+function parseRead(c, env, u, request) {
   const route = u.pathname
+  const fresh = u.searchParams.get('fresh') === '1'
+  const auth = c.forwardAuth ? request.headers.get('authorization') || undefined : undefined
+  if (route.startsWith('/v1/read/')) {
+    const path = route.slice('/v1/read'.length).toLowerCase()
+    if (!READ_PATHS.some((re) => re.test(path))) return { error: 'not a shared read path' }
+    const params = []
+    const seen = new Set()
+    for (const [name, value] of u.searchParams) {
+      if (name === 'fresh') continue
+      if (!READ_PARAMS.has(name) || seen.has(name) || !READ_VALUE_RE.test(value)) return { error: `not a shared read parameter: ${name.slice(0, 40)}` }
+      seen.add(name)
+      params.push([name, value])
+    }
+    // One key per read, whatever order the client wrote its query in.
+    params.sort(([a], [b]) => (a < b ? -1 : 1))
+    const qs = new URLSearchParams(params).toString()
+    const url = `${c.base}${path}${qs ? `?${qs}` : ''}`
+    return { key: `read:${path}?${qs}`, fetcher: () => fetchReddit(c, env, url, auth), ttl: SLOW_READ_RE.test(path) ? c.slowTtl : 0, fresh }
+  }
   if (route === '/v1/commons' || route === '/v1/comments' || route === '/v1/page') {
     const kind = route === '/v1/comments' ? 'comments' : route === '/v1/page' ? 'page' : 'commons'
     const id = (u.searchParams.get('id') || '').replace(/[^A-Za-z0-9_]/g, '')
@@ -283,11 +474,10 @@ function parseRead(c, u, request) {
     if (!id || !SORT_RE.test(sort) || (kind === 'page' && !AFTER_RE.test(after))) {
       return { error: `require ?id=<${kind === 'comments' ? 'item' : 'feed'}-id>&sort=<sort>${kind === 'page' ? '&after=<t3_id>' : ''}` }
     }
-    const auth = c.forwardAuth ? request.headers.get('authorization') || undefined : undefined
     const key = kind === 'commons' ? `${id}/${sort}` : kind === 'page' ? `page:${id}/${sort}/${after}` : `${kind}:${id}/${sort}`
     const template = kind === 'comments' ? c.commentsTemplate : kind === 'page' ? c.pageTemplate : c.template
     const url = upstreamUrl(c, id, sort, template, after)
-    return { key, fetcher: () => fetchUpstream(c, url, auth) }
+    return { key, fetcher: () => fetchReddit(c, env, url, auth), fresh }
   }
   if (route === '/v1/imgur') {
     const id = (u.searchParams.get('id') || '').trim()
@@ -304,13 +494,13 @@ export default {
     const started = Date.now()
     const c = cfg(env)
     const u = new URL(request.url)
-    const read = parseRead(c, u, request)
+    const read = parseRead(c, env, u, request)
     // Reads only, so any egress failure can fall back to this Worker's own commons
     // (more Reddit 429s from Cloudflare IPs, but no outage). The breaker skips a dead
     // egress for a minute per isolate.
     if (env.EGRESS_COMMONS_ORIGIN && !u.hostname.endsWith('.workers.dev') && u.pathname !== '/health' && Date.now() >= egressDownUntil) {
       try {
-        const viaEgress = await viaEgressCommons(request, env, c, u, read?.key)
+        const viaEgress = await viaEgressCommons(request, env, ctx, c, u, read?.key)
         if (viaEgress) return viaEgress
         log({ route: u.pathname, reason: 'egress_unavailable' })
       } catch (e) { log({ route: u.pathname, reason: 'egress_error', code: e?.name }) }
@@ -324,22 +514,25 @@ export default {
       log({ route, status: 403, durationMs: Date.now() - started })
       return new Response(null, { status: 403 })
     }
-    let resp, cacheState = '-', reason, upstreamStatus
+    let resp, cacheState = '-', reason, upstreamStatus, cred
     if (route === '/health') {
-      resp = json(200, { status: 'ok', service: 'commons-cache', ts: new Date().toISOString(), uptimeS: Math.round((Date.now() - bootedAt) / 1000), cacheKeys: cache.size })
+      resp = json(200, {
+        status: 'ok', service: 'commons-cache', ts: new Date().toISOString(), uptimeS: Math.round((Date.now() - bootedAt) / 1000), cacheKeys: cache.size,
+        sharedCache: Boolean(env.COMMONS_KV), ownCredential: Boolean(env.REDDIT_CLIENT_ID), ownToken: Boolean(ownToken), budgetLow: budgetLow(c, env),
+      })
     } else if (route === '/v1/probe') {
       const up = await fetchUpstream(c, upstreamUrl(c, 'example', 'latest', c.template))
       resp = new Response(JSON.stringify({ note: 'upstream-surface reachability from this host: status, size, and latency', results: { commons: { status: up.status, bytes: up.body?.length || 0, ms: up.ms } } }, null, 2), { headers: { 'Content-Type': 'application/json' } })
     } else if (read?.error) {
       resp = json(400, { error: read.error })
     } else if (read) {
-      const out = await cached(c, ctx, read.key, read.fetcher, route)
-      ;({ cacheState, reason, upstreamStatus } = out)
+      const out = await cached(c, env, ctx, read, route)
+      ;({ cacheState, reason, upstreamStatus, cred } = out)
       resp = await serveCached(request, c, out)
     } else {
-      resp = json(404, { error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort=', '/v1/imgur?id=|image=', '/v1/comments?id=&sort=', '/v1/page?id=&sort=&after='] })
+      resp = json(404, { error: 'not found', routes: ['/health', '/v1/probe', '/v1/commons?id=&sort=', '/v1/imgur?id=|image=', '/v1/comments?id=&sort=', '/v1/page?id=&sort=&after=', '/v1/read/<path>?<query>'] })
     }
-    log({ route, status: resp.status, cache: cacheState, reason, upstreamStatus: reason ? upstreamStatus : undefined, durationMs: Date.now() - started })
+    log({ route, status: resp.status, cache: cacheState, reason, upstreamStatus: reason ? upstreamStatus : undefined, cred, remaining: Number.isFinite(budgets.guest.remaining) ? budgets.guest.remaining : undefined, durationMs: Date.now() - started })
     return resp
   },
 }
