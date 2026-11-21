@@ -85,6 +85,56 @@ The gateway publishes its HPKE key material at two endpoints. `GET /ohttp-config
 - `commons-cache/` is another dependency-free Node service, an optional cache origin for public, sessionless content. It serves `X-Cache: HIT|MISS|STALE` with CDN-ready `Cache-Control` and `Age` headers.
 - `token-issuer/` is its own service. It runs Apple App Attest verification and blind-signs ([RFC 9474](https://www.rfc-editor.org/rfc/rfc9474)) anonymous tokens so the relay can require a genuine, rate-limited client without a login. It is the one component that learns a device identity; blinding prevents that identity from being linked to any finished token or to the content it is spent on. Verifying a spent token at the relay is offline against the issuer's published epoch public key. See [`token-issuer/PROTOCOL.md`](./token-issuer/PROTOCOL.md) for the wire format and [`token-issuer/README.md`](./token-issuer).
 
+The same four components also run on Cloudflare Workers from [`workers/`](./workers). See [Cloudflare Workers](#cloudflare-workers).
+
+---
+
+## Cloudflare Workers
+
+[`workers/`](./workers) is a Cloudflare Workers deployment of the same components. Routes, limits, status mapping and RED-only logs follow the Node and Go services, and the Docker services above remain a fully supported way to self-host.
+
+| Worker | Directory | What it does |
+|---|---|---|
+| `columbia-relay` | [`workers/relay/`](./workers/relay) | `POST /relay` and `GET /ohttp-configs`. Forwards the sealed body to the gateway with no client headers, and applies a per-IP rate limit (`RELAY_RATE_LIMITER`, 120 a minute) |
+| `columbia-gateway` | [`workers/gateway/`](./workers/gateway) | Decapsulates, fetches the allowlisted target and seals the response. It has no public route (`workers_dev = false`) |
+| `columbia-commons` | [`workers/commons/`](./workers/commons) | The commons cache: `/v1/commons`, `/v1/comments`, `/v1/page`, `/v1/imgur` and `/v1/read/<path>`, with a per-isolate copy in front of a shared KV copy |
+| `columbia-issuer` | [`workers/issuer/`](./workers/issuer) | The token issuer (`/issuer-keys`, `/issue`). It imports `appattest.js`, `epoch-keys.js` and `state-store.js` from `token-issuer/` and keeps durable state in D1 |
+
+[`workers/shared/`](./workers/shared) holds the gateway's OHTTP and binary HTTP code.
+
+**How they connect.** The relay reaches the gateway through a service binding (`GATEWAY`), and the gateway reaches commons through another (`COMMONS`) whenever a sealed request targets one of `COMMONS_HOSTS`. Neither hop goes over the public internet. The relay sees the client IP and ciphertext; the gateway sees plaintext and no IP. Putting all four Workers on one Cloudflare account puts them under one operator, though, so it validates the flow but doesn't give you the non-collusion property (see [SELFHOSTING.md](./SELFHOSTING.md#running-relay-and-gateway-as-separate-operators)).
+
+**Bindings.**
+
+- `COMMONS_KV` (commons): a KV namespace shared by every isolate and colo. Keys are SHA-256 hashes, so a listing of the namespace names nothing, and bodies are stored gzip. Without the binding, commons caches per isolate only.
+- `ISSUER_DB` (issuer): a D1 database for registrations, assertion counters and quotas. The issuer creates its table on first use. The committed config sets `REQUIRE_DURABLE_STATE=1`, so without it the issuer fails every request instead of falling back to memory.
+- `RELAY_RATE_LIMITER` (relay): the per-IP rate limit, keyed on `cf-connecting-ip` (or `TRUSTED_CLIENT_IP_HEADER` on the `workers.dev` hostname a front door uses).
+- `GATEWAY` (relay) and `COMMONS` (gateway): the service bindings above.
+
+**Configuration and secrets.** Plain settings are `[vars]` in each `wrangler.toml`. Anything secret or deployment-specific is a Worker secret, set with `wrangler secret put` and never written to the repo:
+
+- gateway: `OHTTP_SK_HEX`, the X25519 private key as hex. `OHTTP_KEY_ID` and `OHTTP_CONFIG_HEX` in `[vars]` are the matching public key config, served verbatim at `/ohttp-configs`. To keep the key a Go gateway already publishes, use the X25519 key it derives from its `SEED_SECRET_KEY` and that gateway's classical config bytes. The Worker publishes only that classical config; there is no `/ohttp-keys` or post-quantum config.
+- relay and gateway: optionally the same `RELAY_GATEWAY_SECRET` on both, so the gateway accepts only the relay.
+- relay, commons and issuer: optionally `REQUIRE_FDID`, the front-door lock. It applies only on the `workers.dev` hostnames (for the issuer, hosts ending in `FDID_GATED_HOST_SUFFIX`), so a custom domain such as `relay.example.com` serves clients directly.
+- commons: optionally `REDDIT_CLIENT_ID` and `REDDIT_CLIENT_SECRET`, Columbia's own upstream credential. Without them, misses use the app-level bearer the caller sends (`FORWARD_UPSTREAM_AUTH`).
+- issuer: `ISSUER_SIGNING_KEY`, `ISSUER_STATE_SALT`, `APPLE_TEAM_ID`, `APPLE_BUNDLE_ID`, and `APPLE_APP_ATTEST_ROOT_CA_PEM_B64`. Reusing a `token-issuer` signing key keeps its key IDs.
+
+`ALLOWED_TARGET_ORIGINS` works as it does on the Go gateway, matching the exact host. Leaving it empty makes the gateway an open proxy. The committed configs carry the reference deployment's values. In your own copy, set `ALLOWED_TARGET_ORIGINS`, `COMMONS_HOSTS` and the KV and D1 IDs to yours.
+
+**Deploying.** Deploy from a checkout, because the issuer Worker imports from `token-issuer/`:
+
+```sh
+cd workers && npm ci && (cd issuer && npm ci)
+npx wrangler login
+npx wrangler kv namespace create COMMONS_KV       # put the id in commons/wrangler.toml
+npx wrangler d1 create columbia-issuer-state      # put the id in issuer/wrangler.toml
+npx wrangler secret put OHTTP_SK_HEX -c gateway/wrangler.toml
+npx wrangler secret put ISSUER_SIGNING_KEY -c issuer/wrangler.toml   # and the other issuer secrets
+npm run deploy
+```
+
+`npm run deploy` runs the Workers tests, deploys commons, gateway and relay in that order so each service binding has a target, then tests and deploys the issuer. Attach custom domains (for example `relay.example.com`, `issuer.example.com`) in the Cloudflare dashboard. [`deploy/README.md`](./deploy/README.md) has more deployment notes, and [`deploy/oracle/`](./deploy/oracle/README.md) runs a separate egress origin the relay and commons Workers can use through `EGRESS_RELAY_ORIGIN` and `EGRESS_COMMONS_ORIGIN`.
+
 ---
 
 ## Public surface and abuse controls
@@ -214,6 +264,7 @@ flowchart TD
     issuer["token-issuer/: App Attest + blind-RSA token issuer (Node)"]
     issuerfiles["server.js, appattest.js, PROTOCOL.md, Dockerfile, README.md"]
     deploy["deploy/: optional reference deploy config, one example among many"]
+    workers["workers/: the same components on Cloudflare Workers"]
 
     root --> readme
     root --> arch
@@ -232,6 +283,7 @@ flowchart TD
     root --> issuer
     issuer --> issuerfiles
     root --> deploy
+    root --> workers
 ```
 
 ## Standards

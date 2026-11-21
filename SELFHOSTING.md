@@ -1,6 +1,6 @@
 # Self-Hosting Columbia
 
-This guide runs the request-path components (relay, gateway, and optionally the commons cache) on plain Docker, on any host, plus the optional token issuer that gates who may use the relay. No managed cloud is required. One optional cloud example is at the end, using placeholders for your own resource names.
+This guide runs the request-path components (relay, gateway, and optionally the commons cache) on plain Docker, on any host, plus the optional token issuer that gates who may use the relay. No managed cloud is required. One optional cloud example is at the end, using placeholders for your own resource names. To run the same components on Cloudflare Workers instead of Docker, see [Cloudflare Workers](./README.md#cloudflare-workers) in the README.
 
 > Read this first. The operator-blind guarantee only holds when the relay and gateway are run by different operators who don't collude. Running both on one host is fine for testing, but it gives you no protection against that single operator. The [two-operator section](#running-relay-and-gateway-as-separate-operators) below explains how to split them for the real guarantee.
 
