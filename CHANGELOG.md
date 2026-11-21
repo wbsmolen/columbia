@@ -2,11 +2,55 @@
 
 Notable changes to Columbia. Published releases and their exact tags are listed on [GitHub Releases](https://github.com/wbsmolen/columbia/releases).
 
-## Unreleased
+## v1.8.0 - 2026-11-21
 
-### Changed
+### Cloudflare Workers
+
+- `workers/` runs the relay, gateway and commons cache on Cloudflare Workers, with the same routes, size limits, timeouts, status mapping and response headers as the Node and Go services. The gateway Worker holds the X25519 key derived from the existing gateway seed, so `/ohttp-configs` returns the same bytes and pinned clients keep working. It has no public route: the relay reaches it through a service binding, and it reaches commons through another, so the relay still sees the client IP but no plaintext and the gateway sees plaintext but no IP. The relay adds a per-IP rate-limit binding (120 requests a minute). `REQUIRE_FDID` is a Worker secret, enforced only on the `workers.dev` hostnames a front door forwards to.
+- `workers/issuer/` runs the token issuer as a Worker with the same wire contract, limits, client-data binding, front-door gate and RED-only log fields as `token-issuer/server.js`. It imports `appattest.js`, `epoch-keys.js` and `state-store.js` from `token-issuer/` unchanged, under `nodejs_compat`. Registrations, counters and quotas live in D1: a conditional insert or update is the compare-and-swap the reservation loop needs, a lost acknowledgement is resolved by reading back, and a salt fingerprint makes a changed salt fail closed. The same signing key keeps the same key IDs. `FDID_GATED_HOST_SUFFIX` limits the front-door gate to one hostname suffix. Invocation logs stay off, because they would record request headers. Its 60 tests run inside workerd, including the `token-issuer` App Attest and epoch-key suites with the RFC 9474 vector.
+
+### Egress
+
+- The relay and commons Workers can hand upstream-bound work to an egress origin with its own IP addresses (`EGRESS_RELAY_ORIGIN`, `EGRESS_COMMONS_ORIGIN`), because the upstream rate-limits Cloudflare's shared egress IPs. They pass the front-door header and the real client IP, so per-IP rate limiting still applies at the origin. When the origin's commons answers its own JSON `502`, the Worker returns that same `502`.
+- When the egress origin is down, both Workers fall back to their own gateway and commons. The relay falls back only when a request provably never reached the origin's gateway (a connection error, a `502` or `503`, or a platform HTML error page), and never retries a POST that timed out, so a write is never sent twice. After a failure each isolate skips the origin for 60 seconds.
+- The Azure egress origins are removed from the committed relay and commons Worker configs, so the Workers serve from their own gateway and commons. The egress variables still work with any other origin.
+- `deploy/oracle/` runs the relay, gateway and commons on one Oracle Cloud Always Free VM behind Caddy, as an egress origin for the Workers. It covers OCI CLI provisioning, cloud-init, the compose stack, secrets kept outside the repo, a DNS-only record, and a cutover script with a canary check, automatic rollback and a dry-run mode.
+
+### Commons
 
 - Commons gzips successful `/v1/commons`, `/v1/comments` and `/v1/imgur` responses when the caller accepts gzip, and sends `Content-Length` and `Vary: Accept-Encoding` with them. The gateway's Go client asks for gzip and decodes it transparently, so clients get identical bytes; the commons-to-gateway hop, which runs through the CDN, shrinks several-fold. Callers that don't ask for gzip get the plain body, as before.
+- `GET /v1/page?id=&sort=&after=t3_…` serves later listing pages, so readers who follow the same cursor share one upstream fetch per cursor per TTL. A cursor that isn't `t3_` plus up to 13 base-36 characters is a `400` that never reaches upstream. In the Node service the route exists only when `PAGE_PATH_TEMPLATE` is set; otherwise the unknown-route `404` is unchanged.
+- An upstream `404` (a deleted post or image) is now a `404` with a fixed `{"error":"not found"}` body and `Cache-Control: no-store`, in both the Node service and the Worker. It was a `502`, which counted as an outage. Every other upstream failure is still a fixed `502`, and upstream bodies are still never forwarded.
+- The commons Worker serves the last good copy when the upstream refuses. On a `429`, a `5xx` or a timeout, a copy of that key up to `COMMONS_STALE_IF_ERROR_MS` old (6 hours) is served as a `200` with `X-Cache: STALE-ERROR` and `X-Upstream-Status` set to the refused status. Without a copy the answer is unchanged.
+- The commons Worker has a shared tier in KV (`COMMONS_KV`). A read checks the isolate's own copy, then KV, then the upstream, so one upstream read per key per TTL serves every isolate and colo. KV keys are SHA-256 hashes, so a listing of the namespace names nothing. Bodies are stored gzip and kept for the stale-if-error window.
+- The commons Worker watches the upstream rate-limit bucket. It reads `x-ratelimit-remaining`, `x-ratelimit-reset` and `429`s per credential. With fewer than `COMMONS_BUDGET_FLOOR` (150) requests left, it serves any copy inside the stale-if-error window as `X-Cache: STALE-BUDGET` without revalidating, so only reads nobody has a copy of spend the bucket.
+- `GET /v1/read/<path>?<query>` on the commons Worker shares the remaining public guest reads: the front page and listings, multi-community listings, community info, rules and wiki pages, `by_id`, `duplicates`, `morechildren` and popular communities. Paths are lowercased and parameters sorted, so each read has one key. Unknown or repeated parameters, search and user pages are refused with `400`, so no key names what someone looked for. Community info, rules and wiki pages stay fresh for an hour (`COMMONS_SLOW_TTL_MS`).
+- `fresh=1` on any commons Worker read route takes a copy at most `COMMONS_FRESH_MS` (30 seconds) old, or else reads the upstream. If the upstream refuses, the last good copy is served instead of an error.
+- The commons Worker can spend its own upstream credential. With `REDDIT_CLIENT_ID` (and `REDDIT_CLIENT_SECRET` for a web or script app) set as Worker secrets, misses spend that credential's bucket, and the caller's bearer is used only when that bucket refuses. The token lives only in isolate memory, and a refused mint backs off for five minutes. Without the secrets, behavior is unchanged.
+- The committed commons Worker config keeps a copy fresh for 5 minutes, then serves it for up to 25 more while one background read refreshes it.
+
+### Fixed
+
+- The commons Worker re-encodes bodies it proxies from an egress origin. It had passed on the already-decompressed body still labelled `Content-Encoding: gzip`, which URLSession and Go's HTTP transport can't read.
+- Commons keeps `+` in a multi-community id. `id=pics+aww` read `r/picsaww`.
+- A commons Worker read no longer waits on another request's fetch. A Workers promise settles only in the request that created it, so when that request ended first, every request coalesced onto its fetch failed and the key stayed stuck until the isolate restarted. A follower now drops a flight that fails or is older than 20 seconds and fetches for itself.
+- The gateway Worker's imported private key and the issuer Worker's D1 readiness check are now shared as settled values, not promises, for the same reason. A first request that ended early could otherwise break decapsulation, or state access, for the rest of the isolate's life.
+
+### Security
+
+- `@hpke/core` in `workers/` is 1.7.5 (was 1.7.2), the patch for CVE-2025-64767 (nonce reuse on a shared sender context). The gateway opens requests with recipient contexts, not the affected pattern, so this is remediation rather than a fix for an observed exploit. New tests cover OHTTP interoperability with a client HPKE context, rejection of a wrong key ID, unsupported suite, truncation and tampering, independent concurrent requests, and serialized seals on a shared sender context.
+- `fast-xml-parser` in the relay and issuer lockfiles is 5.12.1 (was 5.11.1). It comes in through `@azure/data-tables` and `@azure/core-xml`, whose range already allowed it; `package.json` is unchanged.
+
+### Operations
+
+- GitHub Actions runs the unit tests on every pull request and push to main: `go test` for the gateway and Node 24 tests for the relay, issuer, commons cache, Workers and issuer Worker. The manual Azure deploy workflow is removed.
+- `npm run deploy` in `workers/` runs the Workers tests, deploys commons, gateway and relay in binding order, then tests and deploys the issuer. Secrets are set with `wrangler secret put` and never committed. See [README.md](README.md#cloudflare-workers) and [deploy/README.md](deploy/README.md).
+- The relay's rate-window test skews the clock instead of sleeping through the window, so it no longer fails on a slow runner.
+
+### Upgrade notes
+
+- The Docker services keep their configuration. The relay and issuer images change only in the `fast-xml-parser` lockfile bump. The commons cache gains gzip, the `404` for deleted items and the opt-in `/v1/page` route. The Go gateway is unchanged from v1.7.3.
+- The Workers are a separate deployment, not an upgrade of the containers. To run your own, create a KV namespace and a D1 database, put their IDs in `commons/wrangler.toml` and `issuer/wrangler.toml`, and set the secrets each Worker needs (see [README.md](README.md#cloudflare-workers)). The issuer Worker creates its D1 table on first use. Reuse the gateway seed and the issuer signing key to keep the same key configs and key IDs.
 
 ## v1.7.3 - 2026-11-06
 
